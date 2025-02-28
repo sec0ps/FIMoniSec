@@ -17,6 +17,7 @@ LOG_FILE = os.path.join(LOG_DIR, "file_monitor.json")
 PID_FILE = os.path.abspath("fim.pid")
 OUTPUT_DIR = os.path.abspath("./output")
 HASH_FILE = os.path.join(OUTPUT_DIR, "file_hashes.txt")
+INTEGRITY_STATE_FILE = os.path.join(OUTPUT_DIR, "integrity_state.json")
 
 def ensure_log_file():
     """Ensure that the log directory and log file exist with appropriate permissions."""
@@ -64,17 +65,34 @@ def load_config():
         return json.load(f)
 
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions):
-    """Generate and store SHA-256 hashes for all monitored files."""
+    """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
     file_hashes = {}
+    integrity_state = load_integrity_state()
 
     for directory in scheduled_directories + real_time_directories:
         if directory not in exclusions.get("directories", []):
             for filepath in Path(directory).rglob("*"):
                 if filepath.is_file() and str(filepath) not in exclusions.get("files", []):
                     file_hash = get_file_hash(filepath)
-                    if file_hash:
+                    metadata = get_file_metadata(filepath)
+                    if file_hash and metadata:
                         file_hashes[str(filepath)] = file_hash
+                        previous_entry = integrity_state.get(str(filepath))
 
+                        if previous_entry:
+                            if previous_entry["hash"] != file_hash or previous_entry["metadata"] != metadata:
+                                log_event({
+                                    "path": str(filepath),
+                                    "event_type": "MODIFIED",
+                                    "previous_hash": previous_entry["hash"],
+                                    "new_hash": file_hash,
+                                    "previous_metadata": previous_entry["metadata"],
+                                    "new_metadata": metadata
+                                })
+
+                        integrity_state[str(filepath)] = {"hash": file_hash, "metadata": metadata}
+
+    save_integrity_state(integrity_state)
     write_file_hashes(file_hashes)
 
 def get_file_hash(filepath):
@@ -90,6 +108,33 @@ def write_file_hashes(file_hashes):
     with open(HASH_FILE, "w") as f:
         for file, file_hash in file_hashes.items():
             f.write(f"{file}:{file_hash}\n")
+
+def load_integrity_state():
+    """Load previous integrity state from the integrity_state.json file."""
+    if os.path.exists(INTEGRITY_STATE_FILE):
+        with open(INTEGRITY_STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_integrity_state(state):
+    """Save the integrity state to the integrity_state.json file."""
+    with open(INTEGRITY_STATE_FILE, "w") as f:
+        json.dump(state, f, indent=4)
+
+def get_file_metadata(filepath):
+    """Retrieve metadata of a file."""
+    try:
+        stats = os.stat(filepath)
+        return {
+            "size": stats.st_size,
+            "permissions": oct(stats.st_mode),
+            "owner": stats.st_uid,
+            "group": stats.st_gid,
+            "last_accessed": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_atime)),
+            "last_modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_mtime))
+        }
+    except Exception:
+        return None
 
 def log_event(event):
     """Log file change events in JSON format."""
