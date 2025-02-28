@@ -27,6 +27,20 @@ def ensure_log_file():
             json.dump([], f)
     os.chmod(LOG_FILE, 0o600)
 
+def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None):
+    """Log file change events in JSON format with detailed metadata."""
+    log_entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": event_type,
+        "file_path": file_path,
+        "previous_metadata": previous_metadata,
+        "new_metadata": new_metadata,
+        "previous_hash": previous_hash,
+        "new_hash": new_hash
+    }
+    with open(LOG_FILE, "a") as log:
+        log.write(json.dumps(log_entry) + "\n")
+
 def ensure_output_dir():
     """Ensure that the output directory exists with appropriate permissions."""
     os.makedirs(OUTPUT_DIR, mode=0o700, exist_ok=True)
@@ -66,7 +80,8 @@ def load_config():
 
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions):
     """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
-    file_hashes = {}
+    ensure_output_dir()  # Ensure output directory exists before saving
+    file_hashes = load_file_hashes()
     integrity_state = load_integrity_state()
 
     for directory in scheduled_directories + real_time_directories:
@@ -75,25 +90,42 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
                 if filepath.is_file() and str(filepath) not in exclusions.get("files", []):
                     file_hash = get_file_hash(filepath)
                     metadata = get_file_metadata(filepath)
+
                     if file_hash and metadata:
-                        file_hashes[str(filepath)] = file_hash
-                        previous_entry = integrity_state.get(str(filepath))
+                        previous_entry = integrity_state.get(str(filepath), {})
+                        previous_hash = previous_entry.get("hash", None)
+                        previous_metadata = previous_entry.get("metadata", None)
 
-                        if previous_entry:
-                            if previous_entry["hash"] != file_hash or previous_entry["metadata"] != metadata:
-                                log_event({
-                                    "path": str(filepath),
-                                    "event_type": "MODIFIED",
-                                    "previous_hash": previous_entry["hash"],
-                                    "new_hash": file_hash,
-                                    "previous_metadata": previous_entry["metadata"],
-                                    "new_metadata": metadata
-                                })
+                        # ✅ Fix: Ensure both previous_hash and previous_metadata exist before comparison
+                        if previous_hash is not None and previous_metadata is not None:
+                            if previous_hash == file_hash and previous_metadata == metadata:
+                                continue  # ❌ Skip logging, nothing changed
 
+                        # ✅ Only log real modifications
+                        event_type = None
+                        if previous_hash is None and previous_metadata is None:
+                            event_type = "NEW FILE"
+                        elif previous_hash != file_hash:
+                            event_type = "MODIFIED"
+                        elif previous_metadata != metadata:
+                            event_type = "METADATA CHANGED"
+
+                        if event_type:  # ✅ Log only when there's an actual change
+                            log_event(
+                                event_type=event_type,
+                                file_path=str(filepath),
+                                previous_metadata=previous_metadata,
+                                new_metadata=metadata,
+                                previous_hash=previous_hash,
+                                new_hash=file_hash
+                            )
+
+                        # ✅ Update state correctly
                         integrity_state[str(filepath)] = {"hash": file_hash, "metadata": metadata}
+                        file_hashes[str(filepath)] = file_hash
 
+    save_file_hashes(file_hashes)  # Persist updated file hashes
     save_integrity_state(integrity_state)
-    write_file_hashes(file_hashes)
 
 def get_file_hash(filepath):
     """Generate SHA-256 hash of a file."""
@@ -103,11 +135,22 @@ def get_file_hash(filepath):
     except Exception:
         return None  # File may have been deleted before reading
 
-def write_file_hashes(file_hashes):
-    """Write file hashes to the output file."""
+def load_file_hashes():
+    """Load previously stored file hashes."""
+    if os.path.exists(HASH_FILE):
+        with open(HASH_FILE, "r") as f:
+            return dict(line.strip().split(":") for line in f if ":" in line)
+    return {}
+
+def save_file_hashes(file_hashes):
+    """Save updated file hashes to file."""
+    ensure_output_dir()  # Ensure the output directory exists before writing
     with open(HASH_FILE, "w") as f:
         for file, file_hash in file_hashes.items():
             f.write(f"{file}:{file_hash}\n")
+
+    # Explicitly set file permissions to prevent permission errors
+    os.chmod(HASH_FILE, 0o600)
 
 def load_integrity_state():
     """Load previous integrity state from the integrity_state.json file."""
@@ -131,42 +174,55 @@ def get_file_metadata(filepath):
             "owner": stats.st_uid,
             "group": stats.st_gid,
             "last_accessed": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_atime)),
-            "last_modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_mtime))
+            "last_modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_mtime)),
+            "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_ctime)),
+            "inode": stats.st_ino,
+            "hard_links": stats.st_nlink,
+            "device": stats.st_dev,
+            "block_size": stats.st_blksize,
+            "blocks": stats.st_blocks
         }
     except Exception:
         return None
-
-def log_event(event):
-    """Log file change events in JSON format."""
-    log_entry = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "event": event
-    }
-    with open(LOG_FILE, "a") as log:
-        log.write(json.dumps(log_entry) + "\n")
 
 def monitor_changes(real_time_directories, exclusions):
     """Monitor file system changes in real-time using inotify."""
     notifier = inotify.adapters.Inotify()
 
+    def add_watch_recursive(directory):
+        """Recursively add inotify watches for all subdirectories."""
+        for root, dirs, files in os.walk(directory):
+            if root not in exclusions.get("directories", []):
+                notifier.add_watch(root, mask=inotify.constants.IN_CREATE |
+                                             inotify.constants.IN_MODIFY |
+                                             inotify.constants.IN_DELETE)
+
+    # Add watches for all real-time directories
     for directory in real_time_directories:
-        if directory not in exclusions.get("directories", []):
-            notifier.add_watch(directory, mask=inotify.constants.IN_CREATE |
-                                               inotify.constants.IN_MODIFY |
-                                               inotify.constants.IN_DELETE)
+        add_watch_recursive(directory)
 
     print("[INFO] Real-time monitoring started...")
 
     for event in notifier.event_gen(yield_nones=False):
         (_, type_names, path, filename) = event
         full_path = os.path.join(path, filename)
+
         if full_path not in exclusions.get("files", []):
-            log_event({"path": full_path, "event_type": type_names})
+            log_event(
+                event_type="REAL-TIME EVENT",
+                file_path=full_path,
+                new_metadata={"event_type": type_names}  # Corrected argument
+            )
+
+            # If a new directory is created, add a watch for it dynamically
+            if "IN_CREATE" in type_names and os.path.isdir(full_path):
+                add_watch_recursive(full_path)
 
 def scan_files(scheduled_directories, scan_interval, exclusions):
     """Perform periodic file integrity scans."""
     print("[INFO] Periodic scanning started...")
-    last_hashes = {}
+    file_hashes = load_file_hashes()
+    integrity_state = load_integrity_state()
 
     while True:
         for directory in scheduled_directories:
@@ -174,12 +230,30 @@ def scan_files(scheduled_directories, scan_interval, exclusions):
                 for filepath in Path(directory).rglob("*"):
                     if filepath.is_file() and str(filepath) not in exclusions.get("files", []):
                         file_hash = get_file_hash(filepath)
-                        if filepath in last_hashes:
-                            if last_hashes[filepath] != file_hash:
-                                log_event({"path": str(filepath), "event_type": "MODIFIED"})
-                        else:
-                            log_event({"path": str(filepath), "event_type": "NEW FILE"})
-                        last_hashes[filepath] = file_hash
+                        metadata = get_file_metadata(filepath)
+
+                        if file_hash and metadata:
+                            previous_hash = file_hashes.get(str(filepath))
+                            previous_metadata = integrity_state.get(str(filepath))
+
+                            if previous_hash == file_hash and previous_metadata == metadata:
+                                continue  # No changes, move to next file
+
+                            if previous_hash != file_hash or previous_metadata != metadata:
+                                log_event(
+                                    event_type="MODIFIED" if previous_hash else "NEW FILE",
+                                    file_path=str(filepath),
+                                    previous_metadata=previous_metadata,
+                                    new_metadata=metadata,
+                                    previous_hash=previous_hash,
+                                    new_hash=file_hash
+                                )
+
+                            file_hashes[str(filepath)] = file_hash
+                            integrity_state[str(filepath)] = metadata
+
+        save_file_hashes(file_hashes)
+        save_integrity_state(integrity_state)
         time.sleep(scan_interval)
 
 def stop_daemon():
