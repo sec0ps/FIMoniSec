@@ -80,9 +80,11 @@ def load_config():
 
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions):
     """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
-    ensure_output_dir()  # Ensure output directory exists before saving
-    file_hashes = load_file_hashes()
-    integrity_state = load_integrity_state()
+    file_hashes = load_file_hashes()  # Load existing hashes
+    integrity_state = load_integrity_state()  # Load previous integrity state
+
+    new_file_hashes = {}  # Dictionary to store updated hashes
+    new_integrity_state = {}  # Dictionary to store updated metadata
 
     for directory in scheduled_directories + real_time_directories:
         if directory not in exclusions.get("directories", []):
@@ -92,40 +94,43 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
                     metadata = get_file_metadata(filepath)
 
                     if file_hash and metadata:
-                        previous_entry = integrity_state.get(str(filepath), {})
-                        previous_hash = previous_entry.get("hash", None)
-                        previous_metadata = previous_entry.get("metadata", None)
+                        previous_hash = file_hashes.get(str(filepath))
+                        previous_metadata = integrity_state.get(str(filepath))
 
-                        # ✅ Fix: Ensure both previous_hash and previous_metadata exist before comparison
-                        if previous_hash is not None and previous_metadata is not None:
-                            if previous_hash == file_hash and previous_metadata == metadata:
-                                continue  # ❌ Skip logging, nothing changed
+                        # If the file existed before and is unchanged, continue
+                        if previous_hash == file_hash and previous_metadata == metadata:
+                            new_file_hashes[str(filepath)] = file_hash
+                            new_integrity_state[str(filepath)] = metadata
+                            continue
 
-                        # ✅ Only log real modifications
-                        event_type = None
-                        if previous_hash is None and previous_metadata is None:
-                            event_type = "NEW FILE"
-                        elif previous_hash != file_hash:
-                            event_type = "MODIFIED"
-                        elif previous_metadata != metadata:
-                            event_type = "METADATA CHANGED"
+                        # Log file changes
+                        log_event(
+                            event_type="MODIFIED" if previous_hash else "NEW FILE",
+                            file_path=str(filepath),
+                            previous_metadata=previous_metadata,
+                            new_metadata=metadata,
+                            previous_hash=previous_hash,
+                            new_hash=file_hash
+                        )
 
-                        if event_type:  # ✅ Log only when there's an actual change
-                            log_event(
-                                event_type=event_type,
-                                file_path=str(filepath),
-                                previous_metadata=previous_metadata,
-                                new_metadata=metadata,
-                                previous_hash=previous_hash,
-                                new_hash=file_hash
-                            )
+                        # Update new tracking dictionaries
+                        new_file_hashes[str(filepath)] = file_hash
+                        new_integrity_state[str(filepath)] = metadata
 
-                        # ✅ Update state correctly
-                        integrity_state[str(filepath)] = {"hash": file_hash, "metadata": metadata}
-                        file_hashes[str(filepath)] = file_hash
+    # Compare before saving to avoid unnecessary writes
+    if new_file_hashes != file_hashes or new_integrity_state != integrity_state:
+        print("[DEBUG] Differences detected, updating files:")
+        for file, new_hash in new_file_hashes.items():
+            old_hash = file_hashes.get(file)
+            if old_hash and old_hash == new_hash:
+                continue  # Skip unchanged files
+            print(f"[DEBUG] Change detected: {file}")
 
-    save_file_hashes(file_hashes)  # Persist updated file hashes
-    save_integrity_state(integrity_state)
+        save_file_hashes(new_file_hashes)
+        save_integrity_state(new_integrity_state)
+        print(f"[INFO] File hash tracking updated. {len(new_file_hashes)} entries stored.")
+    else:
+        print("[INFO] No changes detected. File hash tracking remains unchanged.")  # New message to confirm no changes
 
 def get_file_hash(filepath):
     """Generate SHA-256 hash of a file."""
@@ -142,9 +147,13 @@ def load_file_hashes():
             return dict(line.strip().split(":") for line in f if ":" in line)
     return {}
 
+import shutil  # Add this import at the top of the script
+
 def save_file_hashes(file_hashes):
-    """Save updated file hashes to file."""
-    ensure_output_dir()  # Ensure the output directory exists before writing
+    """Save updated file hashes to file, keeping a backup of the old file."""
+    if os.path.exists(HASH_FILE):
+        shutil.move(HASH_FILE, f"{HASH_FILE}_old")  # Create a backup before overwriting
+
     with open(HASH_FILE, "w") as f:
         for file, file_hash in file_hashes.items():
             f.write(f"{file}:{file_hash}\n")
