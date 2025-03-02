@@ -242,18 +242,25 @@ def monitor_changes(real_time_directories, exclusions):
 
         # Handle file deletions
         if "IN_DELETE" in type_names:
-            if full_path in integrity_state or full_path in file_hashes:
-                log_event(
-                    event_type="DELETED",
-                    file_path=full_path,
-                    previous_metadata=integrity_state.get(full_path)
-                )
-                integrity_state.pop(full_path, None)  # Remove from tracking
-                file_hashes.pop(full_path, None)
-                save_integrity_state(integrity_state)  # Save state updates immediately
-                save_file_hashes(file_hashes)
-                print(f"[INFO] File deleted and removed from tracking: {full_path}")
-            continue  # Skip further checks for deleted files
+            # Log file deletion
+            log_event(
+                event_type="DELETED FILE",
+                file_path=full_path
+            )
+        
+            # Remove file from tracking
+            if full_path in file_hashes:
+                del file_hashes[full_path]
+        
+            if full_path in integrity_state:
+                del integrity_state[full_path]
+        
+            # Save updated tracking information
+            save_file_hashes(file_hashes)
+            save_integrity_state(integrity_state)
+        
+            print(f"[INFO] File deleted: {full_path}")
+
 
         # Fetch current metadata and hash
         new_metadata = get_file_metadata(full_path)
