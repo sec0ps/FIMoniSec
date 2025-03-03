@@ -4,7 +4,12 @@ import time
 import socket
 
 APP_CONFIG_FILE = os.path.abspath("app.config")
-LOG_FILE = os.path.abspath("fim.log")
+LOG_DIR = os.path.abspath("./logs")
+LOG_FILE = os.path.join(LOG_DIR, "audit.log")
+
+def ensure_log_directory():
+    """Ensure the logs directory exists."""
+    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
 
 def configure_siem():
     """Prompt user for SIEM server configuration and save it to app.config."""
@@ -57,6 +62,8 @@ def send_to_splunk(log_entry):
 
 def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None):
     """Log file change events in JSON format with detailed metadata."""
+    ensure_log_directory()  # Ensure logs directory exists
+
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "event_type": event_type,
@@ -67,9 +74,9 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
         "new_hash": new_hash
     }
 
-    # Write to local log file
+    # Write to audit.log in logs directory
     with open(LOG_FILE, "a") as log:
         log.write(json.dumps(log_entry) + "\n")
 
-    # Send log to Splunk
+    # Send log to Splunk if configured
     send_to_splunk(log_entry)
