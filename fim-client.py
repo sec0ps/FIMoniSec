@@ -396,7 +396,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="File Integrity Monitor (FIM) Client")
     parser.add_argument("-d", "--daemon", action="store_true", help="Run client in background")
     parser.add_argument("-s", "--stop", action="store_true", help="Stop daemon process")
-    parser.add_argument("-l", "--log-config", action="store_true", help="Configure SIEM server settings")
+    parser.add_argument("-l", "--log-config", action="store_true", help="Configure SIEM logging")
     return parser.parse_args()
 
 def run_monitor():
@@ -436,8 +436,10 @@ if __name__ == "__main__":
     args = parse_arguments()
 
     if args.log_config:
-        configure_siem()
-    elif args.stop:
+        audit.configure_siem()
+        exit(0)  # Exit after configuring SIEM
+
+    if args.stop:
         stop_daemon()
     elif args.daemon:
         print("[INFO] Running in background mode...")
