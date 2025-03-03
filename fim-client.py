@@ -71,7 +71,7 @@ def create_default_config():
                 "/etc/dumpdates",
                 "/etc/svc/volatile"
             ]
-        },  # <-- Missing comma added here
+        },
         "instructions": {
             "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
             "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
