@@ -11,6 +11,7 @@ from threading import Thread
 from daemon import DaemonContext
 import shutil
 import pyinotify
+import audit
 
 CONFIG_FILE = os.path.abspath("fim.config")
 LOG_DIR = os.path.abspath("./logs")
