@@ -1,4 +1,3 @@
-inotify
 daemon
 python-daemon
 pyinotify
