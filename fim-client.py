@@ -3,7 +3,6 @@ import json
 import time
 import hashlib
 import sys
-import inotify.adapters
 import argparse
 import daemon
 from pathlib import Path
@@ -11,6 +10,7 @@ import stat
 from threading import Thread
 from daemon import DaemonContext
 import shutil
+import pyinotify
 
 CONFIG_FILE = os.path.abspath("fim.config")
 LOG_DIR = os.path.abspath("./logs")
@@ -58,8 +58,20 @@ def create_default_config():
         },
         "exclusions": {
             "directories": ["/var/log"],
-            "files": ["/etc/mtab"]
-        },
+            "files": [
+                "/etc/mnttab",
+                "/etc/hosts.deny",
+                "/etc/mail/statistics",
+                "/etc/random-seed",
+                "/etc/adjtime",
+                "/etc/httpd/logs",
+                "/etc/utmpx",
+                "/etc/wtmpx",
+                "/etc/cups/certs",
+                "/etc/dumpdates",
+                "/etc/svc/volatile"
+            ]
+        },  # <-- Missing comma added here
         "instructions": {
             "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
             "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
@@ -217,97 +229,117 @@ def get_file_metadata(filepath):
     except Exception:
         return None
 
+class EventHandler(pyinotify.ProcessEvent):
+    def process_IN_CREATE(self, event):
+        """Handles file creation event."""
+        full_path = event.pathname
+        file_hash = get_file_hash(full_path)
+        metadata = get_file_metadata(full_path)
+
+        log_event(
+            event_type="NEW FILE",
+            file_path=full_path,
+            previous_metadata=None,
+            new_metadata=metadata,
+            previous_hash=None,
+            new_hash=file_hash
+        )
+
+        update_file_tracking(full_path, file_hash, metadata)
+
+    def process_IN_DELETE(self, event):
+        """Handles file deletion event."""
+        full_path = event.pathname
+        previous_metadata = integrity_state.get(full_path, None)
+        previous_hash = file_hashes.get(full_path, None)
+
+        log_event(
+            event_type="DELETED",
+            file_path=full_path,
+            previous_metadata=previous_metadata,
+            new_metadata=None,
+            previous_hash=previous_hash,
+            new_hash=None
+        )
+
+        remove_file_tracking(full_path)
+
+    def process_IN_MODIFY(self, event):
+        """Handles file modification event."""
+        full_path = event.pathname
+        file_hash = get_file_hash(full_path)
+        metadata = get_file_metadata(full_path)
+        previous_hash = file_hashes.get(full_path)
+        previous_metadata = integrity_state.get(full_path)
+
+        if file_hash != previous_hash:
+            log_event(
+                event_type="MODIFIED",
+                file_path=full_path,
+                previous_metadata=previous_metadata,
+                new_metadata=metadata,
+                previous_hash=previous_hash,
+                new_hash=file_hash
+            )
+            update_file_tracking(full_path, file_hash, metadata)
+
+    def process_IN_ATTRIB(self, event):
+        """Handles metadata change event."""
+        full_path = event.pathname
+        metadata = get_file_metadata(full_path)
+        previous_metadata = integrity_state.get(full_path)
+
+        if metadata != previous_metadata:
+            log_event(
+                event_type="METADATA_CHANGED",
+                file_path=full_path,
+                previous_metadata=previous_metadata,
+                new_metadata=metadata,
+                previous_hash=None,
+                new_hash=None
+            )
+            integrity_state[full_path] = metadata
+            save_integrity_state(integrity_state)
+
 def monitor_changes(real_time_directories, exclusions):
-    """Monitor file system changes in real-time using inotify."""
-    notifier = inotify.adapters.Inotify()
-
-    # Add watch for each real-time directory
-    for directory in real_time_directories:
-        if directory not in exclusions.get("directories", []):
-            notifier.add_watch(directory, mask=inotify.constants.IN_CREATE |
-                                               inotify.constants.IN_DELETE |
-                                               inotify.constants.IN_MODIFY |
-                                               inotify.constants.IN_ATTRIB)
-
-    print("[INFO] Real-time monitoring started...")
-
-    # Load tracking data
+    """Monitors file system changes using pyinotify."""
+    global file_hashes, integrity_state
     file_hashes = load_file_hashes()
     integrity_state = load_integrity_state()
 
-    for event in notifier.event_gen(yield_nones=False):
-        (_, type_names, path, filename) = event
-        full_path = os.path.join(path, filename)
+    wm = pyinotify.WatchManager()
+    handler = EventHandler()
+    notifier = pyinotify.Notifier(wm, handler)
 
-        # Skip excluded files
-        if full_path in exclusions.get("files", []):
+    # Watch all directories and subdirectories
+    for directory in real_time_directories:
+        if directory in exclusions.get("directories", []):
             continue
+        wm.add_watch(directory, pyinotify.ALL_EVENTS, rec=True, auto_add=True)
 
-        # 🔹 **Handle File Creation**
-        if "IN_CREATE" in type_names:
-            time.sleep(0.5)  # Small delay to ensure file creation completes
-            if os.path.exists(full_path):  # Ensure file still exists
-                file_hash = get_file_hash(full_path)
-                metadata = get_file_metadata(full_path)
+    print("[INFO] Real-time monitoring started using pyinotify...")
 
-                if file_hash and metadata:
-                    file_hashes[full_path] = file_hash
-                    integrity_state[full_path] = metadata
+    # Start monitoring
+    notifier.loop()
 
-                    save_file_hashes(file_hashes)
-                    save_integrity_state(integrity_state)
+def remove_file_tracking(file_path):
+    """Remove deleted file from tracking."""
+    if file_path in file_hashes:
+        del file_hashes[file_path]
+    if file_path in integrity_state:
+        del integrity_state[file_path]
+    save_file_hashes(file_hashes)
+    save_integrity_state(integrity_state)
 
-                    log_event(
-                        event_type="NEW FILE",
-                        file_path=full_path,
-                        new_metadata=metadata,
-                        new_hash=file_hash
-                    )
+def update_file_tracking(file_path, file_hash, metadata):
+    """Update file tracking information for new or modified files."""
+    global file_hashes, integrity_state  # Ensure these are accessible
 
-                    print(f"[INFO] New file detected: {full_path}")
+    file_hashes[file_path] = file_hash
+    integrity_state[file_path] = metadata
 
-        # 🔹 **Handle File Deletions**
-        elif "IN_DELETE" in type_names:
-            if full_path in file_hashes:
-                del file_hashes[full_path]  # Remove from hash tracking
-            if full_path in integrity_state:
-                del integrity_state[full_path]  # Remove from metadata tracking
-
-            save_file_hashes(file_hashes)
-            save_integrity_state(integrity_state)
-
-            log_event(
-                event_type="DELETED FILE",
-                file_path=full_path
-            )
-
-            print(f"[INFO] File deleted: {full_path}")
-
-        # 🔹 **Handle File Modifications**
-        elif "IN_MODIFY" in type_names or "IN_ATTRIB" in type_names:
-            if os.path.exists(full_path):  # Ensure file still exists
-                new_hash = get_file_hash(full_path)
-                new_metadata = get_file_metadata(full_path)
-                previous_hash = file_hashes.get(full_path)
-                previous_metadata = integrity_state.get(full_path)
-
-                if previous_hash != new_hash or previous_metadata != new_metadata:
-                    file_hashes[full_path] = new_hash
-                    integrity_state[full_path] = new_metadata
-
-                    save_file_hashes(file_hashes)
-                    save_integrity_state(integrity_state)
-
-                    log_event(
-                        event_type="MODIFIED",
-                        file_path=full_path,
-                        previous_metadata=previous_metadata,
-                        new_metadata=new_metadata,
-                        previous_hash=previous_hash,
-                        new_hash=new_hash
-                    )
-
-                    print(f"[INFO] File modified: {full_path}")
+    save_file_hashes(file_hashes)
+    save_integrity_state(integrity_state)
 
 def scan_files(scheduled_directories, scan_interval, exclusions):
     """Perform periodic file integrity scans."""
