@@ -218,91 +218,96 @@ def get_file_metadata(filepath):
         return None
 
 def monitor_changes(real_time_directories, exclusions):
-    """Monitor file system changes in real-time using inotify, including deletions and metadata changes."""
+    """Monitor file system changes in real-time using inotify."""
     notifier = inotify.adapters.Inotify()
-    integrity_state = load_integrity_state()  # Load previous metadata tracking
-    file_hashes = load_file_hashes()  # Load previous file hashes
 
+    # Add watch for each real-time directory
     for directory in real_time_directories:
         if directory not in exclusions.get("directories", []):
             notifier.add_watch(directory, mask=inotify.constants.IN_CREATE |
-                                               inotify.constants.IN_MODIFY |
                                                inotify.constants.IN_DELETE |
-                                               inotify.constants.IN_ATTRIB)  # Track metadata changes
+                                               inotify.constants.IN_MODIFY |
+                                               inotify.constants.IN_ATTRIB)
 
     print("[INFO] Real-time monitoring started...")
+
+    # Load tracking data
+    file_hashes = load_file_hashes()
+    integrity_state = load_integrity_state()
 
     for event in notifier.event_gen(yield_nones=False):
         (_, type_names, path, filename) = event
         full_path = os.path.join(path, filename)
 
-        # Ensure we ignore files in exclusions
+        # Skip excluded files
         if full_path in exclusions.get("files", []):
             continue
 
-        # Handle file deletions
-        if "IN_DELETE" in type_names:
-            # Log file deletion
+        # 🔹 **Handle File Creation**
+        if "IN_CREATE" in type_names:
+            time.sleep(0.5)  # Small delay to ensure file creation completes
+            if os.path.exists(full_path):  # Ensure file still exists
+                file_hash = get_file_hash(full_path)
+                metadata = get_file_metadata(full_path)
+
+                if file_hash and metadata:
+                    file_hashes[full_path] = file_hash
+                    integrity_state[full_path] = metadata
+
+                    save_file_hashes(file_hashes)
+                    save_integrity_state(integrity_state)
+
+                    log_event(
+                        event_type="NEW FILE",
+                        file_path=full_path,
+                        new_metadata=metadata,
+                        new_hash=file_hash
+                    )
+
+                    print(f"[INFO] New file detected: {full_path}")
+
+        # 🔹 **Handle File Deletions**
+        elif "IN_DELETE" in type_names:
+            if full_path in file_hashes:
+                del file_hashes[full_path]  # Remove from hash tracking
+            if full_path in integrity_state:
+                del integrity_state[full_path]  # Remove from metadata tracking
+
+            save_file_hashes(file_hashes)
+            save_integrity_state(integrity_state)
+
             log_event(
                 event_type="DELETED FILE",
                 file_path=full_path
             )
-        
-            # Remove file from tracking
-            if full_path in file_hashes:
-                del file_hashes[full_path]
-        
-            if full_path in integrity_state:
-                del integrity_state[full_path]
-        
-            # Save updated tracking information
-            save_file_hashes(file_hashes)
-            save_integrity_state(integrity_state)
-        
+
             print(f"[INFO] File deleted: {full_path}")
 
+        # 🔹 **Handle File Modifications**
+        elif "IN_MODIFY" in type_names or "IN_ATTRIB" in type_names:
+            if os.path.exists(full_path):  # Ensure file still exists
+                new_hash = get_file_hash(full_path)
+                new_metadata = get_file_metadata(full_path)
+                previous_hash = file_hashes.get(full_path)
+                previous_metadata = integrity_state.get(full_path)
 
-        # Fetch current metadata and hash
-        new_metadata = get_file_metadata(full_path)
-        previous_metadata = integrity_state.get(full_path)
-        new_hash = get_file_hash(full_path)
-        previous_hash = file_hashes.get(full_path)
+                if previous_hash != new_hash or previous_metadata != new_metadata:
+                    file_hashes[full_path] = new_hash
+                    integrity_state[full_path] = new_metadata
 
-        # Detect metadata changes (permissions, owner, group, timestamps)
-        if "IN_ATTRIB" in type_names:
-            if previous_metadata and previous_metadata != new_metadata:
-                log_event(
-                    event_type="METADATA_CHANGED",
-                    file_path=full_path,
-                    previous_metadata=previous_metadata,
-                    new_metadata=new_metadata
-                )
-                integrity_state[full_path] = new_metadata  # Update metadata tracking
-                save_integrity_state(integrity_state)  # Ensure it's saved immediately
+                    save_file_hashes(file_hashes)
+                    save_integrity_state(integrity_state)
 
-        # Detect file content changes
-        if "IN_MODIFY" in type_names:
-            if new_hash and new_hash != previous_hash:
-                log_event(
-                    event_type="MODIFIED",
-                    file_path=full_path,
-                    previous_hash=previous_hash,
-                    new_hash=new_hash
-                )
-                file_hashes[full_path] = new_hash  # Update hash record
-                save_file_hashes(file_hashes)
+                    log_event(
+                        event_type="MODIFIED",
+                        file_path=full_path,
+                        previous_metadata=previous_metadata,
+                        new_metadata=new_metadata,
+                        previous_hash=previous_hash,
+                        new_hash=new_hash
+                    )
 
-        # Detect new files
-        if "IN_CREATE" in type_names:
-            log_event(
-                event_type="NEW FILE",
-                file_path=full_path,
-                new_metadata=new_metadata
-            )
-            file_hashes[full_path] = new_hash
-            integrity_state[full_path] = new_metadata
-            save_file_hashes(file_hashes)
-            save_integrity_state(integrity_state)
+                    print(f"[INFO] File modified: {full_path}")
 
 def scan_files(scheduled_directories, scan_interval, exclusions):
     """Perform periodic file integrity scans."""
@@ -361,7 +366,7 @@ def parse_arguments():
     return parser.parse_args()
 
 def run_monitor():
-    """Run the file monitoring process."""
+    """Run the file monitoring process with real-time monitoring and scheduled scans running separately."""
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -380,26 +385,18 @@ def run_monitor():
         print("[ERROR] No directories specified for monitoring. Exiting.")
         exit(1)
 
-    generate_file_hashes(scheduled_directories, real_time_directories, exclusions)
-
-    # Start real-time monitoring and periodic scanning as separate threads
+    # 🔹 Start real-time monitoring **immediately**
     if real_time_directories:
         rt_monitor = Thread(target=monitor_changes, args=(real_time_directories, exclusions), daemon=True)
         rt_monitor.start()
+        print("[INFO] Real-time monitoring started.")
 
+    # 🔹 Run the scheduled scan loop in the main thread
     if scheduled_directories:
-        periodic_scan = Thread(target=scan_files, args=(scheduled_directories, scan_interval, exclusions), daemon=True)
-        periodic_scan.start()
-
-    # Keep main thread alive
-    try:
         while True:
-            time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        print("[INFO] Terminating monitor process...")
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-        exit(0)
+            generate_file_hashes(scheduled_directories, real_time_directories, exclusions)
+            print(f"[INFO] Scheduled scan completed. Sleeping for {scan_interval} seconds.")
+            time.sleep(scan_interval)
 
 if __name__ == "__main__":
     args = parse_arguments()
