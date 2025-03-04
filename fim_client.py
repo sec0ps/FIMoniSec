@@ -63,7 +63,7 @@ def create_default_config():
     default_config = {
         "scheduled_scan": {
             "directories": ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/var/www"],
-            "scan_interval": 300
+            "scan_interval": 60
         },
         "real_time_monitoring": {
             "directories": ["/var/www"]
@@ -112,17 +112,14 @@ def load_config():
     with open(CONFIG_FILE, "r") as f:
         try:
             config = json.load(f)
+#            print(f"[DEBUG] Loaded config: {json.dumps(config, indent=4)}")  # Debugging line
 
             # Ensure the 'siem_settings' key exists
             if "siem_settings" not in config:
                 print("[WARNING] 'siem_settings' key missing in fim.config.")
+                audit.configure_siem()  # Prompt user for SIEM settings
+                return load_config()  # Reload config after setting SIEM
 
-                # Call configure_siem() to prompt the user and update the config
-                audit.configure_siem()
-
-                # Reload the updated configuration
-                with open(CONFIG_FILE, "r") as f:
-                    config = json.load(f)
             return config
 
         except json.JSONDecodeError:
@@ -141,6 +138,9 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     excluded_dirs = set(exclusions.get("directories", []))
     excluded_files = set(exclusions.get("files", []))
 
+    existing_files = set()
+    inode_tracking = {}  # Track inodes to prevent duplicate logging of hard links
+
     for directory in scheduled_directories + real_time_directories:
         if directory in excluded_dirs:
             continue
@@ -148,11 +148,7 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
         for filepath in Path(directory).rglob("*"):
             str_filepath = str(filepath)
 
-            # **Ensure exclusions apply BEFORE any processing**
-            if str_filepath in excluded_files:
-                continue
-
-            if any(str_filepath.startswith(excluded_dir) for excluded_dir in excluded_dirs):
+            if str_filepath in excluded_files or any(str_filepath.startswith(excluded_dir) for excluded_dir in excluded_dirs):
                 continue
 
             if filepath.is_file():
@@ -160,16 +156,22 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
                 metadata = get_file_metadata(filepath)
 
                 if file_hash and metadata:
+                    inode = metadata["inode"]  # Get inode number
+
+                    # **Check if this file's inode has been seen before**
+                    if inode in inode_tracking:
+                        print(f"[DEBUG] Skipping {str_filepath}, already logged via {inode_tracking[inode]}")
+                        continue
+                    else:
+                        inode_tracking[inode] = str_filepath  # Track inode
+
                     previous_hash = file_hashes.get(str_filepath)
                     previous_metadata = integrity_state.get(str_filepath)
-
-                    # **Exclusion Check Here Again to Avoid Logging**
-                    if str_filepath in excluded_files or any(str_filepath.startswith(excluded_dir) for excluded_dir in excluded_dirs):
-                        continue
 
                     if previous_hash == file_hash and previous_metadata == metadata:
                         new_file_hashes[str_filepath] = file_hash
                         new_integrity_state[str_filepath] = metadata
+                        existing_files.add(str_filepath)
                         continue
 
                     log_event(
@@ -183,12 +185,31 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
 
                     new_file_hashes[str_filepath] = file_hash
                     new_integrity_state[str_filepath] = metadata
+                    existing_files.add(str_filepath)
 
-    if new_file_hashes != file_hashes or new_integrity_state != integrity_state:
-        save_file_hashes(new_file_hashes)
-        save_integrity_state(new_integrity_state)
-    else:
-        print("[INFO] No changes detected. File hash tracking remains unchanged.")
+    # 🔹 **Detect Deleted Files**
+    deleted_files = set(file_hashes.keys()) - existing_files
+    for deleted_file in deleted_files:
+        log_event(
+            event_type="DELETED",
+            file_path=deleted_file,
+            previous_metadata=integrity_state.get(deleted_file, None),
+            new_metadata=None,
+            previous_hash=file_hashes.get(deleted_file, None),
+            new_hash=None
+        )
+        print(f"[INFO] Detected deleted file: {deleted_file}")
+
+    # 🔹 **Ensure deleted files are removed from BOTH `file_hashes` and `integrity_state`**
+    for deleted_file in deleted_files:
+        file_hashes.pop(deleted_file, None)
+        integrity_state.pop(deleted_file, None)  # <-- Ensure deletion from integrity_state
+
+    # 🔹 **Save Updated Hashes & Integrity State**
+    save_file_hashes(new_file_hashes)
+    save_integrity_state(new_integrity_state)
+
+    print("[INFO] File hash and integrity state tracking updated.")
 
 def compare_metadata(prev_metadata, new_metadata):
     """Compare metadata while ignoring last accessed time."""
@@ -216,16 +237,25 @@ def load_file_hashes():
             return dict(line.strip().split(":") for line in f if ":" in line)
     return {}
 
+import shutil
+
 def save_file_hashes(file_hashes):
     """Save updated file hashes to file, keeping a backup of the old file."""
-    if os.path.exists(HASH_FILE):
-        shutil.move(HASH_FILE, f"{HASH_FILE}_old")  # Create a backup before overwriting
+    temp_hash_file = f"{HASH_FILE}.tmp"
 
-    with open(HASH_FILE, "w") as f:
+    # ✅ Write new hashes to a temporary file first
+    with open(temp_hash_file, "w") as f:
         for file, file_hash in file_hashes.items():
             f.write(f"{file}:{file_hash}\n")
 
-    # Explicitly set file permissions to prevent permission errors
+    # ✅ Only create a backup if the current file exists and is not empty
+    if os.path.exists(HASH_FILE) and os.stat(HASH_FILE).st_size > 0:
+        shutil.copy(HASH_FILE, f"{HASH_FILE}_old")  # ✅ Preserve previous state instead of moving
+
+    # ✅ Now, safely replace the existing file with the new version
+    shutil.move(temp_hash_file, HASH_FILE)
+
+    # ✅ Explicitly set file permissions
     os.chmod(HASH_FILE, 0o600)
 
 def load_integrity_state():
