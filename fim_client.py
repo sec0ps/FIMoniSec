@@ -105,29 +105,31 @@ def create_default_config():
 def load_config():
     """Load configuration settings from fim.config file."""
     if not os.path.exists(CONFIG_FILE):
-        print("[ERROR] Configuration file not found.")
-        create_default_config()  # Create a default config if not found
-        return load_config()  # Reload config after creating it
+        print("[ERROR] Configuration file not found. Creating default config...")
+        create_default_config()
+        return load_config()  # Reload after creating the default config
 
     with open(CONFIG_FILE, "r") as f:
         try:
             config = json.load(f)
 
-            # Ensure the 'siem' key exists and has a valid value
-            if 'siem_settings' not in config:
-                print("[ERROR] 'siem_settings' key missing in fim.config. Adding default settings.")
-                config["siem_settings"] = {
-                    "enabled": False,  # Default to disabled
-                    "siem_server": "",
-                    "siem_port": 0
-                }
+            # Ensure the 'siem_settings' key exists
+            if "siem_settings" not in config:
+                print("[WARNING] 'siem_settings' key missing in fim.config.")
 
+                # Call configure_siem() to prompt the user and update the config
+                audit.configure_siem()
+
+                # Reload the updated configuration
+                with open(CONFIG_FILE, "r") as f:
+                    config = json.load(f)
             return config
+
         except json.JSONDecodeError:
-            print("[ERROR] Invalid JSON format in fim.config.")
+            print("[ERROR] Invalid JSON format in fim.config. Creating a new default config...")
             create_default_config()  # Create default config if JSON is invalid
-            return load_config()  # Reload the default config after creating it
-            
+            return load_config()  # Reload the default config
+
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions):
     """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
     file_hashes = load_file_hashes()
