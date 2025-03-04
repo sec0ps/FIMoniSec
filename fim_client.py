@@ -105,13 +105,22 @@ def create_default_config():
 def load_config():
     """Load configuration settings from fim.config file."""
     if not os.path.exists(CONFIG_FILE):
-        create_default_config()
+        print("[ERROR] Configuration file not found.")
+        return None
 
     with open(CONFIG_FILE, "r") as f:
-        config = json.load(f)
+        try:
+            config = json.load(f)
 
-    return config
+            if 'siem' not in config:
+                print("[ERROR] 'siem' key missing in fim.config.")
+                return None
 
+            return config
+        except json.JSONDecodeError:
+            print("[ERROR] Invalid JSON format in fim.config.")
+            return None
+            
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions):
     """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
     file_hashes = load_file_hashes()
