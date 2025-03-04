@@ -15,6 +15,7 @@ def ensure_log_directory():
 def configure_siem():
     """Prompt user for SIEM server configuration and save it in fim.config."""
     config = load_config()  # Load existing configuration
+
     siem_ip = input("Enter SIEM server IP address: ").strip()
     siem_port = input("Enter TCP port for log transmission: ").strip()
 
@@ -24,10 +25,11 @@ def configure_siem():
         print("[ERROR] Invalid port number. Please enter a numeric value.")
         return
 
-    # Update configuration with SIEM settings
-    config["siem"] = {
-        "server": siem_ip,
-        "port": siem_port
+    # Update configuration with SIEM settings under the correct key
+    config["siem_settings"] = {  # <-- Standardized key name
+        "enabled": True,
+        "siem_server": siem_ip,
+        "siem_port": siem_port
     }
 
     # Save the updated configuration
