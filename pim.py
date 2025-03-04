@@ -2,7 +2,6 @@ import os
 import time
 import json
 import subprocess
-#from fim_client import log_event  # Import logging function
 
 LOG_FILE = os.path.abspath("./logs/process_monitor.log")
 
