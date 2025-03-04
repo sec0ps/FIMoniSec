@@ -47,40 +47,37 @@ def load_siem_config():
     with open(CONFIG_FILE, "r") as f:
         try:
             config = json.load(f)
-            siem_config = config.get("siem")  # Ensure "siem" key is used
-            if not siem_config:
-                print("[ERROR] 'siem' key missing in fim.config.")
-                return None
-            return siem_config
+            return config.get("siem_settings", None)  # ✅ Correct key
         except json.JSONDecodeError:
             print("[ERROR] Invalid JSON format in fim.config.")
             return None
 
+_si_logged_once = False  # Global flag to track if the message was already printed
+
+import socket
+
 def send_to_siem(log_entry):
     """Send log entry to the configured SIEM server via TCP if enabled."""
     siem_config = load_siem_config()
-    if not siem_config:
-        print("[ERROR] SIEM configuration is missing or invalid.")
-        return
 
-    siem_host = siem_config.get("server")
-    siem_port = siem_config.get("port")
+    if not siem_config or not siem_config.get("enabled", False):
+        return  # Do nothing if SIEM is disabled
+
+    siem_host = siem_config.get("siem_server")
+    siem_port = siem_config.get("siem_port")
 
     if not siem_host or not siem_port:
         print("[ERROR] SIEM server or port not configured, skipping log transmission.")
         return
 
     log_data = json.dumps(log_entry) + "\n"
-#    print(f"[DEBUG] Sending log data to SIEM: {log_data}")  # Debugging step
 
     try:
         with socket.create_connection((siem_host, siem_port), timeout=5) as sock:
             sock.sendall(log_data.encode("utf-8"))
 #            print(f"[INFO] Log successfully sent to SIEM: {siem_host}:{siem_port}")
     except socket.timeout:
-        print(f"[ERROR] Connection to SIEM timed out: {siem_host}:{siem_port}")
-    except ConnectionRefusedError:
-        print(f"[ERROR] Connection refused by SIEM: {siem_host}:{siem_port}")
+        print(f"[ERROR] Timeout while sending log to SIEM {siem_host}:{siem_port}")
     except Exception as e:
         print(f"[ERROR] Failed to send log to SIEM: {e}")
 
