@@ -30,18 +30,29 @@ def ensure_log_file():
     os.chmod(LOG_FILE, 0o600)
 
 def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None):
-    """Log file change events in JSON format with detailed metadata."""
+    """Log file change events while ignoring last accessed time in metadata."""
+
+    def filter_metadata(metadata):
+        """Helper function to remove last_accessed before logging."""
+        if metadata:
+            return {k: v for k, v in metadata.items() if k != "last_accessed"}
+        return None
+
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "event_type": event_type,
         "file_path": file_path,
-        "previous_metadata": previous_metadata,
-        "new_metadata": new_metadata,
+        "previous_metadata": filter_metadata(previous_metadata),
+        "new_metadata": filter_metadata(new_metadata),
         "previous_hash": previous_hash,
         "new_hash": new_hash
     }
+
     with open(LOG_FILE, "a") as log:
         log.write(json.dumps(log_entry) + "\n")
+
+    # Send logs to SIEM (if configured)
+    audit.send_to_siem(log_entry)
 
 def ensure_output_dir():
     """Ensure that the output directory exists with appropriate permissions."""
@@ -61,6 +72,7 @@ def create_default_config():
             "directories": ["/var/log"],
             "files": [
                 "/etc/mnttab",
+                "/etc/mtab",
                 "/etc/hosts.deny",
                 "/etc/mail/statistics",
                 "/etc/random-seed",
@@ -73,10 +85,16 @@ def create_default_config():
                 "/etc/svc/volatile"
             ]
         },
+        "siem_settings": {
+            "enabled": False,  # Default to disabled
+            "siem_server": "",
+            "siem_port": 0
+        },
         "instructions": {
             "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
             "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
-            "exclusions": "Specify directories or files to be excluded from scanning and monitoring."
+            "exclusions": "Specify directories or files to be excluded from scanning and monitoring.",
+            "siem_settings": "Set 'enabled' to true, and provide 'siem_server' and 'siem_port' for SIEM logging."
         }
     }
     with open(CONFIG_FILE, "w") as f:
@@ -92,7 +110,6 @@ def load_config():
     with open(CONFIG_FILE, "r") as f:
         config = json.load(f)
 
-    print(f"[DEBUG] Loaded Exclusions: {config.get('exclusions', {})}")  # DEBUG to confirm exclusions
     return config
 
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions):
@@ -108,7 +125,6 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
 
     for directory in scheduled_directories + real_time_directories:
         if directory in excluded_dirs:
-            print(f"[DEBUG] Skipping excluded directory: {directory}")
             continue
 
         for filepath in Path(directory).rglob("*"):
@@ -116,11 +132,9 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
 
             # **Ensure exclusions apply BEFORE any processing**
             if str_filepath in excluded_files:
-                print(f"[DEBUG] Skipping excluded file: {str_filepath}")
                 continue
 
             if any(str_filepath.startswith(excluded_dir) for excluded_dir in excluded_dirs):
-                print(f"[DEBUG] Skipping file inside excluded directory: {str_filepath}")
                 continue
 
             if filepath.is_file():
@@ -155,20 +169,19 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     if new_file_hashes != file_hashes or new_integrity_state != integrity_state:
         save_file_hashes(new_file_hashes)
         save_integrity_state(new_integrity_state)
-        print(f"[INFO] File hash tracking updated. {len(new_file_hashes)} entries stored.")
     else:
         print("[INFO] No changes detected. File hash tracking remains unchanged.")
 
-def compare_metadata(old_metadata, new_metadata):
-    """Compare metadata while ignoring last_accessed."""
-    if not old_metadata or not new_metadata:
-        return True  # If missing, treat as a change
+def compare_metadata(prev_metadata, new_metadata):
+    """Compare metadata while ignoring last accessed time."""
+    if not prev_metadata or not new_metadata:
+        return False  # No metadata to compare
 
-    ignored_keys = {"last_accessed"}  # Ignore atime
-    filtered_old = {k: v for k, v in old_metadata.items() if k not in ignored_keys}
+    ignored_keys = ["last_accessed"]
+    filtered_prev = {k: v for k, v in prev_metadata.items() if k not in ignored_keys}
     filtered_new = {k: v for k, v in new_metadata.items() if k not in ignored_keys}
 
-    return filtered_old != filtered_new  # Returns True if metadata differs
+    return filtered_prev != filtered_new  # Returns True if metadata (excluding access time) changed
 
 def get_file_hash(filepath):
     """Generate SHA-256 hash of a file."""
@@ -210,7 +223,7 @@ def save_integrity_state(state):
         json.dump(state, f, indent=4)
 
 def get_file_metadata(filepath):
-    """Retrieve metadata of a file."""
+    """Retrieve metadata of a file while tracking but ignoring last accessed time."""
     try:
         stats = os.stat(filepath)
         return {
@@ -218,7 +231,6 @@ def get_file_metadata(filepath):
             "permissions": oct(stats.st_mode),
             "owner": stats.st_uid,
             "group": stats.st_gid,
-            "last_accessed": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_atime)),
             "last_modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_mtime)),
             "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stats.st_ctime)),
             "inode": stats.st_ino,
