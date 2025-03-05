@@ -1,253 +1,101 @@
+import json
 import os
 import time
-import json
-import subprocess
-import hashlib
-from pathlib import Path
+import socket
+#from fim_client import load_config  # Import load_config from fim-client.py
 
-OUTPUT_DIR = os.path.abspath("./output")
-LOG_FILE = os.path.abspath("./logs/process_monitor.log")
-PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
-INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
+LOG_DIR = os.path.abspath("./logs")
+LOG_FILE = os.path.join(LOG_DIR, "audit.log")
+CONFIG_FILE = os.path.abspath("fim.config")
 
-def ensure_output_dir():
-    """Ensure that the output directory exists with appropriate permissions."""
-    os.makedirs(OUTPUT_DIR, mode=0o700, exist_ok=True)
+def ensure_log_directory():
+    """Ensure the logs directory exists."""
+    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
 
-def ensure_log_file():
-    """Ensure the log directory and log file exist with appropriate permissions."""
-    log_dir = os.path.dirname(LOG_FILE)
-    os.makedirs(log_dir, mode=0o700, exist_ok=True)  # Ensure directory exists
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w") as f:
-            json.dump([], f)
-    os.chmod(LOG_FILE, 0o600)
+def configure_siem():
+    """Prompt user for SIEM server configuration and save it in fim.config."""
+    from fim_client import load_config  # Import inside function to avoid circular import
 
-def load_process_hashes():
-    """Load stored process hashes from process_hashes.txt."""
-    if os.path.exists(PROCESS_HASHES_FILE):  # ✅ Corrected name
-        with open(PROCESS_HASHES_FILE, "r") as f:
-            return dict(line.strip().split(":") for line in f if ":" in line)
-    return {}
+    config = load_config()  # Load existing configuration
+    siem_ip = input("Enter SIEM server IP address: ").strip()
+    siem_port = input("Enter TCP port for log transmission: ").strip()
 
-def save_process_hashes(process_hashes):
-    """Save updated process hashes."""
-    with open(PROCESS_HASHES_FILE, "w") as f:  # ✅ Corrected name
-        for exe_path, hash_value in process_hashes.items():
-            f.write(f"{exe_path}:{hash_value}\n")
-
-def load_process_metadata():
-    """Load stored process metadata from integrity_processes.json."""
-    if os.path.exists(INTEGRITY_PROCESS_FILE):  # ✅ Corrected name
-        with open(INTEGRITY_PROCESS_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_process_metadata(integrity_state):
-    """Save updated process metadata."""
-    with open(INTEGRITY_PROCESS_FILE, "w") as f:  # ✅ Corrected name
-        json.dump(integrity_state, f, indent=4)
-
-def get_process_hash(exe_path):
-    """Generate SHA-256 hash of the process executable."""
     try:
-        with open(exe_path, "rb") as f:
-            hash_value = hashlib.sha256(f.read()).hexdigest()
-            return hash_value
+        siem_port = int(siem_port)
+    except ValueError:
+        print("[ERROR] Invalid port number. Please enter a numeric value.")
+        return
+
+    # Update configuration with SIEM settings
+    config["siem_settings"] = {
+        "enabled": True,
+        "siem_server": siem_ip,
+        "siem_port": siem_port
+    }
+
+    # Save the updated configuration
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+    print(f"[INFO] SIEM server configuration saved in {CONFIG_FILE}.")
+
+
+def load_siem_config():
+    """Load SIEM server configuration from fim.config."""
+    if not os.path.exists(CONFIG_FILE):
+        print("[ERROR] Configuration file not found.")
+        return None
+
+    with open(CONFIG_FILE, "r") as f:
+        try:
+            config = json.load(f)
+            return config.get("siem_settings", None)  # ✅ Correct key
+        except json.JSONDecodeError:
+            print("[ERROR] Invalid JSON format in fim.config.")
+            return None
+
+_si_logged_once = False  # Global flag to track if the message was already printed
+
+def send_to_siem(log_entry):
+    """Send log entry to the configured SIEM server via TCP if enabled."""
+    siem_config = load_siem_config()
+
+    if not siem_config or not siem_config.get("enabled", False):
+        return  # Do nothing if SIEM is disabled
+
+    siem_host = siem_config.get("siem_server")
+    siem_port = siem_config.get("siem_port")
+
+    if not siem_host or not siem_port:
+        print("[ERROR] SIEM server or port not configured, skipping log transmission.")
+        return
+
+    log_data = json.dumps(log_entry) + "\n"
+
+    try:
+        with socket.create_connection((siem_host, siem_port), timeout=5) as sock:
+            sock.sendall(log_data.encode("utf-8"))
+#            print(f"[INFO] Log successfully sent to SIEM: {siem_host}:{siem_port}")
+    except socket.timeout:
+        print(f"[ERROR] Timeout while sending log to SIEM {siem_host}:{siem_port}")
     except Exception as e:
-        print(f"[ERROR] Could not generate hash for {exe_path}: {e}")
-        return "ERROR_HASHING"
+        print(f"[ERROR] Failed to send log to SIEM: {e}")
 
-def log_new_process(event_type, file_path, metadata):
-    """Logs new listening process without causing circular import."""
-    from fim_client import log_event  # Import inside function to avoid circular import
+def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None):
+    """Log file change events in JSON format and send to SIEM."""
+    log_entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": event_type,
+        "file_path": file_path,
+        "previous_metadata": previous_metadata,
+        "new_metadata": new_metadata,
+        "previous_hash": previous_hash,
+        "new_hash": new_hash
+    }
 
-    log_event(
-        event_type=event_type,
-        file_path=file_path,
-        previous_metadata=None,
-        new_metadata=metadata,
-        previous_hash=None,
-        new_hash=metadata.get("hash", "UNKNOWN")  # ✅ Ensure the hash is logged
-    )
+    # Write log to local file
+    with open(LOG_FILE, "a") as log:
+        log.write(json.dumps(log_entry) + "\n")
 
-def get_listening_processes():
-    """Retrieve all listening processes and their metadata."""
-    listening_processes = {}
-
-    try:
-        lsof_command = "sudo lsof -i -P -n | grep LISTEN"
-        output = subprocess.check_output(lsof_command, shell=True, text=True)
-
-        for line in output.splitlines():
-            parts = line.split()
-            pid = parts[1]  # Second column is PID
-            exe_path = f"/proc/{pid}/exe"
-
-            try:
-                # ✅ Use sudo to resolve permission issues
-                exe_real_path = subprocess.check_output(f"sudo readlink -f {exe_path}", shell=True, text=True).strip()
-                process_hash = get_process_hash(exe_real_path) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN"
-
-            except (PermissionError, FileNotFoundError, subprocess.CalledProcessError):
-                exe_real_path = "PERMISSION_DENIED"
-                process_hash = "UNKNOWN"
-
-            port = parts[-2].split(':')[-1]  # Extract port number
-            if port.isdigit():
-                port = int(port)
-
-            listening_processes[int(pid)] = {
-                "pid": int(pid),
-                "exe_path": exe_real_path,
-                "process_name": os.path.basename(exe_real_path) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN",
-                "port": port,
-                "user": subprocess.getoutput(f"ps -o user= -p {pid}").strip(),
-                "start_time": subprocess.getoutput(f"ps -o lstart= -p {pid}").strip(),
-                "cmdline": subprocess.getoutput(f"tr '\\0' ' ' < /proc/{pid}/cmdline").strip(),
-                "hash": process_hash,  # ✅ Store the hash correctly
-                "ppid": int(subprocess.getoutput(f"ps -o ppid= -p {pid}").strip()) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN",
-            }
-
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to retrieve listening processes: {e}")
-
-    return listening_processes
-
-def monitor_listening_processes(interval=2):
-    """Continuously monitors for new and terminated listening processes."""
-    known_processes = get_listening_processes()  # Get initial known processes
-    terminated_processes = set()  # Track terminated processes to avoid repeat logging
-
-    while True:
-        current_processes = get_listening_processes()
-
-        new_processes = {
-            pid: info for pid, info in current_processes.items()
-            if pid not in known_processes
-        }
-
-        terminated_pids = {
-            pid: info for pid, info in known_processes.items()
-            if pid not in current_processes
-        }
-
-        from fim_client import log_event  # Import inside function to avoid circular import
-
-        # 🔹 Logging new processes
-        for pid, info in new_processes.items():
-            print(f"[ALERT] New listening process detected! PID: {pid}, Executable: {info['exe_path']}, Port: {info['port']}")
-
-            log_data = {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "event_type": "NEW_LISTENING_PROCESS",
-                "pid": pid,
-                "exe_path": info["exe_path"],
-                "port": info["port"],
-                "hash": info.get("hash", "UNKNOWN")  # ✅ Ensure hash is included
-            }
-
-            # Log locally
-            with open(LOG_FILE, "a") as log:
-                log.write(json.dumps(log_data) + "\n")
-
-            # Log event to FIM system
-            log_event(
-                event_type="NEW_LISTENING_PROCESS",
-                file_path=info["exe_path"],
-                previous_metadata=None,
-                new_metadata=log_data,
-                previous_hash=None,
-                new_hash=info.get("hash", "UNKNOWN")  # ✅ Ensure the hash is logged
-            )
-
-            # Update process hash and metadata tracking
-            update_process_tracking(info["exe_path"], info["hash"], info)
-
-        # 🔹 Logging terminated processes (ONLY ONCE)
-        for pid, info in terminated_pids.items():
-            if pid in terminated_processes:
-                continue  # Skip already logged terminations
-
-            print(f"[INFO] Process terminated: PID: {pid}, Executable: {info['exe_path']}, Port: {info['port']}")
-
-            log_data = {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "event_type": "PROCESS_TERMINATED",
-                "pid": pid,
-                "exe_path": info["exe_path"],
-                "port": info["port"],
-                "hash": info.get("hash", "UNKNOWN")  # ✅ Ensure hash is logged
-            }
-
-            # Log locally
-            with open(LOG_FILE, "a") as log:
-                log.write(json.dumps(log_data) + "\n")
-
-            # Log event to FIM system
-            log_event(
-                event_type="PROCESS_TERMINATED",
-                file_path=info["exe_path"],
-                previous_metadata=None,
-                new_metadata=None,
-                previous_hash=info.get("hash", "UNKNOWN"),  # ✅ Ensure the hash is logged
-                new_hash=None
-            )
-
-            # Remove process from tracking files
-            remove_process_tracking(info["exe_path"])
-
-            # Mark process as terminated to prevent duplicate logging
-            terminated_processes.add(pid)
-
-        known_processes = current_processes  # Update process tracking
-        time.sleep(interval)
-
-def remove_process_tracking(exe_path):
-    """Remove process hash and metadata when a process terminates."""
-    process_hashes = load_process_hashes()
-    integrity_state = load_process_metadata()
-
-    # Remove process from process_hashes.txt
-    if exe_path in process_hashes:
-        del process_hashes[exe_path]
-
-    # Remove process from integrity_processes.json
-    if exe_path in integrity_state:
-        del integrity_state[exe_path]
-
-    # Save updated files
-    save_process_hashes(process_hashes)  # ✅ Ensure process hashes are updated
-    save_process_metadata(integrity_state)  # ✅ Ensure metadata is removed
-
-def update_process_tracking(exe_path, process_hash, metadata):
-    """Update process tracking files with new or modified processes."""
-    process_hashes = load_process_hashes()
-    integrity_state = load_process_metadata()
-
-    process_hashes[exe_path] = process_hash
-    integrity_state[exe_path] = metadata
-
-    save_process_hashes(process_hashes)
-    save_process_metadata(integrity_state)
-
-def save_process_hashes(process_hashes):
-    """Save process hashes to process_hashes.txt."""
-    with open(PROCESS_HASHES_FILE, "w") as f:
-        for exe_path, hash_value in process_hashes.items():  # Fix: Correct iteration
-            f.write(f"{exe_path}:{hash_value}\n")  # Fix: Using correct dictionary structure
-    os.chmod(PROCESS_HASHES_FILE, 0o600)
-
-def save_integrity_processes(processes):
-    """Save full process metadata to integrity_processes.json."""
-    with open(INTEGRITY_PROCESS_FILE, "w") as f:
-        json.dump(processes, f, indent=4)
-    os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
-
-if __name__ == "__main__":
-    ensure_log_file()
-
-    print("[INFO] Listening process monitoring started...")
-
-    # Run the listener detection
-    monitor_listening_processes()
+    # Send log to SIEM
+    send_to_splunk(log_entry)
