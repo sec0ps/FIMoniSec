@@ -20,6 +20,7 @@ PID_FILE = os.path.abspath("fim.pid")
 OUTPUT_DIR = os.path.abspath("./output")
 HASH_FILE = os.path.join(OUTPUT_DIR, "file_hashes.txt")
 INTEGRITY_STATE_FILE = os.path.join(OUTPUT_DIR, "integrity_state.json")
+INODE_TRACKING_FILE = os.path.join(OUTPUT_DIR, "inode_tracking.json")
 
 def ensure_log_file():
     """Ensure that the log directory and log file exist with appropriate permissions."""
@@ -131,15 +132,16 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
     file_hashes = load_file_hashes()
     integrity_state = load_integrity_state()
+    inode_tracking = load_inode_tracking()  # ✅ NEW: Load inode tracking from file
 
     new_file_hashes = {}
     new_integrity_state = {}
+    new_inode_tracking = {}
 
     excluded_dirs = set(exclusions.get("directories", []))
     excluded_files = set(exclusions.get("files", []))
 
     existing_files = set()
-    inode_tracking = {}  # Track inodes to prevent duplicate logging of hard links
 
     for directory in scheduled_directories + real_time_directories:
         if directory in excluded_dirs:
@@ -148,6 +150,7 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
         for filepath in Path(directory).rglob("*"):
             str_filepath = str(filepath)
 
+            # ✅ **Apply exclusions before processing**
             if str_filepath in excluded_files or any(str_filepath.startswith(excluded_dir) for excluded_dir in excluded_dirs):
                 continue
 
@@ -156,38 +159,31 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
                 metadata = get_file_metadata(filepath)
 
                 if file_hash and metadata:
-                    inode = metadata["inode"]  # Get inode number
+                    inode = metadata["inode"]  # ✅ NEW: Track inode
 
-                    # **Check if this file's inode has been seen before**
-                    if inode in inode_tracking:
-                        print(f"[DEBUG] Skipping {str_filepath}, already logged via {inode_tracking[inode]}")
-                        continue
-                    else:
-                        inode_tracking[inode] = str_filepath  # Track inode
+                    # **✅ Check if this inode was seen before at a different path (File Moved)**
+                    if inode in inode_tracking and inode_tracking[inode] != str_filepath:
+                        log_event(
+                            event_type="MOVED",
+                            file_path=str_filepath,
+                            previous_metadata=integrity_state.get(inode_tracking[inode], None),
+                            new_metadata=metadata,
+                            previous_hash=file_hashes.get(inode_tracking[inode], None),
+                            new_hash=file_hash
+                        )
+                        print(f"[INFO] File moved: {inode_tracking[inode]} → {str_filepath}")
 
-                    previous_hash = file_hashes.get(str_filepath)
-                    previous_metadata = integrity_state.get(str_filepath)
+                        # ✅ **Remove old file tracking**
+                        file_hashes.pop(inode_tracking[inode], None)
+                        integrity_state.pop(inode_tracking[inode], None)
 
-                    if previous_hash == file_hash and previous_metadata == metadata:
-                        new_file_hashes[str_filepath] = file_hash
-                        new_integrity_state[str_filepath] = metadata
-                        existing_files.add(str_filepath)
-                        continue
-
-                    log_event(
-                        event_type="MODIFIED" if previous_hash else "NEW FILE",
-                        file_path=str_filepath,
-                        previous_metadata=previous_metadata,
-                        new_metadata=metadata,
-                        previous_hash=previous_hash,
-                        new_hash=file_hash
-                    )
-
+                    # ✅ **Track new file information**
                     new_file_hashes[str_filepath] = file_hash
                     new_integrity_state[str_filepath] = metadata
+                    new_inode_tracking[inode] = str_filepath  # ✅ Store inode mapping
                     existing_files.add(str_filepath)
 
-    # 🔹 **Detect Deleted Files**
+    # 🔹 **Detect Deleted Files (Not Moved)**
     deleted_files = set(file_hashes.keys()) - existing_files
     for deleted_file in deleted_files:
         log_event(
@@ -200,14 +196,13 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
         )
         print(f"[INFO] Detected deleted file: {deleted_file}")
 
-    # 🔹 **Ensure deleted files are removed from BOTH `file_hashes` and `integrity_state`**
-    for deleted_file in deleted_files:
         file_hashes.pop(deleted_file, None)
-        integrity_state.pop(deleted_file, None)  # <-- Ensure deletion from integrity_state
+        integrity_state.pop(deleted_file, None)
 
-    # 🔹 **Save Updated Hashes & Integrity State**
+    # ✅ **Save Updated Hashes, Integrity State, and Inode Tracking**
     save_file_hashes(new_file_hashes)
     save_integrity_state(new_integrity_state)
+    save_inode_tracking(new_inode_tracking)  # ✅ NEW: Save inode tracking persistently
 
     print("[INFO] File hash and integrity state tracking updated.")
 
@@ -236,8 +231,6 @@ def load_file_hashes():
         with open(HASH_FILE, "r") as f:
             return dict(line.strip().split(":") for line in f if ":" in line)
     return {}
-
-import shutil
 
 def save_file_hashes(file_hashes):
     """Save updated file hashes to file, keeping a backup of the old file."""
@@ -291,8 +284,10 @@ def get_file_metadata(filepath):
         return None
 
 class EventHandler(pyinotify.ProcessEvent):
+    moved_files = {}  # Dictionary to track moved files (inode: old_path)
+
     def process_IN_CREATE(self, event):
-        """Handles file creation event."""
+        """Handles file creation."""
         full_path = event.pathname
         file_hash = get_file_hash(full_path)
         metadata = get_file_metadata(full_path)
@@ -309,10 +304,14 @@ class EventHandler(pyinotify.ProcessEvent):
         update_file_tracking(full_path, file_hash, metadata)
 
     def process_IN_DELETE(self, event):
-        """Handles file deletion event."""
+        """Handles file deletion. Avoid logging if the file was moved."""
         full_path = event.pathname
         previous_metadata = integrity_state.get(full_path, None)
         previous_hash = file_hashes.get(full_path, None)
+
+        # **Check if this file was moved before considering it deleted**
+        if previous_metadata and previous_metadata["inode"] in self.moved_files:
+            return  # Skip delete event as it's part of a move
 
         log_event(
             event_type="DELETED",
@@ -325,15 +324,32 @@ class EventHandler(pyinotify.ProcessEvent):
 
         remove_file_tracking(full_path)
 
+    def process_IN_ATTRIB(self, event):
+        """Handles metadata changes like permission and ownership updates."""
+        full_path = event.pathname
+        metadata = get_file_metadata(full_path)
+        previous_metadata = integrity_state.get(full_path)
+
+        if metadata and previous_metadata and compare_metadata(previous_metadata, metadata):
+            log_event(
+                event_type="METADATA_CHANGED",
+                file_path=full_path,
+                previous_metadata=previous_metadata,
+                new_metadata=metadata,
+                previous_hash=None,
+                new_hash=None
+            )
+            update_file_tracking(full_path, get_file_hash(full_path), metadata)
+
     def process_IN_MODIFY(self, event):
-        """Handles file modification event."""
+        """Handles file modifications."""
         full_path = event.pathname
         file_hash = get_file_hash(full_path)
         metadata = get_file_metadata(full_path)
         previous_hash = file_hashes.get(full_path)
         previous_metadata = integrity_state.get(full_path)
 
-        if file_hash != previous_hash:
+        if file_hash and file_hash != previous_hash:
             log_event(
                 event_type="MODIFIED",
                 file_path=full_path,
@@ -344,23 +360,55 @@ class EventHandler(pyinotify.ProcessEvent):
             )
             update_file_tracking(full_path, file_hash, metadata)
 
-    def process_IN_ATTRIB(self, event):
-        """Handles metadata change event."""
+    def process_IN_MOVED_FROM(self, event):
+        """Handles a file being moved FROM a location."""
         full_path = event.pathname
         metadata = get_file_metadata(full_path)
-        previous_metadata = integrity_state.get(full_path)
 
-        if metadata != previous_metadata:
-            log_event(
-                event_type="METADATA_CHANGED",
-                file_path=full_path,
-                previous_metadata=previous_metadata,
-                new_metadata=metadata,
-                previous_hash=None,
-                new_hash=None
-            )
-            integrity_state[full_path] = metadata
-            save_integrity_state(integrity_state)
+        if metadata:
+            inode = metadata["inode"]
+            self.moved_files[inode] = full_path  # Store old path by inode
+            print(f"[DEBUG] File moved FROM: {full_path} (inode: {inode})")
+
+    def process_IN_MOVED_TO(self, event):
+        """Handles a file being moved TO a new location."""
+        full_path = event.pathname
+        metadata = get_file_metadata(full_path)
+
+        if metadata:
+            inode = metadata["inode"]
+
+            if inode in self.moved_files:
+                old_path = self.moved_files.pop(inode)
+
+                # Log MOVE event
+                log_event(
+                    event_type="MOVED",
+                    file_path=full_path,
+                    previous_metadata=get_file_metadata(old_path),
+                    new_metadata=metadata,
+                    previous_hash=get_file_hash(old_path),
+                    new_hash=get_file_hash(full_path)
+                )
+
+                print(f"[INFO] File moved: {old_path} → {full_path}")
+
+                # Ensure we update tracking
+                remove_file_tracking(old_path)
+                update_file_tracking(full_path, get_file_hash(full_path), metadata)
+
+            else:
+                # If we don't have a previous record, treat it as a new file
+                file_hash = get_file_hash(full_path)
+                log_event(
+                    event_type="NEW FILE",
+                    file_path=full_path,
+                    previous_metadata=None,
+                    new_metadata=metadata,
+                    previous_hash=None,
+                    new_hash=file_hash
+                )
+                update_file_tracking(full_path, file_hash, metadata)
 
 def monitor_changes(real_time_directories, exclusions):
     """Monitors file system changes using pyinotify."""
@@ -491,6 +539,18 @@ def run_monitor():
             generate_file_hashes(scheduled_directories, real_time_directories, exclusions)
             print(f"[INFO] Scheduled scan completed. Sleeping for {scan_interval} seconds.")
             time.sleep(scan_interval)
+
+def load_inode_tracking():
+    """Load previous inode tracking data."""
+    if os.path.exists(INODE_TRACKING_FILE):
+        with open(INODE_TRACKING_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_inode_tracking(inode_tracking):
+    """Save updated inode tracking data."""
+    with open(INODE_TRACKING_FILE, "w") as f:
+        json.dump(inode_tracking, f, indent=4)
 
 if __name__ == "__main__":
     args = parse_arguments()
