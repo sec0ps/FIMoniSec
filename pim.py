@@ -25,27 +25,27 @@ def ensure_log_file():
 
 def load_process_hashes():
     """Load stored process hashes from process_hashes.txt."""
-    if os.path.exists(PROCESS_HASHES_FILE):
+    if os.path.exists(PROCESS_HASHES_FILE):  # ✅ Corrected name
         with open(PROCESS_HASHES_FILE, "r") as f:
             return dict(line.strip().split(":") for line in f if ":" in line)
     return {}
 
 def save_process_hashes(process_hashes):
     """Save updated process hashes."""
-    with open(PROCESS_HASHES_FILE, "w") as f:
+    with open(PROCESS_HASHES_FILE, "w") as f:  # ✅ Corrected name
         for exe_path, hash_value in process_hashes.items():
             f.write(f"{exe_path}:{hash_value}\n")
 
 def load_process_metadata():
     """Load stored process metadata from integrity_processes.json."""
-    if os.path.exists(INTEGRITY_PROCESS_FILE):
+    if os.path.exists(INTEGRITY_PROCESS_FILE):  # ✅ Corrected name
         with open(INTEGRITY_PROCESS_FILE, "r") as f:
             return json.load(f)
     return {}
 
 def save_process_metadata(integrity_state):
     """Save updated process metadata."""
-    with open(INTEGRITY_PROCESS_FILE, "w") as f:
+    with open(INTEGRITY_PROCESS_FILE, "w") as f:  # ✅ Corrected name
         json.dump(integrity_state, f, indent=4)
 
 def get_process_hash(exe_path):
@@ -68,7 +68,7 @@ def log_new_process(event_type, file_path, metadata):
         previous_metadata=None,
         new_metadata=metadata,
         previous_hash=None,
-        new_hash=metadata.get("hash", "UNKNOWN")
+        new_hash=metadata.get("hash", "UNKNOWN")  # ✅ Ensure the hash is logged
     )
 
 def get_listening_processes():
@@ -85,7 +85,7 @@ def get_listening_processes():
             exe_path = f"/proc/{pid}/exe"
 
             try:
-                # Use sudo to resolve permission issues
+                # ✅ Use sudo to resolve permission issues
                 exe_real_path = subprocess.check_output(f"sudo readlink -f {exe_path}", shell=True, text=True).strip()
                 process_hash = get_process_hash(exe_real_path) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN"
 
@@ -105,7 +105,7 @@ def get_listening_processes():
                 "user": subprocess.getoutput(f"ps -o user= -p {pid}").strip(),
                 "start_time": subprocess.getoutput(f"ps -o lstart= -p {pid}").strip(),
                 "cmdline": subprocess.getoutput(f"tr '\\0' ' ' < /proc/{pid}/cmdline").strip(),
-                "hash": process_hash,
+                "hash": process_hash,  # ✅ Store the hash correctly
                 "ppid": int(subprocess.getoutput(f"ps -o ppid= -p {pid}").strip()) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN",
             }
 
@@ -144,7 +144,7 @@ def monitor_listening_processes(interval=2):
                 "pid": pid,
                 "exe_path": info["exe_path"],
                 "port": info["port"],
-                "hash": info.get("hash", "UNKNOWN")
+                "hash": info.get("hash", "UNKNOWN")  # ✅ Ensure hash is included
             }
 
             # Log locally
@@ -158,7 +158,7 @@ def monitor_listening_processes(interval=2):
                 previous_metadata=None,
                 new_metadata=log_data,
                 previous_hash=None,
-                new_hash=info.get("hash", "UNKNOWN")
+                new_hash=info.get("hash", "UNKNOWN")  # ✅ Ensure the hash is logged
             )
 
             # Update process hash and metadata tracking
@@ -177,7 +177,7 @@ def monitor_listening_processes(interval=2):
                 "pid": pid,
                 "exe_path": info["exe_path"],
                 "port": info["port"],
-                "hash": info.get("hash", "UNKNOWN")
+                "hash": info.get("hash", "UNKNOWN")  # ✅ Ensure hash is logged
             }
 
             # Log locally
@@ -190,7 +190,7 @@ def monitor_listening_processes(interval=2):
                 file_path=info["exe_path"],
                 previous_metadata=None,
                 new_metadata=None,
-                previous_hash=info.get("hash", "UNKNOWN"),
+                previous_hash=info.get("hash", "UNKNOWN"),  # ✅ Ensure the hash is logged
                 new_hash=None
             )
 
@@ -217,8 +217,8 @@ def remove_process_tracking(exe_path):
         del integrity_state[exe_path]
 
     # Save updated files
-    save_process_hashes(process_hashes)
-    save_process_metadata(integrity_state)
+    save_process_hashes(process_hashes)  # ✅ Ensure process hashes are updated
+    save_process_metadata(integrity_state)  # ✅ Ensure metadata is removed
 
 def update_process_tracking(exe_path, process_hash, metadata):
     """Update process tracking files with new or modified processes."""
