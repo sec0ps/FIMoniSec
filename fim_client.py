@@ -253,7 +253,7 @@ def save_file_hashes(file_hashes):
         shutil.copy(HASH_FILE, f"{HASH_FILE}_old")  # ✅ Preserve previous state instead of moving
 
     # ✅ Now, safely replace the existing file with the new version
-    shutil.move(temp_hash_file, HASH_FILE)
+    shutil.copy(temp_hash_file, HASH_FILE)
 
     # ✅ Explicitly set file permissions
     os.chmod(HASH_FILE, 0o600)
