@@ -2,7 +2,7 @@ import json
 import os
 import time
 import socket
-from fim_client import load_config  # Import load_config from fim-client.py
+#from fim_client import load_config  # Import load_config from fim-client.py
 
 LOG_DIR = os.path.abspath("./logs")
 LOG_FILE = os.path.join(LOG_DIR, "audit.log")
@@ -14,8 +14,9 @@ def ensure_log_directory():
 
 def configure_siem():
     """Prompt user for SIEM server configuration and save it in fim.config."""
-    config = load_config()  # Load existing configuration
+    from fim_client import load_config  # Import inside function to avoid circular import
 
+    config = load_config()  # Load existing configuration
     siem_ip = input("Enter SIEM server IP address: ").strip()
     siem_port = input("Enter TCP port for log transmission: ").strip()
 
@@ -25,8 +26,8 @@ def configure_siem():
         print("[ERROR] Invalid port number. Please enter a numeric value.")
         return
 
-    # Update configuration with SIEM settings under the correct key
-    config["siem_settings"] = {  # <-- Standardized key name
+    # Update configuration with SIEM settings
+    config["siem_settings"] = {
         "enabled": True,
         "siem_server": siem_ip,
         "siem_port": siem_port
@@ -37,6 +38,7 @@ def configure_siem():
         json.dump(config, f, indent=4)
 
     print(f"[INFO] SIEM server configuration saved in {CONFIG_FILE}.")
+
 
 def load_siem_config():
     """Load SIEM server configuration from fim.config."""
@@ -53,8 +55,6 @@ def load_siem_config():
             return None
 
 _si_logged_once = False  # Global flag to track if the message was already printed
-
-import socket
 
 def send_to_siem(log_entry):
     """Send log entry to the configured SIEM server via TCP if enabled."""
