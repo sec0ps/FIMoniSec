@@ -2,7 +2,6 @@ import os
 import time
 import json
 import subprocess
-#from fim_client import log_event  # Import logging function
 
 LOG_FILE = os.path.abspath("./logs/process_monitor.log")
 
@@ -16,8 +15,8 @@ def ensure_log_file():
     os.chmod(LOG_FILE, 0o600)
 
 def log_new_process(event_type, file_path, metadata):
-    """Logs new listening process without circular import."""
-    from fim_client import log_event  # Import only when function runs
+    """Logs new listening process without causing circular import."""
+    from fim_client import log_event  # Import inside function to avoid circular import
     log_event(event_type, file_path, previous_metadata=None, new_metadata=metadata)
 
 def get_listening_processes():
@@ -25,8 +24,8 @@ def get_listening_processes():
     listening_processes = {}
 
     try:
-        # Ensure 'sudo' is used with lsof and preserve environment
-        lsof_command = "sudo -E lsof -i -P -n | grep LISTEN"
+        # Use sudo with lsof to get listening processes
+        lsof_command = "sudo lsof -i -P -n | grep LISTEN"
         output = subprocess.check_output(lsof_command, shell=True, text=True)
 
         for line in output.splitlines():
@@ -35,25 +34,19 @@ def get_listening_processes():
             exe_path = f"/proc/{pid}/exe"
 
             try:
-                # Get actual executable path from /proc
-                if os.path.exists(exe_path):
-                    exe_real_path = os.readlink(exe_path)
-                else:
-                    exe_real_path = "PERMISSION_DENIED"
+                # Force sudo readlink to bypass permission issues
+                exe_real_path = subprocess.check_output(f"sudo readlink -f {exe_path}", shell=True, text=True).strip()
+            except (PermissionError, FileNotFoundError, subprocess.CalledProcessError):
+                exe_real_path = "PERMISSION_DENIED"
 
-                port = parts[-2].split(':')[-1]  # Extract port number
-                if port.isdigit():
-                    port = int(port)
+            port = parts[-2].split(':')[-1]  # Extract port number
+            if port.isdigit():
+                port = int(port)
 
-                listening_processes[int(pid)] = {
-                    "exe_path": exe_real_path,
-                    "port": port,
-                }
-            except (PermissionError, FileNotFoundError):
-                listening_processes[int(pid)] = {
-                    "exe_path": "PERMISSION_DENIED",
-                    "port": port,
-                }
+            listening_processes[int(pid)] = {
+                "exe_path": exe_real_path,
+                "port": port,
+            }
 
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] Failed to retrieve listening processes: {e}")
@@ -73,6 +66,8 @@ def monitor_listening_processes(interval=2):
         }
 
         if new_processes:
+            from fim_client import log_event  # Import inside function to avoid circular import
+
             for pid, info in new_processes.items():
                 print(f"[ALERT] New listening process detected! PID: {pid}, Executable: {info['exe_path']}, Port: {info['port']}")
 
@@ -88,8 +83,7 @@ def monitor_listening_processes(interval=2):
                 with open(LOG_FILE, "a") as log:
                     log.write(json.dumps(log_data) + "\n")
 
-                # Import log_event only when it's needed to avoid circular import
-                from fim_client import log_event  # Import only when needed
+                # Log event to FIM system
                 log_event(
                     event_type="NEW_LISTENING_PROCESS",
                     file_path=info["exe_path"],
