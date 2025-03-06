@@ -3,11 +3,15 @@ import time
 import json
 import subprocess
 import hashlib
+import signal
+import argparse
+import daemon
 
 OUTPUT_DIR = os.path.abspath("./output")
 LOG_FILE = os.path.abspath("./logs/process_monitor.log")
 PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
 INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
+PID_FILE = os.path.abspath("pim.pid")
 
 def ensure_output_dir():
     """Ensure that the output directory and necessary files exist."""
@@ -197,7 +201,52 @@ def save_process_hashes(process_hashes):
     os.replace(temp_file, PROCESS_HASHES_FILE)
     os.chmod(PROCESS_HASHES_FILE, 0o600)
 
-if __name__ == "__main__":
-    print("[INFO] Listening process monitoring started...")
+def stop_daemon():
+    """Stop the daemon process cleanly."""
+    if os.path.exists(PID_FILE):
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        print(f"[INFO] Stopping daemon process (PID {pid})...")
+        os.kill(pid, signal.SIGTERM)
+        os.remove(PID_FILE)
+    else:
+        print("[ERROR] No PID file found. Is the daemon running?")
+
+def run_monitor():
+    """Run the process monitoring loop and write PID for management."""
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    ensure_output_dir()
+
+    # Redirect stdout and stderr to a log file when running as a daemon
+    if os.fork() > 0:
+        exit(0)  # Parent process exits, child continues as daemon
+
+    # Close standard input, output, and error to avoid crashes
+    sys.stdout = open(LOG_FILE, "a", buffering=1)
+    sys.stderr = sys.stdout
+
+    print("[INFO] Process monitoring started in daemon mode.")
 
     monitor_listening_processes()
+
+def parse_arguments():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Process Integrity Monitor (PIM)")
+    parser.add_argument("-d", "--daemon", action="store_true", help="Run PIM in background")
+    parser.add_argument("-s", "--stop", action="store_true", help="Stop daemon process")
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_arguments()
+
+    if args.stop:
+        stop_daemon()
+    elif args.daemon:
+        print("[INFO] Running in background mode...")
+        with daemon.DaemonContext():
+            run_monitor()
+    else:
+        print("[INFO] Running in foreground mode...")
+        run_monitor()
