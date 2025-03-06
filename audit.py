@@ -1,8 +1,7 @@
-icatioimport json
+import json
 import os
 import time
 import socket
-#from fim_client import load_config  # Import load_config from fim-client.py
 
 LOG_DIR = os.path.abspath("./logs")
 LOG_FILE = os.path.join(LOG_DIR, "audit.log")
