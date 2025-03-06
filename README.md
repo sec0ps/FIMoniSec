@@ -1,4 +1,9 @@
-A python based file integrity management application -- trying for something a little more light weight, less complex and less problematic than some of the more popular applications out there.
+A lightweight Python-based system integrity management application, designed to be simpler, more efficient, and less problematic than some of the more complex alternatives available.  
 
-For the PIM  module to work correctly, the user the management scripts are running as must have the following access:
+This initial version is built entirely in Python and is designed to run on **any Linux-based system with Python installed. A Windows version is planned for a future release.  
+
+To ensure proper functionality, the user running the management scripts must have sudo access to the following commands:  
+
 username ALL=(ALL) NOPASSWD: /usr/bin/lsof, /bin/cat, /bin/ps, /bin/netstat, /bin/ss
+
+Let me know if you’d like any further refinements!
