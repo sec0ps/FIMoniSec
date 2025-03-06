@@ -5,5 +5,3 @@ This initial version is built entirely in Python and is designed to run on **any
 To ensure proper functionality, the user running the management scripts must have sudo access to the following commands:  
 
 username ALL=(ALL) NOPASSWD: /usr/bin/lsof, /bin/cat, /bin/ps, /bin/netstat, /bin/ss
-
-Let me know if you’d like any further refinements!
