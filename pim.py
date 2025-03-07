@@ -7,7 +7,6 @@ import hashlib
 import signal
 import argparse
 import daemon
-#from daemon import DaemonContext
 
 OUTPUT_DIR = os.path.abspath("./output")
 LOG_DIR = os.path.abspath("./logs")  # Change from absolute path
