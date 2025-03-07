@@ -5,6 +5,7 @@ import hashlib
 import sys
 import argparse
 import daemon
+import signal
 from pathlib import Path
 import stat
 from threading import Thread
