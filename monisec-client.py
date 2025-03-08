@@ -104,13 +104,17 @@ signal.signal(signal.SIGTERM, handle_exit)
 
 def monitor_processes():
     while True:
+        all_running = True
         for name, command in PROCESSES.items():
-            if name == "monisec-client":
-                continue  # Skip checking itself
             if not is_process_running(command):
                 logging.warning(f"{name} is not running. Restarting...")
                 start_process(name)
-        time.sleep(30)  # Check every 30 seconds
+                all_running = False
+
+        if all_running:
+            time.sleep(60)  # Increase sleep time if no issues detected
+        else:
+            time.sleep(10)  # Check more frequently if issues occur
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
