@@ -6,12 +6,57 @@ import hmac
 import hashlib
 import json
 
-# Ensure logs directory exists
-LOG_DIR = "./logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, "monisec-server.log")
+# Config File
+CONFIG_FILE = "monisec-server.config"
 
-# Set log file permissions to 600 (read/write for user only)
+DEFAULT_CONFIG = {
+    "HOST": "0.0.0.0",
+    "PORT": "5555",
+    "LOG_DIR": "./logs",
+    "LOG_FILE": "monisec-server.log",
+    "PSK_STORE_FILE": "psk_store.json",
+    "MAX_CLIENTS": "10"
+}
+
+# Function to create default config file if missing
+def create_default_config():
+    with open(CONFIG_FILE, "w") as f:
+        for key, value in DEFAULT_CONFIG.items():
+            f.write(f"{key} = {value}\n")
+
+# Function to load config from file
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        print(f"{CONFIG_FILE} not found. Creating default configuration.")
+        create_default_config()
+
+    config = {}
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    key, value = line.split("=", 1)
+                    config[key.strip()] = value.strip()
+    except Exception as e:
+        print(f"Failed to load configuration: {e}")
+        exit(1)
+    return config
+
+config = load_config()
+
+# Assign Configuration Variables
+HOST = config.get("HOST", "0.0.0.0")
+PORT = int(config.get("PORT", 5555))
+LOG_DIR = config.get("LOG_DIR", "./logs")
+LOG_FILE = os.path.join(LOG_DIR, config.get("LOG_FILE", "monisec-server.log"))
+PSK_STORE_FILE = config.get("PSK_STORE_FILE", "psk_store.json")
+MAX_CLIENTS = int(config.get("MAX_CLIENTS", 10))
+
+# Ensure logs directory exists
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Set log file permissions
 try:
     with open(LOG_FILE, 'a') as f:
         pass
@@ -25,11 +70,6 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
-# Server Configuration
-HOST = "0.0.0.0"
-PORT = 5555
-PSK_STORE_FILE = "psk_store.json"  # Store client PSKs
 
 # Ensure PSK store exists
 if not os.path.exists(PSK_STORE_FILE):
@@ -48,7 +88,7 @@ def save_psks(psks):
 
 # Function to generate a new PSK for a client
 def generate_psk():
-    return os.urandom(32).hex()  # Generate a 32-byte secure key
+    return os.urandom(32).hex()
 
 # Function to add a new client
 def add_client(client_id):
@@ -76,7 +116,7 @@ def remove_client(client_id):
 # Function to authenticate a client using PSK
 def authenticate_client(client_socket):
     try:
-        client_socket.sendall(b"AUTH_REQUEST")  # Ask for authentication
+        client_socket.sendall(b"AUTH_REQUEST")
         auth_data = client_socket.recv(1024).decode("utf-8")
         
         if not auth_data:
@@ -102,7 +142,7 @@ def authenticate_client(client_socket):
         logging.error(f"Authentication error: {e}")
         return None
 
-# Function to handle each client connection
+# Function to handle client connections and execute remote commands
 def handle_client(client_socket, client_address):
     logging.info(f"New connection from {client_address}")
 
@@ -120,6 +160,13 @@ def handle_client(client_socket, client_address):
             if not data:
                 break
             logging.info(f"Received from {client_id} ({client_address}): {data}")
+
+            # Command Execution
+            if data.startswith("COMMAND:"):
+                command = data.split(":", 1)[1].strip()
+                logging.info(f"Executing command for {client_id}: {command}")
+                client_socket.sendall(f"EXECUTE:{command}".encode("utf-8"))
+
             client_socket.sendall(b"ACK")
     except Exception as e:
         logging.error(f"Error with client {client_id}: {e}")
@@ -127,12 +174,24 @@ def handle_client(client_socket, client_address):
         logging.info(f"Closing connection with {client_id}")
         client_socket.close()
 
+# Function to send commands to clients
+def send_command(client_ip, command):
+    try:
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.connect((client_ip, PORT))
+        client_socket.sendall(f"COMMAND:{command}".encode("utf-8"))
+        response = client_socket.recv(1024).decode("utf-8")
+        logging.info(f"Client {client_ip} response: {response}")
+        client_socket.close()
+    except Exception as e:
+        logging.error(f"Error sending command to {client_ip}: {e}")
+
 # Main server function
 def start_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.bind((HOST, PORT))
-    server.listen(5)
-    logging.info(f"MoniSec Server listening on {HOST}:{PORT}")
+    server.listen(MAX_CLIENTS)
+    logging.info(f"MoniSec Server listening on {HOST}:{PORT} with max {MAX_CLIENTS} clients")
 
     while True:
         client_socket, client_address = server.accept()
