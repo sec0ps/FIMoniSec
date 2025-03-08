@@ -3,6 +3,8 @@ import time
 import psutil
 import subprocess
 import logging
+import sys
+import signal
 
 # Ensure logs directory exists
 LOG_DIR = "./logs"
@@ -17,55 +19,114 @@ try:
 except Exception as e:
     print(f"Failed to set log file permissions: {e}")
 
-# Configure logging
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.DEBUG,  # Changed to DEBUG for troubleshooting
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# Configure logging to write to file and optionally to console
+log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+log_handler = logging.FileHandler(LOG_FILE)
+log_handler.setFormatter(log_formatter)
+log_handler.setLevel(logging.DEBUG)
+
+logging_handlers = [log_handler]
+
+# Only add console output if not running in daemon mode
+if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    console_handler.setLevel(logging.DEBUG)
+    logging_handlers.append(console_handler)
+
+logging.basicConfig(level=logging.DEBUG, handlers=logging_handlers)
 
 # List of monitored processes
 PROCESSES = {
-    "python3 fim_client.py -d": "python3 fim_client.py -d",
-    "python3 pim.py -d": "python3 pim.py -d"
+    "fim_client": "python3 fim_client.py -d",
+    "pim": "python3 pim.py -d",
 }
 
 # Function to check if a process is running more precisely
 def is_process_running(full_command):
-    logging.debug(f"Checking if {full_command} is running...")
     for proc in psutil.process_iter(attrs=['pid', 'cmdline']):
         try:
             if proc.info['cmdline'] and " ".join(proc.info['cmdline']) == full_command:
-                logging.debug(f"Process {full_command} is running with PID {proc.info['pid']}.")
-                return True
+                return proc.info['pid']
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
-    logging.debug(f"Process {full_command} is NOT running.")
-    return False
+    return None
+
+# Function to start a process
+def start_process(name):
+    if name in PROCESSES:
+        if is_process_running(PROCESSES[name]):
+            logging.info(f"{name} is already running.")
+        else:
+            logging.info(f"Starting {name}...")
+            subprocess.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    else:
+        logging.error(f"Unknown process: {name}")
+
+def stop_process(name):
+    if name == "monisec-client":
+        logging.info("Stopping monisec-client and all related processes...")
+        stop_process("fim_client")
+        stop_process("pim")
+        sys.exit(0)  # Exit the script after stopping related processes
+    elif name in PROCESSES:
+        pid = is_process_running(PROCESSES[name])
+        if pid:
+            logging.info(f"Stopping {name} with PID {pid}...")
+            os.kill(pid, signal.SIGTERM)
+        else:
+            logging.info(f"{name} is not running.")
+    else:
+        logging.warning(f"Attempted to stop unknown process: {name}")
 
 # Function to restart a process
-def restart_process(full_command):
-    logging.warning(f"{full_command} is not running. Restarting...")
-    try:
-        process = subprocess.Popen(full_command.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(2)  # Give time for process to start
-        if is_process_running(full_command):
-            logging.info(f"{full_command} restarted successfully with PID {process.pid}.")
-        else:
-            logging.error(f"Failed to restart {full_command}.")
-    except Exception as e:
-        logging.error(f"Error restarting {full_command}: {e}")
+def restart_process(name):
+    stop_process(name)
+    time.sleep(2)
+    start_process(name)
 
-# Main monitoring loop
+# Handle graceful shutdown on keyboard interrupt
+def handle_exit(signum, frame):
+    logging.info("Keyboard interrupt received. Stopping MoniSec client and all related processes...")
+    stop_process("monisec-client")
+    sys.exit(0)
+
+# Register signal handler for graceful shutdown
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
 def monitor_processes():
     while True:
-        logging.debug("Checking all monitored processes...")
-        for full_command in PROCESSES.values():
-            if not is_process_running(full_command):
-                restart_process(full_command)
-        logging.debug("Sleeping for 30 seconds before next check...")
+        for name, command in PROCESSES.items():
+            if name == "monisec-client":
+                continue  # Skip checking itself
+            if not is_process_running(command):
+                logging.warning(f"{name} is not running. Restarting...")
+                start_process(name)
         time.sleep(30)  # Check every 30 seconds
 
 if __name__ == "__main__":
-    logging.info("MoniSec Endpoint Monitor started.")
-    monitor_processes()
+    if len(sys.argv) > 1:
+        action = sys.argv[1]
+        if action in ["start", "stop", "restart"] and len(sys.argv) > 2:
+            target_process = sys.argv[2]
+            if action == "start":
+                start_process(target_process)
+            elif action == "stop":
+                stop_process(target_process)
+            elif action == "restart":
+                restart_process(target_process)
+        elif action == "-d":
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)  # Exit parent process
+            os.setsid()
+            os.umask(0)
+            sys.stdin = open(os.devnull, 'r')
+            logging.info("MoniSec Endpoint Monitor started in daemon mode.")
+            monitor_processes()
+        else:
+            print("Usage: python3 monisec-endpoint.py [start|stop|restart] [fim_client|pim|monisec-client] or -d to run in daemon mode.")
+    else:
+        logging.info("MoniSec Endpoint Monitor started in foreground.")
+        monitor_processes()
