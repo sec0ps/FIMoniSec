@@ -52,16 +52,18 @@ def is_process_running(full_command):
             continue
     return None
 
-# Function to start a process
 def start_process(name):
     if name in PROCESSES:
         if is_process_running(PROCESSES[name]):
             logging.info(f"{name} is already running.")
         else:
             logging.info(f"Starting {name}...")
-            subprocess.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    else:
-        logging.error(f"Unknown process: {name}")
+            process = psutil.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(2)  # Wait for process to start
+            if is_process_running(PROCESSES[name]):
+                logging.info(f"{name} started successfully with PID {process.pid}.")
+            else:
+                logging.error(f"Failed to start {name}.")
 
 def stop_process(name):
     if name == "monisec-client":
