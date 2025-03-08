@@ -7,6 +7,7 @@ import hashlib
 import signal
 import argparse
 import daemon
+import threading
 
 OUTPUT_DIR = os.path.abspath("./output")
 LOG_DIR = os.path.abspath("./logs")  # Change from absolute path
@@ -37,7 +38,9 @@ def ensure_output_dir():
         os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
 
 def ensure_file_monitor_json():
-    """Ensure that the file_monitor.json file exists."""
+    """Ensure that the file_monitor.json file exists and create logs directory if needed."""
+    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)  # ✅ Ensure logs directory exists
+
     if not os.path.exists(FILE_MONITOR_JSON):
         with open(FILE_MONITOR_JSON, "w") as f:
             json.dump({}, f, indent=4)
@@ -175,18 +178,19 @@ def get_listening_processes():
 def monitor_listening_processes(interval=2):
     """Continuously monitors for new and terminated listening processes."""
     known_processes = get_listening_processes()
-    terminated_processes = set()
+    terminated_pids = set()
 
     while True:
         try:
             current_processes = get_listening_processes()
             new_processes = {pid: info for pid, info in current_processes.items() if pid not in known_processes}
-            terminated_pids = {pid: info for pid, info in known_processes.items() if pid not in current_processes}
+            terminated_processes = {pid: info for pid, info in known_processes.items() if pid not in current_processes}
 
             from fim_client import log_event
 
+            # Handle new processes
             for pid, info in new_processes.items():
-                print(f"[DEBUG] New process detected: {info}")  # Debugging
+                print(f"[REAL-TIME] New listening process detected: {info}")
                 log_event(
                     event_type="NEW_LISTENING_PROCESS",
                     file_path=info["exe_path"],
@@ -197,42 +201,129 @@ def monitor_listening_processes(interval=2):
                 )
                 update_process_tracking(info["exe_path"], info["hash"], info)
 
-            for pid, info in terminated_pids.items():
-                if pid in terminated_processes:
+            # Handle terminated processes
+            for pid, info in terminated_processes.items():
+                if pid in terminated_pids:
                     continue
 
-                print(f"[DEBUG] Process terminated: {info}")  # Debugging
+                # Retrieve stored metadata before it becomes "PERMISSION_DENIED"
+                stored_info = load_process_metadata().get(info["exe_path"], None)
+
+                print(f"[REAL-TIME] Listening process terminated: {info}")
                 log_event(
                     event_type="PROCESS_TERMINATED",
-                    file_path=info["exe_path"],
-                    previous_metadata=info,
+                    file_path=info["exe_path"] if stored_info else "UNKNOWN",
+                    previous_metadata=stored_info if stored_info else "UNKNOWN",
                     new_metadata=None,
-                    previous_hash=info.get("hash", "UNKNOWN"),
+                    previous_hash=stored_info["hash"] if stored_info else "UNKNOWN",
                     new_hash=None
                 )
 
-                remove_process_tracking(info["exe_path"])
-                terminated_processes.add(pid)
+                # Remove from tracking based on the stored PID
+                remove_process_tracking(pid)
+                terminated_pids.add(pid)
 
             known_processes = current_processes
             time.sleep(interval)
 
         except Exception as e:
-            print(f"[ERROR] Exception in monitoring loop: {e}", file=sys.stderr)
+            print(f"[ERROR] Exception in real-time monitoring loop: {e}")
 
-def remove_process_tracking(exe_path):
-    """Remove process hash and metadata when a process terminates."""
+def rescan_listening_processes(interval=120):
+    """Periodically scans listening processes every 2 minutes and checks against integrity records."""
+    while True:
+        try:
+            print("[PERIODIC SCAN] Running integrity check on listening processes...")
+
+            # Load known good state
+            integrity_state = load_process_metadata()
+
+            # Get current running listening processes
+            current_processes = get_listening_processes()
+
+            for pid, current_info in current_processes.items():
+                exe_path = current_info["exe_path"]
+
+                if exe_path in integrity_state:
+                    stored_info = integrity_state[exe_path]
+
+                    # Check for hash mismatch (modified executable)
+                    if stored_info["hash"] != current_info["hash"]:
+                        print(f"[ALERT] Hash mismatch detected for {exe_path}")
+                        log_event(
+                            event_type="PROCESS_MODIFIED",
+                            file_path=exe_path,
+                            previous_metadata=stored_info,
+                            new_metadata=current_info,
+                            previous_hash=stored_info["hash"],
+                            new_hash=current_info["hash"]
+                        )
+
+                    # Check for any metadata changes (user, port, cmdline)
+                    changed_fields = {}
+                    for key in ["user", "port", "cmdline"]:
+                        if stored_info[key] != current_info[key]:
+                            changed_fields[key] = {
+                                "previous": stored_info[key],
+                                "current": current_info[key]
+                            }
+
+                    if changed_fields:
+                        print(f"[ALERT] Metadata changes detected for {exe_path}: {changed_fields}")
+                        log_event(
+                            event_type="PROCESS_METADATA_CHANGED",
+                            file_path=exe_path,
+                            previous_metadata=stored_info,
+                            new_metadata=current_info,
+                            previous_hash=stored_info["hash"],
+                            new_hash=current_info["hash"]
+                        )
+
+                else:
+                    # Process is running but not in integrity records (potential new process)
+                    print(f"[ALERT] New untracked process detected: {exe_path}")
+                    log_event(
+                        event_type="NEW_UNTRACKED_PROCESS",
+                        file_path=exe_path,
+                        previous_metadata=None,
+                        new_metadata=current_info,
+                        previous_hash=None,
+                        new_hash=current_info["hash"]
+                    )
+
+            time.sleep(interval)
+
+        except Exception as e:
+            print(f"[ERROR] Exception in periodic scan: {e}")
+
+def remove_process_tracking(pid):
+    """Remove process metadata from integrity_processes.json and process_hashes.txt using PID reference."""
     process_hashes = load_process_hashes()
     integrity_state = load_process_metadata()
 
-    if exe_path in process_hashes:
-        del process_hashes[exe_path]
+    # Find the corresponding exe_path using PID
+    exe_path = None
+    for stored_path, data in integrity_state.items():
+        if str(data["pid"]) == str(pid):  # Ensure PID matches as a string
+            exe_path = stored_path
+            break
 
-    if exe_path in integrity_state:
-        del integrity_state[exe_path]
+    if exe_path:
+        # Remove from integrity records
+        if exe_path in integrity_state:
+            del integrity_state[exe_path]
 
-    save_process_hashes(process_hashes)
-    save_process_metadata(integrity_state)
+        # Remove from process hash records
+        if exe_path in process_hashes:
+            del process_hashes[exe_path]
+
+        # Save updates to files
+        save_process_metadata(integrity_state)
+        save_process_hashes(process_hashes)
+
+        print(f"[INFO] Process {exe_path} (PID: {pid}) removed from tracking.")
+    else:
+        print(f"[WARNING] No matching process found for PID: {pid}. It may have already been removed.")
 
 def update_process_tracking(exe_path, process_hash, metadata):
     """Update process tracking files with new or modified processes."""
@@ -273,8 +364,10 @@ def stop_daemon():
     else:
         print("[ERROR] No PID file found. Is the daemon running?")
 
+import threading  # Ensure threading is imported
+
 def run_monitor():
-    """Run the process monitoring loop and write PID for management."""
+    """Run the process monitoring loop and start periodic integrity checks."""
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -292,6 +385,11 @@ def run_monitor():
 
     print("[INFO] Initial process tracking complete.")
 
+    # Start periodic integrity check in a separate thread
+    integrity_thread = threading.Thread(target=rescan_listening_processes, daemon=True)
+    integrity_thread.start()
+
+    # Start real-time monitoring in the main thread
     monitor_listening_processes()
 
 if __name__ == "__main__":
@@ -313,12 +411,12 @@ if __name__ == "__main__":
 
     if args.daemon:
         print("[INFO] Running PIM in daemon mode...")
-        with daemon.DaemonContext(
-            working_directory=os.getcwd(),
-            environ=os.environ.copy()  # Preserve environment variables, including sudo settings
-        ):
+
+        # Set environment manually before daemonizing
+        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+        with daemon.DaemonContext(working_directory=os.getcwd()):
             run_monitor()
     else:
         print("[INFO] Running PIM in foreground mode...")
         run_monitor()
-
