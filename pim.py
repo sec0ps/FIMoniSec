@@ -81,10 +81,13 @@ def save_process_metadata(processes):
     try:
         with open(temp_file, "w") as f:
             json.dump(processes, f, indent=4)
+
         os.replace(temp_file, INTEGRITY_PROCESS_FILE)
         os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
-    except Exception:
-        pass
+        print(f"[DEBUG] Successfully wrote integrity metadata to {INTEGRITY_PROCESS_FILE}")  # Debugging
+
+    except Exception as e:
+        print(f"[ERROR] Failed to write to {INTEGRITY_PROCESS_FILE}: {e}", file=sys.stderr)
 
 def get_process_hash(exe_path):
     """Generate SHA-256 hash of the process executable."""
@@ -100,10 +103,14 @@ def get_listening_processes():
 
     try:
         # Use full path for `lsof` and `grep` to avoid path issues in daemon mode
-        lsof_command = "sudo /usr/bin/lsof -i -P -n | /usr/bin/grep LISTEN"
+        lsof_command = "sudo -n /usr/bin/lsof -i -P -n | /bin/grep LISTEN"
         output = subprocess.getoutput(lsof_command)
 
+        if not output:
+            print("[ERROR] lsof returned no output. Check sudo permissions.", file=sys.stderr)
+
         for line in output.splitlines():
+            print(f"[DEBUG] Processing line: {line}")  # Debugging
             parts = line.split()
             if len(parts) < 9:
                 continue
@@ -112,31 +119,36 @@ def get_listening_processes():
             exe_path = f"/proc/{pid}/exe"
 
             try:
-                # Use sudo with absolute path to readlink
-                exe_real_path = subprocess.getoutput(f"sudo /usr/bin/readlink -f {exe_path}").strip()
-
-                # Generate hash only if path isn't permission denied
+                exe_real_path = subprocess.getoutput(f"sudo -n /usr/bin/readlink -f {exe_path}").strip()
+                if not exe_real_path or "Permission denied" in exe_real_path:
+                    exe_real_path = "PERMISSION_DENIED"
                 process_hash = get_process_hash(exe_real_path) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN"
-            except (PermissionError, FileNotFoundError, subprocess.CalledProcessError):
+
+            except Exception as e:
+                print(f"[ERROR] Failed to resolve exe path for PID {pid}: {e}", file=sys.stderr)
                 exe_real_path = "PERMISSION_DENIED"
                 process_hash = "UNKNOWN"
 
-            # Extract the port number
-            port = parts[-2].split(':')[-1]
-            if port.isdigit():
-                port = int(port)
+            # Extract port number safely
+            try:
+                port = parts[-2].split(':')[-1]
+                if port.isdigit():
+                    port = int(port)
+            except IndexError:
+                port = "UNKNOWN"
 
             try:
-                # Use full paths for system commands inside daemon mode
-                user = subprocess.getoutput(f"sudo /bin/ps -o user= -p {pid}").strip()
-                start_time = subprocess.getoutput(f"sudo /bin/ps -o lstart= -p {pid}").strip()
-                cmdline = subprocess.getoutput(f"sudo /bin/cat /proc/{pid}/cmdline 2>/dev/null").strip()
-
-                # Get parent PID safely
-                ppid = subprocess.getoutput(f"sudo /bin/ps -o ppid= -p {pid}").strip()
+                user = subprocess.getoutput(f"sudo -n /bin/ps -o user= -p {pid}").strip()
+                start_time = subprocess.getoutput(f"sudo -n /bin/ps -o lstart= -p {pid}").strip()
+                cmdline = subprocess.getoutput(f"sudo -n /bin/cat /proc/{pid}/cmdline 2>/dev/null").strip()
+                ppid = subprocess.getoutput(f"sudo -n /bin/ps -o ppid= -p {pid}").strip()
                 ppid = int(ppid) if ppid.isdigit() else "UNKNOWN"
 
-            except Exception:
+                if not user:
+                    print(f"[WARNING] User info missing for PID {pid}", file=sys.stderr)
+
+            except Exception as e:
+                print(f"[ERROR] Failed to retrieve process metadata for PID {pid}: {e}", file=sys.stderr)
                 user, start_time, cmdline, ppid = "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"
 
             listening_processes[int(pid)] = {
@@ -151,8 +163,8 @@ def get_listening_processes():
                 "ppid": ppid,
             }
 
-    except subprocess.CalledProcessError:
-        pass
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] subprocess error in get_listening_processes: {e}", file=sys.stderr)
 
     return listening_processes
 
@@ -170,6 +182,7 @@ def monitor_listening_processes(interval=2):
             from fim_client import log_event
 
             for pid, info in new_processes.items():
+                print(f"[DEBUG] New process detected: {info}")  # Debugging
                 log_event(
                     event_type="NEW_LISTENING_PROCESS",
                     file_path=info["exe_path"],
@@ -178,11 +191,13 @@ def monitor_listening_processes(interval=2):
                     previous_hash=None,
                     new_hash=info.get("hash", "UNKNOWN")
                 )
+                update_process_tracking(info["exe_path"], info["hash"], info)
 
             for pid, info in terminated_pids.items():
                 if pid in terminated_processes:
                     continue
 
+                print(f"[DEBUG] Process terminated: {info}")  # Debugging
                 log_event(
                     event_type="PROCESS_TERMINATED",
                     file_path=info["exe_path"],
@@ -199,7 +214,7 @@ def monitor_listening_processes(interval=2):
             time.sleep(interval)
 
         except Exception as e:
-            print(f"[ERROR] Exception in monitoring loop: {e}")
+            print(f"[ERROR] Exception in monitoring loop: {e}", file=sys.stderr)
 
 def remove_process_tracking(exe_path):
     """Remove process hash and metadata when a process terminates."""
@@ -226,15 +241,22 @@ def update_process_tracking(exe_path, process_hash, metadata):
     save_process_hashes(process_hashes)
     save_process_metadata(integrity_state)
 
+    print(f"[DEBUG] Updated tracking for: {exe_path}")  # Debugging
+
 def save_process_hashes(process_hashes):
     """Save process hashes to process_hashes.txt."""
     temp_file = f"{PROCESS_HASHES_FILE}.tmp"
-    with open(temp_file, "w") as f:
-        for exe_path, hash_value in process_hashes.items():
-            f.write(f"{exe_path}:{hash_value}\n")
+    try:
+        with open(temp_file, "w") as f:
+            for exe_path, hash_value in process_hashes.items():
+                f.write(f"{exe_path}:{hash_value}\n")
 
-    os.replace(temp_file, PROCESS_HASHES_FILE)
-    os.chmod(PROCESS_HASHES_FILE, 0o600)
+        os.replace(temp_file, PROCESS_HASHES_FILE)
+        os.chmod(PROCESS_HASHES_FILE, 0o600)
+        print(f"[DEBUG] Successfully wrote process hashes to {PROCESS_HASHES_FILE}")  # Debugging
+
+    except Exception as e:
+        print(f"[ERROR] Failed to write to {PROCESS_HASHES_FILE}: {e}", file=sys.stderr)
 
 def stop_daemon():
     """Stop the daemon process cleanly."""
@@ -287,7 +309,10 @@ if __name__ == "__main__":
 
     if args.daemon:
         print("[INFO] Running PIM in daemon mode...")
-        with daemon.DaemonContext(working_directory=os.getcwd()):
+        with daemon.DaemonContext(
+            working_directory=os.getcwd(),
+            environ=os.environ.copy()  # Preserve environment variables, including sudo settings
+        ):
             run_monitor()
     else:
         print("[INFO] Running PIM in foreground mode...")
