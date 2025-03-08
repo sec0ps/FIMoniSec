@@ -102,7 +102,7 @@ def get_listening_processes():
     listening_processes = {}
 
     try:
-        # Use full path for `lsof` and `grep` to avoid path issues in daemon mode
+        # Use full path for `lsof` to avoid daemon path issues
         lsof_command = "sudo -n /usr/bin/lsof -i -P -n | /bin/grep LISTEN"
         output = subprocess.getoutput(lsof_command)
 
@@ -110,7 +110,6 @@ def get_listening_processes():
             print("[ERROR] lsof returned no output. Check sudo permissions.", file=sys.stderr)
 
         for line in output.splitlines():
-            print(f"[DEBUG] Processing line: {line}")  # Debugging
             parts = line.split()
             if len(parts) < 9:
                 continue
@@ -119,30 +118,31 @@ def get_listening_processes():
             exe_path = f"/proc/{pid}/exe"
 
             try:
-                # Get the real executable path
+                # Read actual executable path
                 exe_real_path = subprocess.getoutput(f"sudo -n /usr/bin/readlink -f {exe_path}").strip()
-                if not exe_real_path or "Permission denied" in exe_real_path:
-                    exe_real_path = "PERMISSION_DENIED"
 
-                # Generate hash if file exists
+                if "Permission denied" in exe_real_path or not exe_real_path:
+                    raise PermissionError("Could not read process executable path")
+
+                # Generate process hash
                 process_hash = get_process_hash(exe_real_path) if os.path.exists(exe_real_path) else "UNKNOWN"
 
-            except Exception as e:
-                print(f"[ERROR] Failed to resolve exe path for PID {pid}: {e}", file=sys.stderr)
+            except (PermissionError, FileNotFoundError, subprocess.CalledProcessError):
                 exe_real_path = "PERMISSION_DENIED"
                 process_hash = "UNKNOWN"
 
-            # Extract port number
+            # Extract port safely
             try:
                 port = parts[-2].split(':')[-1]
-                if port.isdigit():
-                    port = int(port)
-                else:
+                if not port.isdigit():
                     port = "UNKNOWN"
+                else:
+                    port = int(port)
             except IndexError:
                 port = "UNKNOWN"
 
             try:
+                # Capture additional process details
                 user = subprocess.getoutput(f"sudo -n /bin/ps -o user= -p {pid}").strip()
                 start_time = subprocess.getoutput(f"sudo -n /bin/ps -o lstart= -p {pid}").strip()
                 cmdline = subprocess.getoutput(f"sudo -n /bin/cat /proc/{pid}/cmdline 2>/dev/null").strip()
@@ -150,10 +150,9 @@ def get_listening_processes():
                 ppid = int(ppid) if ppid.isdigit() else "UNKNOWN"
 
                 if not user:
-                    print(f"[WARNING] User info missing for PID {pid}", file=sys.stderr)
+                    user = "UNKNOWN"
 
-            except Exception as e:
-                print(f"[ERROR] Failed to retrieve process metadata for PID {pid}: {e}", file=sys.stderr)
+            except Exception:
                 user, start_time, cmdline, ppid = "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"
 
             listening_processes[int(pid)] = {
