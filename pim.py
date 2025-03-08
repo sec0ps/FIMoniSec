@@ -84,7 +84,7 @@ def save_process_metadata(processes):
 
         os.replace(temp_file, INTEGRITY_PROCESS_FILE)
         os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
-        print(f"[DEBUG] Successfully wrote integrity metadata to {INTEGRITY_PROCESS_FILE}")  # Debugging
+        print(f"[DEBUG] Successfully wrote integrity metadata to {INTEGRITY_PROCESS_FILE}")
 
     except Exception as e:
         print(f"[ERROR] Failed to write to {INTEGRITY_PROCESS_FILE}: {e}", file=sys.stderr)
@@ -119,21 +119,26 @@ def get_listening_processes():
             exe_path = f"/proc/{pid}/exe"
 
             try:
+                # Get the real executable path
                 exe_real_path = subprocess.getoutput(f"sudo -n /usr/bin/readlink -f {exe_path}").strip()
                 if not exe_real_path or "Permission denied" in exe_real_path:
                     exe_real_path = "PERMISSION_DENIED"
-                process_hash = get_process_hash(exe_real_path) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN"
+
+                # Generate hash if file exists
+                process_hash = get_process_hash(exe_real_path) if os.path.exists(exe_real_path) else "UNKNOWN"
 
             except Exception as e:
                 print(f"[ERROR] Failed to resolve exe path for PID {pid}: {e}", file=sys.stderr)
                 exe_real_path = "PERMISSION_DENIED"
                 process_hash = "UNKNOWN"
 
-            # Extract port number safely
+            # Extract port number
             try:
                 port = parts[-2].split(':')[-1]
                 if port.isdigit():
                     port = int(port)
+                else:
+                    port = "UNKNOWN"
             except IndexError:
                 port = "UNKNOWN"
 
@@ -241,7 +246,7 @@ def update_process_tracking(exe_path, process_hash, metadata):
     save_process_hashes(process_hashes)
     save_process_metadata(integrity_state)
 
-    print(f"[DEBUG] Updated tracking for: {exe_path}")  # Debugging
+    print(f"[DEBUG] Logged listening process: {exe_path} | Hash: {process_hash}")
 
 def save_process_hashes(process_hashes):
     """Save process hashes to process_hashes.txt."""
@@ -253,7 +258,7 @@ def save_process_hashes(process_hashes):
 
         os.replace(temp_file, PROCESS_HASHES_FILE)
         os.chmod(PROCESS_HASHES_FILE, 0o600)
-        print(f"[DEBUG] Successfully wrote process hashes to {PROCESS_HASHES_FILE}")  # Debugging
+        print(f"[DEBUG] Successfully wrote process hashes to {PROCESS_HASHES_FILE}")
 
     except Exception as e:
         print(f"[ERROR] Failed to write to {PROCESS_HASHES_FILE}: {e}", file=sys.stderr)
@@ -280,15 +285,15 @@ def run_monitor():
     sys.stdout = open(LOG_FILE, "a", buffering=1)
     sys.stderr = sys.stdout
 
-    print("[INFO] Process monitoring started in daemon mode.")
+    print("[INFO] Logging all listening processes on startup...")
+    initial_processes = get_listening_processes()
 
-    # Make sure the function does not exit
-    while True:
-        try:
-            monitor_listening_processes()
-        except Exception as e:
-            print(f"[ERROR] Exception in monitoring loop: {e}")
-        time.sleep(2)  # Prevent excessive CPU usage if an error occurs
+    for pid, info in initial_processes.items():
+        update_process_tracking(info["exe_path"], info["hash"], info)
+
+    print("[INFO] Initial process tracking complete.")
+
+    monitor_listening_processes()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process Integrity Monitor (PIM)")
