@@ -88,7 +88,12 @@ def restart_process(name):
 # Handle graceful shutdown on keyboard interrupt
 def handle_exit(signum, frame):
     logging.info("Keyboard interrupt received. Stopping MoniSec client and all related processes...")
-    stop_process("monisec-client")
+    stop_process("fim_client")
+    stop_process("pim")
+
+    # Ensure processes are fully stopped before exiting
+    time.sleep(2)
+    logging.info("MoniSec client shutdown complete.")
     sys.exit(0)
 
 # Register signal handler for graceful shutdown
