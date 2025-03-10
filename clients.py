@@ -2,6 +2,7 @@ import os
 import json
 import hmac
 import hashlib
+import logging
 
 PSK_STORE_FILE = "psk_store.json"
 
@@ -92,26 +93,113 @@ def list_clients():
     for agent_id, details in psks.items():
         print(f"  - Agent ID: {details['AgentID']}, Name: {details['AgentName']}, IP: {details['AgentIP']}")
 
-def authenticate_client(agent_id, agent_ip, nonce, client_hmac):
-    """Authenticates a client using PSK, AgentID, and IP address."""
-    psks = load_psks()
+def authenticate_client(client_socket):
+    """Authenticates a client using stored PSK and IP."""
+    try:
+        # Receive authentication data from client
+        auth_data = client_socket.recv(1024).decode("utf-8")
 
-    if str(agent_id) not in psks:
-        print(f"[ERROR] Unknown agent ID: {agent_id}")
-        return False
+        if not auth_data:
+            logging.warning("[ERROR] No authentication data received.")
+            client_socket.sendall(b"AUTH_FAILED")
+            return None
 
-    agent_data = psks[str(agent_id)]
+        # Extract authentication parameters sent by the client
+        try:
+            client_name, nonce, client_hmac = auth_data.split(":")
+        except ValueError:
+            logging.warning(f"[ERROR] Malformed authentication data received: {auth_data}")
+            client_socket.sendall(b"AUTH_FAILED")
+            return None
 
-    expected_hmac = hmac.new(agent_data["AgentPSK"].encode(), nonce.encode(), hashlib.sha256).hexdigest()
+        # Load stored PSKs
+        psks = load_psks()
+        logging.debug(f"[DEBUG] Loaded PSKs: {json.dumps(psks, indent=4)}")  # Debugging
 
-    if not hmac.compare_digest(client_hmac, expected_hmac):
-        print(f"[ERROR] Authentication failed for agent {agent_id}")
-        return False
+        # Check if client name exists in PSKs
+        matching_agent = None
+        for agent_id, agent_data in psks.items():
+            if agent_data["AgentName"] == client_name:
+                matching_agent = agent_data
+                break
 
-    # Check if the IP matches
-    if agent_ip != agent_data["AgentIP"]:
-        print(f"[ERROR] IP mismatch for agent {agent_id}. Expected: {agent_data['AgentIP']}, Got: {agent_ip}")
-        return False
+        if not matching_agent:
+            logging.warning(f"[ERROR] Unknown client: {client_name}")
+            client_socket.sendall(b"AUTH_FAILED")
+            return None
 
-    print(f"[SUCCESS] Agent {agent_id} authenticated successfully.")
-    return True
+        # Retrieve stored PSK for the client
+        client_psk = matching_agent["AgentPSK"]
+        logging.debug(f"[DEBUG] Retrieved PSK for {client_name}: {client_psk[:6]}********")  # Masked for security
+
+        # Compute expected HMAC
+        expected_hmac = hmac.new(client_psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+
+        # Validate authentication
+        if hmac.compare_digest(client_hmac, expected_hmac):
+            client_socket.sendall(b"AUTH_SUCCESS")
+            logging.info(f"[SUCCESS] Client {client_name} authenticated successfully.")
+            return client_name
+        else:
+            logging.warning(f"[ERROR] Authentication failed for {client_name}")
+            client_socket.sendall(b"AUTH_FAILED")
+            return None
+
+    except Exception as e:
+        logging.error(f"[ERROR] Authentication error: {e}")
+        client_socket.sendall(b"AUTH_FAILED")
+        return None
+
+def handle_client(client_socket, client_address):
+    logging.info(f"New connection from {client_address}")
+
+    try:
+        # Authenticate the client
+        client_id = authenticate_client(client_socket)  # Fix: Only pass client_socket
+
+        if not client_id:
+            logging.warning(f"Authentication failed for client {client_address}")
+            client_socket.sendall(b"AUTH_FAILED")
+            client_socket.close()
+            return
+
+        logging.info(f"Client {client_id} authenticated successfully.")
+
+        # Proceed to command handling
+        while True:
+            data = client_socket.recv(1024).decode("utf-8")
+            if not data:
+                break
+            logging.info(f"Received from {client_id} ({client_address}): {data}")
+
+            if data.startswith("COMMAND:"):
+                command_parts = data.split(":", 1)[1].strip().split()
+
+                if len(command_parts) != 2:
+                    logging.warning(f"Invalid command format from {client_id}: {data}")
+                    client_socket.sendall(b"ERROR: Invalid command format")
+                else:
+                    target, action = command_parts
+                    if target in ALLOWED_COMMANDS and action in ALLOWED_COMMANDS[target]:
+                        logging.info(f"Executing allowed command for {client_id}: {target} {action}")
+                        client_socket.sendall(f"EXECUTE:{target} {action}".encode("utf-8"))
+                    else:
+                        logging.warning(f"Unauthorized command attempt from {client_id}: {target} {action}")
+                        client_socket.sendall(b"ERROR: Unauthorized command")
+    except Exception as e:
+        logging.error(f"Error with client {client_id}: {e}")
+    finally:
+        logging.info(f"Closing connection with {client_id}")
+        client_socket.close()
+
+# Function to send commands to clients
+def send_command(client_ip, command):
+    try:
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.connect((client_ip, PORT))
+        client_socket.sendall(f"COMMAND:{command}".encode("utf-8"))
+        response = client_socket.recv(1024).decode("utf-8")
+        logging.info(f"Client {client_ip} response: {response}")
+        client_socket.close()
+    except Exception as e:
+        logging.error(f"Error sending command to {client_ip}: {e}")
