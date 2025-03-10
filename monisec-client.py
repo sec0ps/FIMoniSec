@@ -49,32 +49,27 @@ PROCESSES = {
 
 def start_process(name):
     if name in PROCESSES:
-        if is_process_running(PROCESSES[name]):
+        if is_process_running(name):
             logging.info(f"{name} is already running.")
         else:
             logging.info(f"Starting {name}...")
-            process = psutil.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            process = subprocess.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             time.sleep(2)  # Wait for process to start
-            if is_process_running(PROCESSES[name]):
+            if is_process_running(name):
                 logging.info(f"{name} started successfully with PID {process.pid}.")
             else:
                 logging.error(f"Failed to start {name}.")
 
 def stop_process(name):
-    if name == "monisec_client":
-        logging.info("Stopping monisec_client and all related processes...")
-        stop_process("fim_client")
-        stop_process("pim")
-        sys.exit(0)  # Exit the script after stopping related processes
-    elif name in PROCESSES:
-        pid = is_process_running(PROCESSES[name])
+    if name in PROCESSES:
+        pid = is_process_running(name)
         if pid:
             logging.info(f"Stopping {name} with PID {pid}...")
             os.kill(pid, signal.SIGTERM)
         else:
             logging.info(f"{name} is not running.")
     else:
-        logging.warning(f"Attempted to stop unknown process: {name}")
+        logging.warning(f"[ERROR] Attempted to stop unknown process: {name}")
 
 # Function to restart a process
 def restart_process(name):
@@ -82,15 +77,27 @@ def restart_process(name):
     time.sleep(2)
     start_process(name)
 
-def is_process_running(full_command):
-    """Check if a process is running by matching the full command line."""
+def is_process_running(name):
+    """Check if a process is running by matching a substring in the command line."""
     for proc in psutil.process_iter(attrs=['pid', 'cmdline']):
         try:
-            if proc.info['cmdline'] and " ".join(proc.info['cmdline']) == full_command:
+            cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
+            if name in cmdline:
                 return proc.info['pid']
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
     return None
+
+def monitor_processes():
+    while True:
+        all_running = True
+        for name in PROCESSES:
+            if not is_process_running(name):
+                logging.warning(f"{name} is not running. Restarting...")
+                start_process(name)
+                all_running = False  # Mark that at least one process was restarted
+
+        time.sleep(10 if not all_running else 60)  # Increase interval if stable
 
 # Handle graceful shutdown on keyboard interrupt
 def handle_exit(signum, frame):
@@ -107,73 +114,42 @@ def handle_exit(signum, frame):
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
-def monitor_processes():
-    while True:
-        all_running = True
-        for name, command in PROCESSES.items():
-            if not is_process_running(command):
-                logging.warning(f"{name} is not running. Restarting...")
-                start_process(name)
-                all_running = False
-
-        if all_running:
-            time.sleep(60)  # Increase sleep time if no issues detected
-        else:
-            time.sleep(10)  # Check more frequently if issues occur
-
-def import_psk(psk_value):
-    """Imports a PSK and stores it locally."""
-    token_data = {"psk": psk_value}
-    with open("auth_token.json", "w") as f:
-        json.dump(token_data, f)
-    os.chmod("auth_token.json", 0o600)
-    print("[INFO] PSK imported and stored securely.")
-def authenticate_with_server(server_ip, client_name):
-    """Authenticates with the MoniSec server using a stored PSK."""
-    token_file = "auth_token.json"
-
-    # Load stored PSK
-    try:
-        with open(token_file, "r") as f:
-            token_data = json.load(f)
-            psk = token_data.get("psk", None)
-            if not psk:
-                raise ValueError("No PSK found.")
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        print("[ERROR] No valid PSK found. Import the PSK before connecting.")
-        return False
-
-    nonce = os.urandom(16).hex()
-    client_hmac = hmac.new(psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((server_ip, 5555))
-
-        sock.sendall(f"{client_name}:{nonce}:{client_hmac}".encode("utf-8"))
-        response = sock.recv(1024).decode("utf-8")
-
-        if response == "AUTH_SUCCESS":
-            print("[SUCCESS] Authentication successful.")
-            return True
-        else:
-            print("[ERROR] Authentication failed.")
-            return False
-    except Exception as e:
-        print(f"[ERROR] Connection failed: {e}")
-        return False
-
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         action = sys.argv[1]
-        if action in ["start", "stop", "restart"] and len(sys.argv) > 2:
-            target_process = sys.argv[2]
-            if action == "start":
-                start_process(target_process)
-            elif action == "stop":
-                stop_process(target_process)
-            elif action == "restart":
-                restart_process(target_process)
+
+        # Restart MoniSec Client
+        if action == "restart":
+            stop_process("monisec_client")
+            time.sleep(2)
+            start_process("monisec_client")
+
+        # Start, Stop, Restart PIM or FIM
+        elif action in ["pim", "fim"]:
+            if len(sys.argv) > 2 and sys.argv[2] in ["start", "stop", "restart"]:
+                target_process = f"{action}_client"
+                if sys.argv[2] == "start":
+                    start_process(target_process)
+                elif sys.argv[2] == "stop":
+                    stop_process(target_process)
+                elif sys.argv[2] == "restart":
+                    restart_process(target_process)
+            else:
+                print(f"[ERROR] Invalid command. Usage: monisec_client {action} start|stop|restart")
+                sys.exit(1)
+
+        # Import PSK for authentication
+        elif action == "import-psk" and len(sys.argv) > 2:
+            psk_value = sys.argv[2]
+            remote.import_psk(psk_value)
+
+        # Authenticate with server
+        elif action == "auth" and len(sys.argv) > 3:
+            server_ip = sys.argv[2]
+            client_name = sys.argv[3]
+            remote.authenticate_with_server(server_ip, client_name)
+
+        # Daemon mode
         elif action == "-d":
             pid = os.fork()
             if pid > 0:
@@ -181,6 +157,7 @@ if __name__ == "__main__":
             os.setsid()
             os.umask(0)
             sys.stdin = open(os.devnull, 'r')
+
             logging.info("MoniSec Endpoint Monitor started in daemon mode.")
 
             # Start remote command listener in a separate thread
@@ -188,9 +165,21 @@ if __name__ == "__main__":
             listener_thread.start()
 
             monitor_processes()
+
+        # Print usage information for invalid commands
         else:
-            print("Usage: python3 monisec-endpoint.py [start|stop|restart] [fim_client|pim|monisec_client] or -d to run in daemon mode.")
+            print(
+                """Usage:
+    monisec_client restart                  # Restart monisec_client
+    monisec_client pim start|stop|restart   # Control PIM process
+    monisec_client fim start|stop|restart   # Control FIM process
+    monisec_client import-psk <PSK>         # Import PSK for authentication
+    monisec_client auth <ServerIP> <Name>   # Authenticate with server"""
+            )
+            sys.exit(1)
+
     else:
+        # Run in foreground mode (default behavior)
         logging.info("MoniSec Endpoint Monitor started in foreground.")
 
         # Start remote command listener in a separate thread
