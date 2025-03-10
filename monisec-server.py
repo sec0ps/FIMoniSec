@@ -7,8 +7,11 @@ import hmac
 import hashlib
 import json
 import clients
+import signal
 
 CONFIG_FILE = "monisec-server.config"
+server_socket = None  # Global reference to the server socket
+shutdown_event = threading.Event()  # Event to signal shutdown
 
 DEFAULT_CONFIG = {
     "HOST": "0.0.0.0",
@@ -83,72 +86,6 @@ if not os.path.exists(PSK_STORE_FILE):
     with open(PSK_STORE_FILE, "w") as f:
         json.dump({}, f)
 
-# Function to load PSKs from file
-def load_psks():
-    with open(PSK_STORE_FILE, "r") as f:
-        return json.load(f)
-
-# Function to save PSKs to file
-def save_psks(psks):
-    with open(PSK_STORE_FILE, "w") as f:
-        json.dump(psks, f, indent=4)
-
-# Function to generate a new PSK for a client
-def generate_psk():
-    return os.urandom(32).hex()
-
-# Function to add a new client
-def add_client(client_id):
-    psks = load_psks()
-    if client_id in psks:
-        logging.warning(f"Client {client_id} already has a PSK.")
-        return psks[client_id]
-    
-    new_psk = generate_psk()
-    psks[client_id] = new_psk
-    save_psks(psks)
-    logging.info(f"Generated PSK for client {client_id}")
-    return new_psk
-
-# Function to remove a client
-def remove_client(client_id):
-    psks = load_psks()
-    if client_id in psks:
-        del psks[client_id]
-        save_psks(psks)
-        logging.info(f"Removed PSK for client {client_id}")
-        return True
-    return False
-
-# Function to authenticate a client using PSK
-def authenticate_client(client_socket):
-    try:
-        client_socket.sendall(b"AUTH_REQUEST")
-        auth_data = client_socket.recv(1024).decode("utf-8")
-        
-        if not auth_data:
-            return None
-        
-        client_id, nonce, client_hmac = auth_data.split(":")
-        psks = load_psks()
-
-        if client_id not in psks:
-            logging.warning(f"Unknown client attempted authentication: {client_id}")
-            client_socket.sendall(b"AUTH_FAILED")
-            return None
-
-        expected_hmac = hmac.new(psks[client_id].encode(), nonce.encode(), hashlib.sha256).hexdigest()
-
-        if hmac.compare_digest(client_hmac, expected_hmac):
-            client_socket.sendall(b"AUTH_SUCCESS")
-            return client_id
-        else:
-            client_socket.sendall(b"AUTH_FAILED")
-            return None
-    except Exception as e:
-        logging.error(f"Authentication error: {e}")
-        return None
-
 # Function to handle client connections and execute remote commands
 def handle_client(client_socket, client_address):
     logging.info(f"New connection from {client_address}")
@@ -203,17 +140,47 @@ def send_command(client_ip, command):
     except Exception as e:
         logging.error(f"Error sending command to {client_ip}: {e}")
 
-# Main server function
-def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
-    server.listen(MAX_CLIENTS)
-    logging.info(f"MoniSec Server listening on {HOST}:{PORT} with max {MAX_CLIENTS} clients")
+def handle_shutdown(signum, frame):
+    """Gracefully shuts down the MoniSec Server on signal (CTRL+C)."""
+    logging.info("[INFO] Shutting down MoniSec Server...")
+    shutdown_event.set()  # Signal all threads to stop
 
-    while True:
-        client_socket, client_address = server.accept()
-        client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
-        client_thread.start()
+    if server_socket:
+        server_socket.close()  # Close server socket to free the port
+
+    logging.info("[INFO] MoniSec Server stopped.")
+    exit(0)
+
+# Register SIGINT (CTRL+C) and SIGTERM (kill command) for graceful shutdown
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
+
+def start_server():
+    """Starts the MoniSec server and listens for incoming client connections."""
+    global server_socket
+
+    try:
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow immediate reuse of port
+        server_socket.bind(("0.0.0.0", 5555))
+        server_socket.listen(10)
+        logging.info("[INFO] MoniSec Server listening on 0.0.0.0:5555")
+
+        while not shutdown_event.is_set():
+            try:
+                server_socket.settimeout(1.0)  # Allow server to check shutdown event
+                client_socket, client_address = server_socket.accept()
+                threading.Thread(target=handle_client, args=(client_socket, client_address), daemon=True).start()
+            except socket.timeout:
+                continue  # Continue loop to check shutdown event
+
+    except Exception as e:
+        logging.error(f"[ERROR] Server encountered an error: {e}")
+
+    finally:
+        logging.info("[INFO] Cleaning up server resources...")
+        if server_socket:
+            server_socket.close()
 
 def print_help():
     """Prints the available command-line options for monisec-server.py"""
@@ -230,21 +197,21 @@ If no command is provided, the server will start normally.
 """)
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[1] in ["add-client", "remove-client"]:
-        client_name = sys.argv[2]
-        if sys.argv[1] == "add-client":
-            clients.add_client(client_name)
-        elif sys.argv[1] == "remove-client":
-            clients.remove_client(client_name)
-        sys.exit(0)
+    if len(sys.argv) > 1:
+        command = sys.argv[1]
 
-    elif len(sys.argv) > 1:
-        if sys.argv[1] == "list-clients":
+        if command == "add-client":
+            clients.add_client()
+            sys.exit(0)
+        elif command == "list-clients":
             clients.list_clients()
             sys.exit(0)
-        elif sys.argv[1] in ["-h", "--help"]:
+        elif command == "remove-client" and len(sys.argv) > 2:
+            clients.remove_client(sys.argv[2])
+            sys.exit(0)
+        elif command in ["-h", "--help"]:
             print_help()
             sys.exit(0)
 
     print("Starting MoniSec Server...")
-    start_server()  # Start the main server function
+    start_server()
