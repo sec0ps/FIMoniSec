@@ -1,3 +1,4 @@
+import sys
 import socket
 import threading
 import logging
@@ -5,8 +6,8 @@ import os
 import hmac
 import hashlib
 import json
+import clients
 
-# Config File
 CONFIG_FILE = "monisec-server.config"
 
 DEFAULT_CONFIG = {
@@ -16,6 +17,12 @@ DEFAULT_CONFIG = {
     "LOG_FILE": "monisec-server.log",
     "PSK_STORE_FILE": "psk_store.json",
     "MAX_CLIENTS": "10"
+}
+
+ALLOWED_COMMANDS = {
+    "monisec_client": ["start", "stop", "restart"],
+    "fim_client": ["start", "stop", "restart"],
+    "pim": ["start", "stop", "restart"]
 }
 
 # Function to create default config file if missing
@@ -45,13 +52,13 @@ def load_config():
 
 config = load_config()
 
-# Assign Configuration Variables
-HOST = config.get("HOST", "0.0.0.0")
-PORT = int(config.get("PORT", 5555))
-LOG_DIR = config.get("LOG_DIR", "./logs")
-LOG_FILE = os.path.join(LOG_DIR, config.get("LOG_FILE", "monisec-server.log"))
-PSK_STORE_FILE = config.get("PSK_STORE_FILE", "psk_store.json")
-MAX_CLIENTS = int(config.get("MAX_CLIENTS", 10))
+# Assign values from the config
+HOST = config["HOST"]
+PORT = int(config["PORT"])
+LOG_DIR = config["LOG_DIR"]
+LOG_FILE = os.path.join(LOG_DIR, config["LOG_FILE"])
+PSK_STORE_FILE = config["PSK_STORE_FILE"]
+MAX_CLIENTS = int(config["MAX_CLIENTS"])
 
 # Ensure logs directory exists
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -163,11 +170,21 @@ def handle_client(client_socket, client_address):
 
             # Command Execution
             if data.startswith("COMMAND:"):
-                command = data.split(":", 1)[1].strip()
-                logging.info(f"Executing command for {client_id}: {command}")
-                client_socket.sendall(f"EXECUTE:{command}".encode("utf-8"))
+                command_parts = data.split(":", 1)[1].strip().split()
 
-            client_socket.sendall(b"ACK")
+                if len(command_parts) != 2:
+                    logging.warning(f"Invalid command format from {client_id}: {data}")
+                    client_socket.sendall(b"ERROR: Invalid command format")
+                else:
+                    target, action = command_parts
+                    if target in ALLOWED_COMMANDS and action in ALLOWED_COMMANDS[target]:
+                        logging.info(f"Executing allowed command for {client_id}: {target} {action}")
+                        client_socket.sendall(f"EXECUTE:{target} {action}".encode("utf-8"))
+                    else:
+                        logging.warning(f"Unauthorized command attempt from {client_id}: {target} {action}")
+                        client_socket.sendall(b"ERROR: Unauthorized command")
+
+                        client_socket.sendall(b"ACK")
     except Exception as e:
         logging.error(f"Error with client {client_id}: {e}")
     finally:
@@ -198,5 +215,36 @@ def start_server():
         client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
         client_thread.start()
 
+def print_help():
+    """Prints the available command-line options for monisec-server.py"""
+    print("""
+Usage: python monisec-server.py [command] [client_name]
+
+Commands:
+  add-client <client_name>     Add a new client and generate a unique PSK.
+  remove-client <client_name>  Remove an existing client.
+  list-clients                 List all registered clients.
+  -h, --help                   Show this help message.
+
+If no command is provided, the server will start normally.
+""")
+
 if __name__ == "__main__":
-    start_server()
+    if len(sys.argv) > 2 and sys.argv[1] in ["add-client", "remove-client"]:
+        client_name = sys.argv[2]
+        if sys.argv[1] == "add-client":
+            clients.add_client(client_name)
+        elif sys.argv[1] == "remove-client":
+            clients.remove_client(client_name)
+        sys.exit(0)
+
+    elif len(sys.argv) > 1:
+        if sys.argv[1] == "list-clients":
+            clients.list_clients()
+            sys.exit(0)
+        elif sys.argv[1] in ["-h", "--help"]:
+            print_help()
+            sys.exit(0)
+
+    print("Starting MoniSec Server...")
+    start_server()  # Start the main server function
