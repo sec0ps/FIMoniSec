@@ -86,60 +86,6 @@ if not os.path.exists(PSK_STORE_FILE):
     with open(PSK_STORE_FILE, "w") as f:
         json.dump({}, f)
 
-# Function to handle client connections and execute remote commands
-def handle_client(client_socket, client_address):
-    logging.info(f"New connection from {client_address}")
-
-    client_id = authenticate_client(client_socket)
-    if not client_id:
-        logging.warning(f"Client {client_address} failed authentication. Disconnecting.")
-        client_socket.close()
-        return
-
-    logging.info(f"Client {client_id} authenticated successfully.")
-
-    try:
-        while True:
-            data = client_socket.recv(1024).decode("utf-8")
-            if not data:
-                break
-            logging.info(f"Received from {client_id} ({client_address}): {data}")
-
-            # Command Execution
-            if data.startswith("COMMAND:"):
-                command_parts = data.split(":", 1)[1].strip().split()
-
-                if len(command_parts) != 2:
-                    logging.warning(f"Invalid command format from {client_id}: {data}")
-                    client_socket.sendall(b"ERROR: Invalid command format")
-                else:
-                    target, action = command_parts
-                    if target in ALLOWED_COMMANDS and action in ALLOWED_COMMANDS[target]:
-                        logging.info(f"Executing allowed command for {client_id}: {target} {action}")
-                        client_socket.sendall(f"EXECUTE:{target} {action}".encode("utf-8"))
-                    else:
-                        logging.warning(f"Unauthorized command attempt from {client_id}: {target} {action}")
-                        client_socket.sendall(b"ERROR: Unauthorized command")
-
-                        client_socket.sendall(b"ACK")
-    except Exception as e:
-        logging.error(f"Error with client {client_id}: {e}")
-    finally:
-        logging.info(f"Closing connection with {client_id}")
-        client_socket.close()
-
-# Function to send commands to clients
-def send_command(client_ip, command):
-    try:
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.connect((client_ip, PORT))
-        client_socket.sendall(f"COMMAND:{command}".encode("utf-8"))
-        response = client_socket.recv(1024).decode("utf-8")
-        logging.info(f"Client {client_ip} response: {response}")
-        client_socket.close()
-    except Exception as e:
-        logging.error(f"Error sending command to {client_ip}: {e}")
-
 def handle_shutdown(signum, frame):
     """Gracefully shuts down the MoniSec Server on signal (CTRL+C)."""
     logging.info("[INFO] Shutting down MoniSec Server...")
@@ -156,31 +102,21 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 def start_server():
-    """Starts the MoniSec server and listens for incoming client connections."""
-    global server_socket
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("0.0.0.0", 5555))
+    server.listen(10)
+    logging.info("[INFO] MoniSec Server listening on 0.0.0.0:5555")
 
     try:
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow immediate reuse of port
-        server_socket.bind(("0.0.0.0", 5555))
-        server_socket.listen(10)
-        logging.info("[INFO] MoniSec Server listening on 0.0.0.0:5555")
-
-        while not shutdown_event.is_set():
-            try:
-                server_socket.settimeout(1.0)  # Allow server to check shutdown event
-                client_socket, client_address = server_socket.accept()
-                threading.Thread(target=handle_client, args=(client_socket, client_address), daemon=True).start()
-            except socket.timeout:
-                continue  # Continue loop to check shutdown event
-
+        while True:
+            client_socket, client_address = server.accept()
+            client_thread = threading.Thread(target=clients.handle_client, args=(client_socket, client_address))
+            client_thread.start()
     except Exception as e:
         logging.error(f"[ERROR] Server encountered an error: {e}")
-
     finally:
         logging.info("[INFO] Cleaning up server resources...")
-        if server_socket:
-            server_socket.close()
+        server.close()
 
 def print_help():
     """Prints the available command-line options for monisec-server.py"""
@@ -198,20 +134,27 @@ If no command is provided, the server will start normally.
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
-        command = sys.argv[1]
+        action = sys.argv[1]
 
-        if command == "add-client":
-            clients.add_client()
-            sys.exit(0)
-        elif command == "list-clients":
+        if action in ["-h", "--help", "help"]:
+            print_help()  # Display help message
+            sys.exit(0)  # Exit before starting the server
+
+        elif action == "list-agents":
             clients.list_clients()
-            sys.exit(0)
-        elif command == "remove-client" and len(sys.argv) > 2:
-            clients.remove_client(sys.argv[2])
-            sys.exit(0)
-        elif command in ["-h", "--help"]:
-            print_help()
-            sys.exit(0)
+            sys.exit(0)  # Exit before starting the server
+
+        elif action == "add-client":
+            clients.add_client()
+            sys.exit(0)  # Exit before starting the server
+
+        elif action == "remove-client":
+            if len(sys.argv) < 3:
+                print("[ERROR] Please specify an agent name to remove.")
+                sys.exit(1)
+            agent_name = sys.argv[2]
+            clients.remove_client(agent_name)
+            sys.exit(0)  # Exit before starting the server
 
     print("Starting MoniSec Server...")
-    start_server()
+    start_server()  # Start the main server function
