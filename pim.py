@@ -235,10 +235,10 @@ def rescan_listening_processes(interval=120):
         try:
             print("[PERIODIC SCAN] Running integrity check on listening processes...")
 
-            # Load known good state
-            integrity_state = load_process_metadata()
+            # Import log_event inside the function
+            from fim_client import log_event
 
-            # Get current running listening processes
+            integrity_state = load_process_metadata()
             current_processes = get_listening_processes()
 
             for pid, current_info in current_processes.items():
@@ -259,7 +259,7 @@ def rescan_listening_processes(interval=120):
                             new_hash=current_info["hash"]
                         )
 
-                    # Check for any metadata changes (user, port, cmdline)
+                    # Check for metadata changes
                     changed_fields = {}
                     for key in ["user", "port", "cmdline"]:
                         if stored_info[key] != current_info[key]:
@@ -280,7 +280,6 @@ def rescan_listening_processes(interval=120):
                         )
 
                 else:
-                    # Process is running but not in integrity records (potential new process)
                     print(f"[ALERT] New untracked process detected: {exe_path}")
                     log_event(
                         event_type="NEW_UNTRACKED_PROCESS",
