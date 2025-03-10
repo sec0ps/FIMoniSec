@@ -1,58 +1,117 @@
-import socket
-import threading
-import logging
-import sys
-from monisec_client import start_process, stop_process, restart_process, is_process_running, PROCESSES
+import os
+import json
+import hmac
+import hashlib
 
-CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
-CLIENT_PORT = 6000       # Port for receiving commands
+PSK_STORE_FILE = "psk_store.json"
 
-def start_client_listener():
-    """Starts a TCP server to receive and execute remote commands from monisec-server."""
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((CLIENT_HOST, CLIENT_PORT))
-    server_socket.listen(5)
-    logging.info(f"MoniSec client listening for commands on {CLIENT_HOST}:{CLIENT_PORT}")
+def load_psks():
+    """Load stored PSKs from a JSON file as a structured list."""
+    if not os.path.exists(PSK_STORE_FILE):
+        return {}
 
-    while True:
-        client_socket, addr = server_socket.accept()
-        logging.info(f"Received connection from {addr}")
-        client_thread = threading.Thread(target=handle_server_commands, args=(client_socket,))
-        client_thread.start()
-
-def handle_server_commands(client_socket):
-    """Handles incoming commands from monisec-server and executes only allowed actions."""
     try:
-        data = client_socket.recv(1024).decode("utf-8")
-        if not data:
+        with open(PSK_STORE_FILE, "r") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return {}
+
+def save_psks(psks):
+    """Save PSK store as a structured list."""
+    with open(PSK_STORE_FILE, "w") as f:
+        json.dump(psks, f, indent=4)
+
+# Generate a new PSK
+def generate_psk():
+    """Generate a random 32-byte PSK."""
+    return os.urandom(32).hex()
+
+def get_next_agent_id(psks):
+    """Find the next available Agent ID."""
+    if not psks:
+        return 0
+    return max(int(agent["AgentID"]) for agent in psks.values()) + 1
+
+def add_client():
+    """Prompts user for Agent Name and IP, assigns a unique Agent ID, and stores it in JSON."""
+    psks = load_psks()
+
+    # Prompt the user for input
+    agent_name = input("Enter Agent Name: ").strip()
+    if not agent_name:
+        print("[ERROR] Agent name cannot be empty.")
+        return
+
+    # Ensure unique agent name
+    for agent in psks.values():
+        if agent["AgentName"] == agent_name:
+            print(f"[ERROR] Agent '{agent_name}' already exists.")
             return
 
-        if data.startswith("EXECUTE:"):
-            command_parts = data.split(":", 1)[1].strip().split()
+    agent_ip = input("Enter Agent IP Address: ").strip()
+    if not agent_ip:
+        print("[ERROR] Agent IP cannot be empty.")
+        return
 
-            if len(command_parts) != 2:
-                logging.warning(f"Invalid command format received: {data}")
-                client_socket.sendall(b"ERROR: Invalid command format")
-                return
+    # Assign next available Agent ID
+    agent_id = get_next_agent_id(psks)
+    new_psk = generate_psk()
 
-            target, action = command_parts
-            if target in PROCESSES and action in ["start", "stop", "restart"]:
-                logging.info(f"Executing {action} on {target}")
+    # Store the new agent information
+    psks[str(agent_id)] = {
+        "AgentID": str(agent_id),
+        "AgentName": agent_name,
+        "AgentPSK": new_psk,
+        "AgentIP": agent_ip
+    }
 
-                if action == "restart":
-                    restart_process(target)
-                elif action == "start":
-                    start_process(target)
-                elif action == "stop":
-                    stop_process(target)
+    save_psks(psks)
+    print(f"[INFO] Agent '{agent_name}' added with Agent ID {agent_id}. IP: {agent_ip}, PSK: {new_psk}")
 
-                client_socket.sendall(b"SUCCESS: Command executed")
-            else:
-                logging.warning(f"Unauthorized command received: {target} {action}")
-                client_socket.sendall(b"ERROR: Unauthorized command")
+def remove_client(agent_id):
+    """Removes a client from the PSK store using Agent ID."""
+    psks = load_psks()
 
-    except Exception as e:
-        logging.error(f"Error handling server command: {e}")
-    finally:
-        client_socket.close()
+    if str(agent_id) in psks:
+        removed_agent = psks.pop(str(agent_id))
+        save_psks(psks)
+        print(f"[INFO] Agent '{removed_agent['AgentName']}' (ID: {agent_id}, IP: {removed_agent['AgentIP']}) removed.")
+        return True
+
+    print(f"[ERROR] Agent ID {agent_id} not found.")
+    return False
+
+def list_clients():
+    """Lists all registered clients with their Agent IDs, Names, and IPs."""
+    psks = load_psks()
+    if not psks:
+        print("[INFO] No clients registered.")
+        return
+
+    print("[INFO] Registered Agents:")
+    for agent_id, details in psks.items():
+        print(f"  - Agent ID: {details['AgentID']}, Name: {details['AgentName']}, IP: {details['AgentIP']}")
+
+def authenticate_client(agent_id, agent_ip, nonce, client_hmac):
+    """Authenticates a client using PSK, AgentID, and IP address."""
+    psks = load_psks()
+
+    if str(agent_id) not in psks:
+        print(f"[ERROR] Unknown agent ID: {agent_id}")
+        return False
+
+    agent_data = psks[str(agent_id)]
+
+    expected_hmac = hmac.new(agent_data["AgentPSK"].encode(), nonce.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(client_hmac, expected_hmac):
+        print(f"[ERROR] Authentication failed for agent {agent_id}")
+        return False
+
+    # Check if the IP matches
+    if agent_ip != agent_data["AgentIP"]:
+        print(f"[ERROR] IP mismatch for agent {agent_id}. Expected: {agent_data['AgentIP']}, Got: {agent_ip}")
+        return False
+
+    print(f"[SUCCESS] Agent {agent_id} authenticated successfully.")
+    return True
