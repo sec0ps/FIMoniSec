@@ -2,6 +2,10 @@ import socket
 import threading
 import logging
 import sys
+import json
+import os
+import hmac
+import hashlib
 from monisec_client import start_process, stop_process, restart_process, is_process_running, PROCESSES
 
 CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
@@ -57,44 +61,79 @@ def handle_server_commands(client_socket):
     finally:
         client_socket.close()
 
-def import_psk(psk_value):
-    """Imports a PSK and stores it locally."""
-    token_data = {"psk": psk_value}
+def import_psk():
+    """Prompts user to enter the Server IP, Client Name, and PSK for authentication and stores them."""
+    server_ip = input("Enter Server IP Address: ").strip()
+    client_name = input("Enter Client Name: ").strip()
+    psk_value = input("Enter PSK: ").strip()
+
+    if not server_ip or not client_name or not psk_value:
+        print("[ERROR] Server IP, Client Name, and PSK cannot be empty.")
+        return
+
+    token_data = {
+        "server_ip": server_ip,
+        "client_name": client_name,
+        "psk": psk_value
+    }
+
     with open("auth_token.json", "w") as f:
-        json.dump(token_data, f)
+        json.dump(token_data, f, indent=4)
     os.chmod("auth_token.json", 0o600)
+
     print("[INFO] PSK imported and stored securely.")
-def authenticate_with_server(server_ip, client_name):
-    """Authenticates with the MoniSec server using a stored PSK."""
+
+def authenticate_with_server():
+    """Authenticates with the MoniSec server using stored IP and PSK from auth_token.json."""
+
     token_file = "auth_token.json"
 
-    # Load stored PSK
+    print("[DEBUG] Loading authentication data...")
+
+    # Load stored authentication data
     try:
         with open(token_file, "r") as f:
             token_data = json.load(f)
-            psk = token_data.get("psk", None)
-            if not psk:
-                raise ValueError("No PSK found.")
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        print("[ERROR] No valid PSK found. Import the PSK before connecting.")
+            server_ip = token_data.get("server_ip")
+            psk = token_data.get("psk")
+            client_name = token_data.get("client_name")
+
+            if not server_ip or not psk or not client_name:
+                raise ValueError("Missing Server IP, PSK, or Client Name in auth_token.json.")
+
+        print(f"[DEBUG] Server IP: {server_ip}")
+        print(f"[DEBUG] Client Name: {client_name}")
+        print(f"[DEBUG] PSK Loaded: {psk[:6]}********")  # Masked for security
+
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+        print(f"[ERROR] Failed to load authentication data: {e}")
         return False
 
+    # Generate authentication HMAC
     nonce = os.urandom(16).hex()
     client_hmac = hmac.new(psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
 
+    print("[DEBUG] Connecting to server...")
+
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)  # Prevent infinite hangs
         sock.connect((server_ip, 5555))
 
+        print("[DEBUG] Sending authentication request...")
         sock.sendall(f"{client_name}:{nonce}:{client_hmac}".encode("utf-8"))
+
         response = sock.recv(1024).decode("utf-8")
 
         if response == "AUTH_SUCCESS":
             print("[SUCCESS] Authentication successful.")
             return True
-        else:
+        elif response == "AUTH_FAILED":
             print("[ERROR] Authentication failed.")
+            return False
+        else:
+            print(f"[ERROR] Unexpected server response: {response}")
             return False
     except Exception as e:
         print(f"[ERROR] Connection failed: {e}")
-        return Falsefs
+        return False
