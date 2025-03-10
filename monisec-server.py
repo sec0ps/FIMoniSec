@@ -1,72 +1,23 @@
-import sys
-import socket
-import threading
-import logging
 import os
+import time
+import psutil
+import subprocess
+import logging
+import sys
+import signal
+import remote
+import threading
+import json
+import socket
 import hmac
 import hashlib
-import json
-import clients
-import signal
-
-CONFIG_FILE = "monisec-server.config"
-server_socket = None  # Global reference to the server socket
-shutdown_event = threading.Event()  # Event to signal shutdown
-
-DEFAULT_CONFIG = {
-    "HOST": "0.0.0.0",
-    "PORT": "5555",
-    "LOG_DIR": "./logs",
-    "LOG_FILE": "monisec-server.log",
-    "PSK_STORE_FILE": "psk_store.json",
-    "MAX_CLIENTS": "10"
-}
-
-ALLOWED_COMMANDS = {
-    "monisec_client": ["start", "stop", "restart"],
-    "fim_client": ["start", "stop", "restart"],
-    "pim": ["start", "stop", "restart"]
-}
-
-# Function to create default config file if missing
-def create_default_config():
-    with open(CONFIG_FILE, "w") as f:
-        for key, value in DEFAULT_CONFIG.items():
-            f.write(f"{key} = {value}\n")
-
-# Function to load config from file
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        print(f"{CONFIG_FILE} not found. Creating default configuration.")
-        create_default_config()
-
-    config = {}
-    try:
-        with open(CONFIG_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    key, value = line.split("=", 1)
-                    config[key.strip()] = value.strip()
-    except Exception as e:
-        print(f"Failed to load configuration: {e}")
-        exit(1)
-    return config
-
-config = load_config()
-
-# Assign values from the config
-HOST = config["HOST"]
-PORT = int(config["PORT"])
-LOG_DIR = config["LOG_DIR"]
-LOG_FILE = os.path.join(LOG_DIR, config["LOG_FILE"])
-PSK_STORE_FILE = config["PSK_STORE_FILE"]
-MAX_CLIENTS = int(config["MAX_CLIENTS"])
 
 # Ensure logs directory exists
+LOG_DIR = "./logs"
 os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "monisec-endpoint.log")
 
-# Set log file permissions
+# Set log file permissions to 600 (read/write for user only)
 try:
     with open(LOG_FILE, 'a') as f:
         pass
@@ -74,87 +25,170 @@ try:
 except Exception as e:
     print(f"Failed to set log file permissions: {e}")
 
-# Configure logging
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# Configure logging to write to file and optionally to console
+log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+log_handler = logging.FileHandler(LOG_FILE)
+log_handler.setFormatter(log_formatter)
+log_handler.setLevel(logging.DEBUG)
+logging_handlers = [log_handler]
 
-# Ensure PSK store exists
-if not os.path.exists(PSK_STORE_FILE):
-    with open(PSK_STORE_FILE, "w") as f:
-        json.dump({}, f)
+# Only add console output if not running in daemon mode
+if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    console_handler.setLevel(logging.DEBUG)
+    logging_handlers.append(console_handler)
 
-def handle_shutdown(signum, frame):
-    """Gracefully shuts down the MoniSec Server on signal (CTRL+C)."""
-    logging.info("[INFO] Shutting down MoniSec Server...")
-    shutdown_event.set()  # Signal all threads to stop
+logging.basicConfig(level=logging.DEBUG, handlers=logging_handlers)
 
-    if server_socket:
-        server_socket.close()  # Close server socket to free the port
+# List of monitored processes
+PROCESSES = {
+    "fim_client": "python3 fim_client.py -d",
+    "pim": "python3 pim.py -d",
+}
 
-    logging.info("[INFO] MoniSec Server stopped.")
-    exit(0)
+def start_process(name):
+    if name in PROCESSES:
+        if is_process_running(name):
+            logging.info(f"{name} is already running.")
+        else:
+            logging.info(f"Starting {name}...")
+            process = subprocess.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            time.sleep(2)  # Wait for process to start
+            if is_process_running(name):
+                logging.info(f"{name} started successfully with PID {process.pid}.")
+            else:
+                logging.error(f"Failed to start {name}.")
 
-# Register SIGINT (CTRL+C) and SIGTERM (kill command) for graceful shutdown
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
+def stop_process(name):
+    if name in PROCESSES:
+        pid = is_process_running(name)
+        if pid:
+            logging.info(f"Stopping {name} with PID {pid}...")
+            os.kill(pid, signal.SIGTERM)
+        else:
+            logging.info(f"{name} is not running.")
+    else:
+        logging.warning(f"[ERROR] Attempted to stop unknown process: {name}")
 
-def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("0.0.0.0", 5555))
-    server.listen(10)
-    logging.info("[INFO] MoniSec Server listening on 0.0.0.0:5555")
+# Function to restart a process
+def restart_process(name):
+    stop_process(name)
+    time.sleep(2)
+    start_process(name)
 
-    try:
-        while True:
-            client_socket, client_address = server.accept()
-            client_thread = threading.Thread(target=clients.handle_client, args=(client_socket, client_address))
-            client_thread.start()
-    except Exception as e:
-        logging.error(f"[ERROR] Server encountered an error: {e}")
-    finally:
-        logging.info("[INFO] Cleaning up server resources...")
-        server.close()
+def is_process_running(name):
+    """Check if a process is running by matching a substring in the command line."""
+    for proc in psutil.process_iter(attrs=['pid', 'cmdline']):
+        try:
+            cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
+            if name in cmdline:
+                return proc.info['pid']
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return None
 
-def print_help():
-    """Prints the available command-line options for monisec-server.py"""
-    print("""
-Usage: python monisec-server.py [command] [client_name]
+def monitor_processes():
+    while True:
+        all_running = True
+        for name in PROCESSES:
+            if not is_process_running(name):
+                logging.warning(f"{name} is not running. Restarting...")
+                start_process(name)
+                all_running = False  # Mark that at least one process was restarted
 
-Commands:
-  add-client <client_name>     Add a new client and generate a unique PSK.
-  remove-client <client_name>  Remove an existing client.
-  list-clients                 List all registered clients.
-  -h, --help                   Show this help message.
+        time.sleep(10 if not all_running else 60)  # Increase interval if stable
 
-If no command is provided, the server will start normally.
-""")
+# Handle graceful shutdown on keyboard interrupt
+def handle_exit(signum, frame):
+    logging.info("Keyboard interrupt received. Stopping MoniSec client and all related processes...")
+    stop_process("fim_client")
+    stop_process("pim")
+
+    # Ensure processes are fully stopped before exiting
+    time.sleep(2)
+    logging.info("MoniSec client shutdown complete.")
+    sys.exit(0)
+
+# Register signal handler for graceful shutdown
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         action = sys.argv[1]
 
-        if action in ["-h", "--help", "help"]:
-            print_help()  # Display help message
-            sys.exit(0)  # Exit before starting the server
+        # Restart MoniSec Client
+        if action == "restart":
+            stop_process("monisec_client")
+            time.sleep(2)
+            start_process("monisec_client")
 
-        elif action == "list-agents":
-            clients.list_clients()
-            sys.exit(0)  # Exit before starting the server
-
-        elif action == "add-client":
-            clients.add_client()
-            sys.exit(0)  # Exit before starting the server
-
-        elif action == "remove-client":
-            if len(sys.argv) < 3:
-                print("[ERROR] Please specify an agent name to remove.")
+        # Start, Stop, Restart PIM or FIM
+        elif action in ["pim", "fim"]:
+            if len(sys.argv) > 2 and sys.argv[2] in ["start", "stop", "restart"]:
+                target_process = f"{action}_client"
+                if sys.argv[2] == "start":
+                    start_process(target_process)
+                elif sys.argv[2] == "stop":
+                    stop_process(target_process)
+                elif sys.argv[2] == "restart":
+                    restart_process(target_process)
+            else:
+                print(f"[ERROR] Invalid command. Usage: monisec_client {action} start|stop|restart")
                 sys.exit(1)
-            agent_name = sys.argv[2]
-            clients.remove_client(agent_name)
-            sys.exit(0)  # Exit before starting the server
 
-    print("Starting MoniSec Server...")
-    start_server()  # Start the main server function
+        # Import PSK for authentication
+        elif action == "import-psk":
+            remote.import_psk()
+
+        # Authenticate with server
+        elif action == "auth":
+            if len(sys.argv) > 2 and sys.argv[2] == "test":
+                print("[INFO] Attempting authentication using stored credentials...")
+                success = remote.authenticate_with_server()
+                if success:
+                    print("[INFO] Authentication successful.")
+                else:
+                    print("[ERROR] Authentication failed.")
+            else:
+                print("[ERROR] Invalid command. Usage: monisec_client auth test")
+
+        # Daemon mode
+        elif action == "-d":
+            pid = os.fork()
+            if pid > 0:
+                sys.exit(0)  # Exit parent process
+            os.setsid()
+            os.umask(0)
+            sys.stdin = open(os.devnull, 'r')
+
+            logging.info("MoniSec Endpoint Monitor started in daemon mode.")
+
+            # Start remote command listener in a separate thread
+            listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
+            listener_thread.start()
+
+            monitor_processes()
+
+        # Print usage information for invalid commands
+        else:
+            print(
+                """Usage:
+    monisec_client restart                  # Restart monisec_client
+    monisec_client pim start|stop|restart   # Control PIM process
+    monisec_client fim start|stop|restart   # Control FIM process
+    monisec_client import-psk <PSK>         # Import PSK for authentication
+    monisec_client auth test   # Authenticate with server"""
+            )
+            sys.exit(1)
+
+    else:
+        # Run in foreground mode (default behavior)
+        logging.info("MoniSec Endpoint Monitor started in foreground.")
+
+        # Start remote command listener in a separate thread
+        listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
+        listener_thread.start()
+
+        monitor_processes()
