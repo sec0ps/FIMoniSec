@@ -7,6 +7,10 @@ import sys
 import signal
 import remote
 import threading
+import json
+import socket
+import hmac
+import hashlib
 
 # Ensure logs directory exists
 LOG_DIR = "./logs"
@@ -116,6 +120,48 @@ def monitor_processes():
             time.sleep(60)  # Increase sleep time if no issues detected
         else:
             time.sleep(10)  # Check more frequently if issues occur
+
+def import_psk(psk_value):
+    """Imports a PSK and stores it locally."""
+    token_data = {"psk": psk_value}
+    with open("auth_token.json", "w") as f:
+        json.dump(token_data, f)
+    os.chmod("auth_token.json", 0o600)
+    print("[INFO] PSK imported and stored securely.")
+def authenticate_with_server(server_ip, client_name):
+    """Authenticates with the MoniSec server using a stored PSK."""
+    token_file = "auth_token.json"
+
+    # Load stored PSK
+    try:
+        with open(token_file, "r") as f:
+            token_data = json.load(f)
+            psk = token_data.get("psk", None)
+            if not psk:
+                raise ValueError("No PSK found.")
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        print("[ERROR] No valid PSK found. Import the PSK before connecting.")
+        return False
+
+    nonce = os.urandom(16).hex()
+    client_hmac = hmac.new(psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((server_ip, 5555))
+
+        sock.sendall(f"{client_name}:{nonce}:{client_hmac}".encode("utf-8"))
+        response = sock.recv(1024).decode("utf-8")
+
+        if response == "AUTH_SUCCESS":
+            print("[SUCCESS] Authentication successful.")
+            return True
+        else:
+            print("[ERROR] Authentication failed.")
+            return False
+    except Exception as e:
+        print(f"[ERROR] Connection failed: {e}")
+        return False
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
