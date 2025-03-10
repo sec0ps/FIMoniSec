@@ -139,15 +139,20 @@ if __name__ == "__main__":
                 sys.exit(1)
 
         # Import PSK for authentication
-        elif action == "import-psk" and len(sys.argv) > 2:
-            psk_value = sys.argv[2]
-            remote.import_psk(psk_value)
+        elif action == "import-psk":
+            remote.import_psk()
 
         # Authenticate with server
-        elif action == "auth" and len(sys.argv) > 3:
-            server_ip = sys.argv[2]
-            client_name = sys.argv[3]
-            remote.authenticate_with_server(server_ip, client_name)
+        elif action == "auth":
+            if len(sys.argv) > 2 and sys.argv[2] == "test":
+                print("[INFO] Attempting authentication using stored credentials...")
+                success = remote.authenticate_with_server()
+                if success:
+                    print("[INFO] Authentication successful.")
+                else:
+                    print("[ERROR] Authentication failed.")
+            else:
+                print("[ERROR] Invalid command. Usage: monisec_client auth test")
 
         # Daemon mode
         elif action == "-d":
@@ -174,7 +179,7 @@ if __name__ == "__main__":
     monisec_client pim start|stop|restart   # Control PIM process
     monisec_client fim start|stop|restart   # Control FIM process
     monisec_client import-psk <PSK>         # Import PSK for authentication
-    monisec_client auth <ServerIP> <Name>   # Authenticate with server"""
+    monisec_client auth test   # Authenticate with server"""
             )
             sys.exit(1)
 
