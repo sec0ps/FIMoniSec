@@ -5,6 +5,7 @@ import hashlib
 import logging
 
 PSK_STORE_FILE = "psk_store.json"
+ENDPOINT_LOG_FILE = "./logs/endpoint-integrity-logs.json"
 
 def load_psks():
     """Load stored PSKs from a JSON file as a structured list."""
@@ -151,46 +152,44 @@ def authenticate_client(client_socket):
         return None
 
 def handle_client(client_socket, client_address):
+    """Handles authentication and logs reception from an authenticated client."""
     logging.info(f"New connection from {client_address}")
 
-    try:
-        # Authenticate the client
-        client_id = authenticate_client(client_socket)  # Fix: Only pass client_socket
-
-        if not client_id:
-            logging.warning(f"Authentication failed for client {client_address}")
-            client_socket.sendall(b"AUTH_FAILED")
-            client_socket.close()
-            return
-
-        logging.info(f"Client {client_id} authenticated successfully.")
-
-        # Proceed to command handling
-        while True:
-            data = client_socket.recv(1024).decode("utf-8")
-            if not data:
-                break
-            logging.info(f"Received from {client_id} ({client_address}): {data}")
-
-            if data.startswith("COMMAND:"):
-                command_parts = data.split(":", 1)[1].strip().split()
-
-                if len(command_parts) != 2:
-                    logging.warning(f"Invalid command format from {client_id}: {data}")
-                    client_socket.sendall(b"ERROR: Invalid command format")
-                else:
-                    target, action = command_parts
-                    if target in ALLOWED_COMMANDS and action in ALLOWED_COMMANDS[target]:
-                        logging.info(f"Executing allowed command for {client_id}: {target} {action}")
-                        client_socket.sendall(f"EXECUTE:{target} {action}".encode("utf-8"))
-                    else:
-                        logging.warning(f"Unauthorized command attempt from {client_id}: {target} {action}")
-                        client_socket.sendall(b"ERROR: Unauthorized command")
-    except Exception as e:
-        logging.error(f"Error with client {client_id}: {e}")
-    finally:
-        logging.info(f"Closing connection with {client_id}")
+    authenticated_client = authenticate_client(client_socket)
+    if not authenticated_client:
+        logging.warning(f"Authentication failed for client {client_address}")
         client_socket.close()
+        return
+
+    logging.info(f"Client {authenticated_client} authenticated successfully. Awaiting logs...")
+
+    try:
+        while True:
+            data = client_socket.recv(4096).decode("utf-8")  # Increase buffer size
+            if not data:
+                break  # Disconnect if client stops sending
+
+            try:
+                log_entry = json.loads(data)
+                append_log(log_entry)
+                logging.info(f"[DEBUG] Received log from {authenticated_client}: {log_entry}")
+            except json.JSONDecodeError:
+                logging.warning(f"Received malformed log data from {authenticated_client}: {data}")
+
+    except Exception as e:
+        logging.error(f"Error with client {authenticated_client}: {e}")
+    finally:
+        logging.info(f"Client {authenticated_client} disconnected.")
+        client_socket.close()
+
+def append_log(log_entry):
+    """Appends incoming logs to the endpoint-integrity-logs.json file."""
+    try:
+        with open(ENDPOINT_LOG_FILE, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+        logging.info(f"[DEBUG] Log appended: {log_entry}")
+    except Exception as e:
+        logging.error(f"[ERROR] Failed to write log: {e}")
 
 # Function to send commands to clients
 def send_command(client_ip, command):
