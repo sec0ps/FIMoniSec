@@ -12,7 +12,7 @@ from monisec_client import start_process, stop_process, restart_process, is_proc
 CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
 CLIENT_PORT = 6000       # Port for receiving commands
 AUTH_TOKEN_FILE = "auth_token.json"
-LOG_FILE = "./logs/endpoint-integrity-logs.json"
+LOG_FILES = ["./logs/monisec-client.log", "./logs/file_monitor.json"]
 
 def start_client_listener():
     """Starts a TCP server to receive and execute remote commands from monisec-server."""
@@ -142,9 +142,7 @@ def authenticate_with_server():
         return False
 
 def send_logs_to_server():
-    """Sends logs from MoniSec client to MoniSec server after authentication."""
-    LOG_FILES = ["./logs/monisec-client.log", "./logs/file_monitor.json"]
-    log_positions = {log: 0 for log in LOG_FILES}  # Track last read position
+    """Sends only newly appended logs from MoniSec client to MoniSec server in real-time."""
 
     # Load stored authentication data
     try:
@@ -156,13 +154,12 @@ def send_logs_to_server():
 
             if not server_ip or not client_name or not psk:
                 raise ValueError("Missing Server IP, Client Name, or PSK in auth_token.json.")
-
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
-        print(f"[ERROR] Failed to load authentication data: {e}")
+        logging.error(f"Failed to load authentication data: {e}")
         return False
 
     try:
-        print(f"[DEBUG] Connecting to server {server_ip}...")
+        logging.info(f"Connecting to MoniSec Server at {server_ip}...")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(10)
         sock.connect((server_ip, 5555))
@@ -174,56 +171,87 @@ def send_logs_to_server():
         response = sock.recv(1024).decode("utf-8")
 
         if response != "AUTH_SUCCESS":
-            print("[ERROR] Authentication failed. Server response:", response)
+            logging.error(f"Authentication failed. Server response: {response}")
             sock.close()
             return False
 
-        print("[INFO] Authentication successful. Sending logs to server...")
+        logging.info("Authentication successful. Monitoring logs...")
 
-        # Initialize file positions
+        file_positions = {log_file: 0 for log_file in LOG_FILES}
+
+        # Move file pointers to end of file to avoid resending old logs
         for log_file in LOG_FILES:
             if os.path.exists(log_file):
                 with open(log_file, "r") as f:
-                    f.seek(0, os.SEEK_END)  # Move to end of file
-                    log_positions[log_file] = f.tell()
+                    f.seek(0, os.SEEK_END)
+                    file_positions[log_file] = f.tell()  # Start at end of file
 
-        # Continuously check for new logs
+        # Infinite loop to continuously check for new log entries
         while True:
+            logs_to_send = []
+
             for log_file in LOG_FILES:
                 if os.path.exists(log_file):
                     with open(log_file, "r") as f:
-                        f.seek(log_positions[log_file])  # Go to last read position
-                        new_logs = f.readlines()
-                        log_positions[log_file] = f.tell()  # Update position
+                        f.seek(file_positions[log_file])  # Move to last read position
+                        new_logs = f.read().strip()  # Read new appended logs
+                        file_positions[log_file] = f.tell()  # Update position for next read
 
-                    for log_entry in new_logs:
+                    if new_logs:
                         try:
-                            log_data = {"client_name": client_name, "log": log_entry.strip()}
-                            sock.sendall(json.dumps(log_data).encode("utf-8"))
-                            print(f"[DEBUG] Sent log: {log_data}")
-                        except Exception as send_error:
-                            print(f"[ERROR] Failed to send log entry: {send_error}")
+                            # Ensure proper JSON formatting and parsing
+                            formatted_logs = "[" + new_logs.replace("}\n{", "}, {") + "]"
+                            json_logs = json.loads(formatted_logs)
+                            logs_to_send.extend(json_logs)
+                        except json.JSONDecodeError as e:
+                            logging.warning(f"Skipping malformed log entry in {log_file}: {e}")
+                            logging.warning(f"Problematic log contents: {new_logs}")
 
-            time.sleep(3)  # Adjust sending rate
+            if logs_to_send:
+                try:
+                    log_data = {
+                        "client_name": client_name,
+                        "logs": logs_to_send  # Send as a batch
+                    }
+                    sock.sendall(json.dumps(log_data).encode("utf-8"))
+                    logging.info(f"Sent {len(logs_to_send)} logs to server.")
+                except Exception as send_error:
+                    logging.error(f"Failed to send logs: {send_error}")
+
+            time.sleep(2)  # Check for new logs every 2 seconds
 
     except Exception as e:
-        print(f"[ERROR] Connection to server failed: {e}")
+        logging.error(f"Connection to server failed: {e}")
     finally:
-        print("[INFO] Closing log socket connection.")
+        logging.info("Closing log socket connection.")
         sock.close()
 
-def read_latest_log_entry():
-    """Reads the latest log entry from the client's log files."""
-    LOG_FILES = ["./logs/monisec-client.log", "./logs/file_monitor.json"]
-
-    for log_file in LOG_FILES:
+def check_auth_and_send_logs():
+    """Checks if auth_token.json exists and starts log transmission if valid."""
+    if os.path.exists(AUTH_TOKEN_FILE):
         try:
-            with open(log_file, "r") as f:
-                lines = f.readlines()
-                if lines:
-                    return json.loads(lines[-1].strip())  # Send the latest log entry
-        except (FileNotFoundError, json.JSONDecodeError):
-            continue  # Skip if file is missing or has malformed data
+            with open(AUTH_TOKEN_FILE, "r") as f:
+                token_data = json.load(f)
+                server_ip = token_data.get("server_ip")
+                client_name = token_data.get("client_name")
+                psk = token_data.get("psk")
 
-    return None  # No logs available yet
+            if server_ip and client_name and psk:
+                logging.info("[INFO] Authentication token found. Attempting to connect to server...")
 
+                success = authenticate_with_server()
+                if success:
+                    logging.info("[INFO] Authentication successful. Starting real-time log transmission...")
+
+                    # ✅ Start log transmission in a separate thread
+                    log_thread = threading.Thread(target=send_logs_to_server, daemon=True)
+                    log_thread.start()
+
+                else:
+                    logging.warning("[WARNING] Authentication failed. Logging locally only.")
+            else:
+                logging.warning("[WARNING] auth_token.json is incomplete. Logging locally only.")
+        except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+            logging.error(f"[ERROR] Failed to parse auth_token.json: {e}")
+    else:
+        logging.info("[INFO] No authentication token found. Logging locally only.")
