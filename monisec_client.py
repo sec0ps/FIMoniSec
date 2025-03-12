@@ -195,4 +195,5 @@ if __name__ == "__main__":
         listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
         listener_thread.start()
 
+        remote.check_auth_and_send_logs()
         monitor_processes()
