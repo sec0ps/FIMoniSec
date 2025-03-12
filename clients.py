@@ -109,13 +109,12 @@ def authenticate_client(client_socket):
         try:
             client_name, nonce, client_hmac = auth_data.split(":")
         except ValueError:
-            logging.warning(f"[ERROR] Malformed authentication data received: {auth_data}")
+            logging.warning("[ERROR] Malformed authentication data received.")
             client_socket.sendall(b"AUTH_FAILED")
             return None
 
         # Load stored PSKs
         psks = load_psks()
-        logging.debug(f"[DEBUG] Loaded PSKs: {json.dumps(psks, indent=4)}")  # Debugging
 
         # Check if client name exists in PSKs
         matching_agent = None
@@ -125,13 +124,12 @@ def authenticate_client(client_socket):
                 break
 
         if not matching_agent:
-            logging.warning(f"[ERROR] Unknown client: {client_name}")
+            logging.warning("[ERROR] Unknown client attempted authentication.")
             client_socket.sendall(b"AUTH_FAILED")
             return None
 
         # Retrieve stored PSK for the client
         client_psk = matching_agent["AgentPSK"]
-        logging.debug(f"[DEBUG] Retrieved PSK for {client_name}: {client_psk[:6]}********")  # Masked for security
 
         # Compute expected HMAC
         expected_hmac = hmac.new(client_psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
@@ -142,7 +140,7 @@ def authenticate_client(client_socket):
             logging.info(f"[SUCCESS] Client {client_name} authenticated successfully.")
             return client_name
         else:
-            logging.warning(f"[ERROR] Authentication failed for {client_name}")
+            logging.warning("[ERROR] Authentication failed.")
             client_socket.sendall(b"AUTH_FAILED")
             return None
 
@@ -157,7 +155,7 @@ def handle_client(client_socket, client_address):
 
     authenticated_client = authenticate_client(client_socket)
     if not authenticated_client:
-        logging.warning(f"Authentication failed for client {client_address}")
+        logging.warning("Authentication failed. Closing connection.")
         client_socket.close()
         return
 
@@ -165,16 +163,15 @@ def handle_client(client_socket, client_address):
 
     try:
         while True:
-            data = client_socket.recv(4096).decode("utf-8")  # Increase buffer size
+            data = client_socket.recv(4096).decode("utf-8")
             if not data:
                 break  # Disconnect if client stops sending
 
             try:
                 log_entry = json.loads(data)
                 append_log(log_entry)
-                logging.info(f"[DEBUG] Received log from {authenticated_client}: {log_entry}")
             except json.JSONDecodeError:
-                logging.warning(f"Received malformed log data from {authenticated_client}: {data}")
+                logging.warning("Received malformed log data.")
 
     except Exception as e:
         logging.error(f"Error with client {authenticated_client}: {e}")
@@ -187,7 +184,6 @@ def append_log(log_entry):
     try:
         with open(ENDPOINT_LOG_FILE, "a") as f:
             f.write(json.dumps(log_entry) + "\n")
-        logging.info(f"[DEBUG] Log appended: {log_entry}")
     except Exception as e:
         logging.error(f"[ERROR] Failed to write log: {e}")
 
