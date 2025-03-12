@@ -5,7 +5,7 @@ import hashlib
 import logging
 
 PSK_STORE_FILE = "psk_store.json"
-ENDPOINT_LOG_FILE = "./logs/endpoint-integrity-logs.json"
+ENDPOINT_LOG_FILE = "./logs/monisec-server.log"
 
 def load_psks():
     """Load stored PSKs from a JSON file as a structured list."""
