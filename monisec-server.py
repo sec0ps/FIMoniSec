@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "LOG_DIR": "./logs",
     "LOG_FILE": "monisec-server.log",
     "PSK_STORE_FILE": "psk_store.json",
+    "ENDPOINT_LOG_FILE": "endpoint-integrity-logs.json",
     "MAX_CLIENTS": "10"
 }
 
@@ -55,13 +56,14 @@ def load_config():
 
 config = load_config()
 
-# Assign values from the config
-HOST = config["HOST"]
-PORT = int(config["PORT"])
-LOG_DIR = config["LOG_DIR"]
-LOG_FILE = os.path.join(LOG_DIR, config["LOG_FILE"])
-PSK_STORE_FILE = config["PSK_STORE_FILE"]
-MAX_CLIENTS = int(config["MAX_CLIENTS"])
+# Ensure required keys exist in the config; fallback to defaults if missing
+HOST = config.get("HOST", DEFAULT_CONFIG["HOST"])
+PORT = int(config.get("PORT", DEFAULT_CONFIG["PORT"]))
+LOG_DIR = config.get("LOG_DIR", DEFAULT_CONFIG["LOG_DIR"])
+LOG_FILE = os.path.join(LOG_DIR, config.get("LOG_FILE", DEFAULT_CONFIG["LOG_FILE"]))
+ENDPOINT_LOG_FILE = os.path.join(LOG_DIR, config.get("ENDPOINT_LOG_FILE", DEFAULT_CONFIG["ENDPOINT_LOG_FILE"]))
+PSK_STORE_FILE = config.get("PSK_STORE_FILE", DEFAULT_CONFIG["PSK_STORE_FILE"])
+MAX_CLIENTS = int(config.get("MAX_CLIENTS", DEFAULT_CONFIG["MAX_CLIENTS"]))
 
 # Ensure logs directory exists
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -118,6 +120,23 @@ def start_server():
         logging.info("[INFO] Cleaning up server resources...")
         server.close()
 
+def initialize_log_storage():
+    """Ensures the logs directory and endpoint-integrity-logs.json exist."""
+    try:
+        # Ensure logs directory exists
+        if not os.path.exists(LOG_DIR):
+            os.makedirs(LOG_DIR)
+            logging.info(f"Created logs directory: {LOG_DIR}")
+
+        # Ensure endpoint-integrity-logs.json exists
+        if not os.path.exists(ENDPOINT_LOG_FILE):
+            with open(ENDPOINT_LOG_FILE, "w") as f:
+                f.write("")  # Create an empty file
+            logging.info(f"Created log file: {ENDPOINT_LOG_FILE}")
+
+    except Exception as e:
+        logging.error(f"Failed to initialize log storage: {e}")
+
 def print_help():
     """Prints the available command-line options for monisec-server.py"""
     print("""
@@ -155,6 +174,6 @@ if __name__ == "__main__":
             agent_name = sys.argv[2]
             clients.remove_client(agent_name)
             sys.exit(0)  # Exit before starting the server
-
+    initialize_log_storage()
     print("Starting MoniSec Server...")
     start_server()  # Start the main server function
