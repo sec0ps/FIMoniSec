@@ -87,7 +87,7 @@ def send_to_siem(log_entry):
     except Exception as e:
         logging.error(f"[ERROR] Failed to send log to SIEM: {e}")
 
-def forward_log_to_siem(log_entry):
+def forward_log_to_siem(log_entry, client_name):
     """Processes logs received from clients and forwards them to the SIEM."""
     formatted_log = {
         "timestamp": log_entry.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
