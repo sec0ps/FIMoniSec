@@ -8,9 +8,9 @@ import signal
 import remote
 import threading
 import json
-import socket
-import hmac
-import hashlib
+#import socket
+#import hmac
+#import hashlib
 
 # Ensure logs directory exists
 LOG_DIR = "./logs"
@@ -142,13 +142,17 @@ if __name__ == "__main__":
         elif action == "import-psk":
             remote.import_psk()
 
-        # Authenticate with server
+        # Authenticate with server and start sending logs
         elif action == "auth":
             if len(sys.argv) > 2 and sys.argv[2] == "test":
                 print("[INFO] Attempting authentication using stored credentials...")
                 success = remote.authenticate_with_server()
                 if success:
-                    print("[INFO] Authentication successful.")
+                    print("[INFO] Authentication successful. Starting log transmission...")
+
+                    # Start sending logs in a separate thread
+                    log_thread = threading.Thread(target=remote.send_logs_to_server, daemon=True)
+                    log_thread.start()
                 else:
                     print("[ERROR] Authentication failed.")
             else:
@@ -178,8 +182,8 @@ if __name__ == "__main__":
     monisec_client restart                  # Restart monisec_client
     monisec_client pim start|stop|restart   # Control PIM process
     monisec_client fim start|stop|restart   # Control FIM process
-    monisec_client import-psk <PSK>         # Import PSK for authentication
-    monisec_client auth test   # Authenticate with server"""
+    monisec_client import-psk               # Import PSK for authentication
+    monisec_client auth test                 # Authenticate and start log transmission"""
             )
             sys.exit(1)
 
