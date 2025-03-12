@@ -3,9 +3,17 @@ import json
 import hmac
 import hashlib
 import logging
+import server_siem
 
 PSK_STORE_FILE = "psk_store.json"
-ENDPOINT_LOG_FILE = "./logs/monisec-server.log"
+ENDPOINT_LOG_FILE = "./logs/siem-forwarding.log"  # ✅ Change to correct log file
+
+# Configure logging
+logging.basicConfig(
+    filename="./logs/monisec-server.log",  # ✅ Server logs remain separate
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 def load_psks():
     """Load stored PSKs from a JSON file as a structured list."""
@@ -150,12 +158,11 @@ def authenticate_client(client_socket):
         return None
 
 def handle_client(client_socket, client_address):
-    """Handles authentication and logs reception from an authenticated client."""
     logging.info(f"New connection from {client_address}")
 
-    authenticated_client = authenticate_client(client_socket)
+    authenticated_client = authenticate_client(client_socket)  # ✅ This gets the client name
     if not authenticated_client:
-        logging.warning("Authentication failed. Closing connection.")
+        logging.warning(f"Authentication failed for client {client_address}")
         client_socket.close()
         return
 
@@ -168,10 +175,19 @@ def handle_client(client_socket, client_address):
                 break  # Disconnect if client stops sending
 
             try:
-                log_entry = json.loads(data)
-                append_log(log_entry)
+                log_data = json.loads(data)
+                if isinstance(log_data, dict) and "logs" in log_data:
+                    logs = log_data["logs"]
+                    for log_entry in logs:
+                        append_log(log_entry)  # ✅ Store logs locally
+                        server_siem.forward_log_to_siem(log_entry, authenticated_client)  # ✅ Forward with correct name
+
+                    logging.info(f"Received {len(logs)} logs from {authenticated_client}.")
+                else:
+                    logging.warning(f"Malformed log data received: {data}")
+
             except json.JSONDecodeError:
-                logging.warning("Received malformed log data.")
+                logging.warning(f"Received malformed log data from {authenticated_client}: {data}")
 
     except Exception as e:
         logging.error(f"Error with client {authenticated_client}: {e}")
@@ -180,12 +196,12 @@ def handle_client(client_socket, client_address):
         client_socket.close()
 
 def append_log(log_entry):
-    """Appends incoming logs to the endpoint-integrity-logs.json file."""
+    """Appends logs from clients to siem-forwarding.log."""
     try:
-        with open(ENDPOINT_LOG_FILE, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
+        with open(ENDPOINT_LOG_FILE, "a") as log_file:
+            log_file.write(json.dumps(log_entry) + "\n")
     except Exception as e:
-        logging.error(f"[ERROR] Failed to write log: {e}")
+        logging.error(f"[ERROR] Failed to write client log: {e}")
 
 # Function to send commands to clients
 def send_command(client_ip, command):
