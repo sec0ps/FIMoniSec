@@ -8,9 +8,6 @@ import signal
 import remote
 import threading
 import json
-#import socket
-#import hmac
-#import hashlib
 
 # Ensure logs directory exists
 LOG_DIR = "./logs"
