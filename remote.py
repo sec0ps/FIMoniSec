@@ -6,10 +6,13 @@ import json
 import os
 import hmac
 import hashlib
+import time
 from monisec_client import start_process, stop_process, restart_process, is_process_running, PROCESSES
 
 CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
 CLIENT_PORT = 6000       # Port for receiving commands
+AUTH_TOKEN_FILE = "auth_token.json"
+LOG_FILE = "./logs/endpoint-integrity-logs.json"
 
 def start_client_listener():
     """Starts a TCP server to receive and execute remote commands from monisec-server."""
@@ -137,3 +140,90 @@ def authenticate_with_server():
     except Exception as e:
         print(f"[ERROR] Connection failed: {e}")
         return False
+
+def send_logs_to_server():
+    """Sends logs from MoniSec client to MoniSec server after authentication."""
+    LOG_FILES = ["./logs/monisec-client.log", "./logs/file_monitor.json"]
+    log_positions = {log: 0 for log in LOG_FILES}  # Track last read position
+
+    # Load stored authentication data
+    try:
+        with open(AUTH_TOKEN_FILE, "r") as f:
+            token_data = json.load(f)
+            server_ip = token_data.get("server_ip")
+            client_name = token_data.get("client_name")
+            psk = token_data.get("psk")
+
+            if not server_ip or not client_name or not psk:
+                raise ValueError("Missing Server IP, Client Name, or PSK in auth_token.json.")
+
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+        print(f"[ERROR] Failed to load authentication data: {e}")
+        return False
+
+    try:
+        print(f"[DEBUG] Connecting to server {server_ip}...")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect((server_ip, 5555))
+
+        # Authenticate first
+        nonce = os.urandom(16).hex()
+        client_hmac = hmac.new(psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+        sock.sendall(f"{client_name}:{nonce}:{client_hmac}".encode("utf-8"))
+        response = sock.recv(1024).decode("utf-8")
+
+        if response != "AUTH_SUCCESS":
+            print("[ERROR] Authentication failed. Server response:", response)
+            sock.close()
+            return False
+
+        print("[INFO] Authentication successful. Sending logs to server...")
+
+        # Initialize file positions
+        for log_file in LOG_FILES:
+            if os.path.exists(log_file):
+                with open(log_file, "r") as f:
+                    f.seek(0, os.SEEK_END)  # Move to end of file
+                    log_positions[log_file] = f.tell()
+
+        # Continuously check for new logs
+        while True:
+            for log_file in LOG_FILES:
+                if os.path.exists(log_file):
+                    with open(log_file, "r") as f:
+                        f.seek(log_positions[log_file])  # Go to last read position
+                        new_logs = f.readlines()
+                        log_positions[log_file] = f.tell()  # Update position
+
+                    for log_entry in new_logs:
+                        try:
+                            log_data = {"client_name": client_name, "log": log_entry.strip()}
+                            sock.sendall(json.dumps(log_data).encode("utf-8"))
+                            print(f"[DEBUG] Sent log: {log_data}")
+                        except Exception as send_error:
+                            print(f"[ERROR] Failed to send log entry: {send_error}")
+
+            time.sleep(3)  # Adjust sending rate
+
+    except Exception as e:
+        print(f"[ERROR] Connection to server failed: {e}")
+    finally:
+        print("[INFO] Closing log socket connection.")
+        sock.close()
+
+def read_latest_log_entry():
+    """Reads the latest log entry from the client's log files."""
+    LOG_FILES = ["./logs/monisec-client.log", "./logs/file_monitor.json"]
+
+    for log_file in LOG_FILES:
+        try:
+            with open(log_file, "r") as f:
+                lines = f.readlines()
+                if lines:
+                    return json.loads(lines[-1].strip())  # Send the latest log entry
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue  # Skip if file is missing or has malformed data
+
+    return None  # No logs available yet
+
