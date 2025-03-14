@@ -175,90 +175,97 @@ def connect_to_server(server_ip, client_name, psk):
         return None
 
 def send_logs_to_server():
-    """Sends full JSON logs from file_monitor.json to MoniSec server without splitting individual lines."""
+    """Sends only newly appended logs from MoniSec client to MoniSec server in real-time."""
     try:
-        # Load stored authentication data
         with open(AUTH_TOKEN_FILE, "r") as f:
             token_data = json.load(f)
             server_ip = token_data.get("server_ip")
             client_name = token_data.get("client_name")
             psk = token_data.get("psk")
 
-        if not server_ip or not client_name or not psk:
-            logging.error("Missing Server IP, Client Name, or PSK in auth_token.json.")
-            return
+            if not server_ip or not client_name or not psk:
+                logging.error("Missing Server IP, Client Name, or PSK in auth_token.json.")
+                return
 
         logging.info(f"Connecting to MoniSec Server at {server_ip}...")
-        sock = socket.create_connection((server_ip, 5555), timeout=10)
+        sock = connect_to_server(server_ip, client_name, psk)  # ✅ Use reconnectable socket function
+        if not sock:
+            return  # Exit if unable to establish connection
 
-        # Authenticate first
-        nonce = os.urandom(16).hex()
-        client_hmac = hmac.new(psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
-        sock.sendall(f"{client_name}:{nonce}:{client_hmac}".encode("utf-8"))
-        response = sock.recv(1024).decode("utf-8")
+        file_positions = {}
 
-        if response != "AUTH_SUCCESS":
-            logging.error(f"Authentication failed. Server response: {response}")
-            sock.close()
-            return
-
-        logging.info("Authentication successful. Monitoring logs...")
-
-        last_position = 0
-        if os.path.exists(LOG_FILE):
-            last_position = os.path.getsize(LOG_FILE)  # Start at the end to avoid resending old logs
-
-        buffer = ""  # Buffer to accumulate valid JSON blocks
+        # Move file pointers to end of file to avoid resending old logs
+        for log_file in LOG_FILES:
+            if os.path.exists(log_file):
+                with open(log_file, "r") as f:
+                    f.seek(0, os.SEEK_END)
+                    file_positions[log_file] = f.tell()
+            else:
+                file_positions[log_file] = 0  # ✅ Ensure every file has a tracked position
 
         while True:
-            if not os.path.exists(LOG_FILE):
-                logging.warning(f"Log file {LOG_FILE} not found.")
-                time.sleep(2)
-                continue
+            logs_to_send = []
 
-            with open(LOG_FILE, "r") as f:
-                f.seek(last_position)
-                new_data = f.read()
+            for log_file in LOG_FILES:
+                if os.path.exists(log_file):
+                    with open(log_file, "r") as f:
+                        f.seek(file_positions[log_file])  # Move to last read position
+                        new_logs = f.read().strip()
 
-                if not new_data:
-                    time.sleep(2)  # No new logs, wait before retrying
-                    continue
+                        if not new_logs:
+                            continue  # Skip empty logs
 
-                last_position = f.tell()  # Update position for next read
-                buffer += new_data.strip()  # Append to buffer
+                        file_positions[log_file] = f.tell()  # ✅ Update file position
 
-            # Try extracting valid JSON objects
-            logs_to_send = extract_valid_json_objects(buffer)
+                    try:
+                        # ✅ Extract JSON blocks correctly
+                        log_entries = extract_valid_json_objects(new_logs)
+
+                        # ✅ Attach client_name to every log entry
+                        for log in log_entries:
+                            if isinstance(log, dict):  # ✅ Ensure it's a dict
+                                log["client_name"] = client_name
+                                logs_to_send.append(log)
+                            else:
+                                logging.warning(f"Skipping malformed log entry: {log}")
+
+                    except json.JSONDecodeError as e:
+                        logging.warning(f"Skipping malformed log entry in {log_file}: {e}")
+                        continue
 
             if logs_to_send:
                 try:
-                    log_data = json.dumps({"client_name": client_name, "logs": logs_to_send})
+                    # ✅ Ensure logs are structured properly before sending
+                    log_data = json.dumps({"logs": logs_to_send})  # ✅ Fix potential assignment issue
                     sock.sendall(log_data.encode("utf-8"))
                     logging.info(f"Sent {len(logs_to_send)} logs to server.")
                 except (socket.error, BrokenPipeError) as send_error:
                     logging.error(f"Failed to send logs: {send_error}")
                     sock.close()
-                    sock = connect_to_server(server_ip, client_name, psk)  # Reconnect on failure
+                    sock = connect_to_server(server_ip, client_name, psk)
                     if not sock:
                         logging.error("Reconnection failed. Retrying in 5 seconds...")
                         time.sleep(5)
-                        continue  # Skip this iteration if reconnection failed
+                        continue
 
-            time.sleep(2)  # Adjust as needed
+            time.sleep(2)  # Check for new logs every 2 seconds
 
     except Exception as e:
-        logging.error(f"Failed to send logs: {e}")
+        logging.error(f"Connection to server failed: {e}")
     finally:
         logging.info("Closing log socket connection.")
-        sock.close()
+        if sock:
+            sock.close()
 
 def extract_valid_json_objects(buffer):
     """Extracts valid JSON blocks from a buffer string."""
     logs = []
+    buffer = buffer.strip()  # ✅ Remove unnecessary whitespace
     while buffer:
         try:
             obj, index = json.JSONDecoder().raw_decode(buffer)  # Decode first valid JSON object
-            logs.append(obj)
+            if isinstance(obj, dict):  # ✅ Ensure valid JSON object
+                logs.append(obj)
             buffer = buffer[index:].strip()  # Remove parsed JSON from buffer
         except json.JSONDecodeError:
             break  # Stop if there's no full JSON object remaining
