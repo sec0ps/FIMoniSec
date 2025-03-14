@@ -139,21 +139,20 @@ if __name__ == "__main__":
         elif action == "import-psk":
             remote.import_psk()
 
-        # Authenticate with server and start sending logs
+        # Authenticate with server and exit
         elif action == "auth":
             if len(sys.argv) > 2 and sys.argv[2] == "test":
                 print("[INFO] Attempting authentication using stored credentials...")
                 success = remote.authenticate_with_server()
                 if success:
-                    print("[INFO] Authentication successful. Starting log transmission...")
-
-                    # Start sending logs in a separate thread
-                    log_thread = threading.Thread(target=remote.send_logs_to_server, daemon=True)
-                    log_thread.start()
+                    print("[SUCCESS] Authentication successful.")
+                    sys.exit(0)  # ✅ Exit gracefully on success
                 else:
                     print("[ERROR] Authentication failed.")
+                    sys.exit(1)  # ✅ Exit with error code
             else:
                 print("[ERROR] Invalid command. Usage: monisec_client auth test")
+                sys.exit(1)
 
         # Daemon mode
         elif action == "-d":
@@ -180,7 +179,7 @@ if __name__ == "__main__":
     monisec_client pim start|stop|restart   # Control PIM process
     monisec_client fim start|stop|restart   # Control FIM process
     monisec_client import-psk               # Import PSK for authentication
-    monisec_client auth test                 # Authenticate and start log transmission"""
+    monisec_client auth test                 # Test authentication, then exit"""
             )
             sys.exit(1)
 
@@ -194,3 +193,4 @@ if __name__ == "__main__":
 
         remote.check_auth_and_send_logs()
         monitor_processes()
+
