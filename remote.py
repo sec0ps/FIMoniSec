@@ -92,7 +92,7 @@ def authenticate_with_server():
 
     token_file = "auth_token.json"
 
-    print("[DEBUG] Loading authentication data...")
+#    print("[DEBUG] Loading authentication data...")
 
     # Load stored authentication data
     try:
@@ -105,9 +105,9 @@ def authenticate_with_server():
             if not server_ip or not psk or not client_name:
                 raise ValueError("Missing Server IP, PSK, or Client Name in auth_token.json.")
 
-        print(f"[DEBUG] Server IP: {server_ip}")
-        print(f"[DEBUG] Client Name: {client_name}")
-        print(f"[DEBUG] PSK Loaded: {psk[:6]}********")  # Masked for security
+#        print(f"[DEBUG] Server IP: {server_ip}")
+#        print(f"[DEBUG] Client Name: {client_name}")
+#        print(f"[DEBUG] PSK Loaded: {psk[:6]}********")  # Masked for security
 
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
         print(f"[ERROR] Failed to load authentication data: {e}")
@@ -117,14 +117,14 @@ def authenticate_with_server():
     nonce = os.urandom(16).hex()
     client_hmac = hmac.new(psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
 
-    print("[DEBUG] Connecting to server...")
+#    print("[DEBUG] Connecting to server...")
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)  # Prevent infinite hangs
         sock.connect((server_ip, 5555))
 
-        print("[DEBUG] Sending authentication request...")
+#        print("[DEBUG] Sending authentication request...")
         sock.sendall(f"{client_name}:{nonce}:{client_hmac}".encode("utf-8"))
 
         response = sock.recv(1024).decode("utf-8")
@@ -238,7 +238,7 @@ def send_logs_to_server():
                     # ✅ Ensure logs are structured properly before sending
                     log_data = json.dumps({"logs": logs_to_send})  # ✅ Fix potential assignment issue
                     sock.sendall(log_data.encode("utf-8"))
-                    logging.info(f"Sent {len(logs_to_send)} logs to server.")
+#                    logging.info(f"Sent {len(logs_to_send)} logs to server.")
                 except (socket.error, BrokenPipeError) as send_error:
                     logging.error(f"Failed to send logs: {send_error}")
                     sock.close()
