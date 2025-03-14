@@ -89,14 +89,18 @@ def send_to_siem(log_entry):
 
 def forward_log_to_siem(log_entry, client_name):
     """Processes logs received from clients and forwards them to the SIEM."""
+    if not isinstance(log_entry, dict):
+        logging.error("[ERROR] Received malformed log entry; expected dictionary.")
+        return
+
     formatted_log = {
         "timestamp": log_entry.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
         "event_type": log_entry.get("event_type", "UNKNOWN"),
-        "client_name": log_entry.get("client_name", "UNKNOWN"),
+        "client_name": client_name,  # ✅ Ensure correct client_name is forwarded
         "file_path": log_entry.get("file_path", "N/A"),
         "metadata": {
-            "previous": log_entry.get("previous_metadata", {}),
-            "new": log_entry.get("new_metadata", {}),
+            "previous": log_entry.get("previous_metadata", {}) if isinstance(log_entry.get("previous_metadata", {}), dict) else {},
+            "new": log_entry.get("new_metadata", {}) if isinstance(log_entry.get("new_metadata", {}), dict) else {},
         },
         "hashes": {
             "previous": log_entry.get("previous_hash", "N/A"),
@@ -105,5 +109,4 @@ def forward_log_to_siem(log_entry, client_name):
         "changes": log_entry.get("changes", "N/A"),
     }
 
-    # Forward to SIEM
     send_to_siem(formatted_log)
