@@ -158,9 +158,10 @@ def authenticate_client(client_socket):
         return None
 
 def handle_client(client_socket, client_address):
+    """Handles authentication and logs reception from an authenticated client."""
     logging.info(f"New connection from {client_address}")
 
-    authenticated_client = authenticate_client(client_socket)  # ✅ This gets the client name
+    authenticated_client = authenticate_client(client_socket)
     if not authenticated_client:
         logging.warning(f"Authentication failed for client {client_address}")
         client_socket.close()
@@ -176,16 +177,19 @@ def handle_client(client_socket, client_address):
 
             try:
                 log_data = json.loads(data)
-                if isinstance(log_data, dict) and "logs" in log_data:
-                    logs = log_data["logs"]
-                    for log_entry in logs:
-                        append_log(log_entry)  # ✅ Store logs locally
-                        server_siem.forward_log_to_siem(log_entry, authenticated_client)  # ✅ Forward with correct name
 
-                    logging.info(f"Received {len(logs)} logs from {authenticated_client}.")
-                else:
-                    logging.warning(f"Malformed log data received: {data}")
+                # ✅ Ensure `log_data["logs"]` is always a list
+                logs = log_data.get("logs", [])
 
+                if isinstance(logs, dict):
+                    logs = [logs]  # ✅ Convert single dict into a list
+
+                for log_entry in logs:
+                    log_entry["client_name"] = authenticated_client  # ✅ Attach client_name
+                    append_log(log_entry)  # ✅ Write logs to monisec-endpoint.log
+                    server_siem.forward_log_to_siem(log_entry, authenticated_client)  # ✅ Send logs to SIEM
+
+                logging.info(f"Received {len(logs)} logs from {authenticated_client}.")
             except json.JSONDecodeError:
                 logging.warning(f"Received malformed log data from {authenticated_client}: {data}")
 
@@ -196,10 +200,10 @@ def handle_client(client_socket, client_address):
         client_socket.close()
 
 def append_log(log_entry):
-    """Appends logs from clients to siem-forwarding.log."""
+    """Appends logs from clients to monisec-endpoint.log."""
     try:
         with open(ENDPOINT_LOG_FILE, "a") as log_file:
-            log_file.write(json.dumps(log_entry) + "\n")
+            log_file.write(json.dumps(log_entry) + "\n")  # ✅ Use newline separator
     except Exception as e:
         logging.error(f"[ERROR] Failed to write client log: {e}")
 
