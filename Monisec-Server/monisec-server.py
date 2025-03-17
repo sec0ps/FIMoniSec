@@ -138,18 +138,25 @@ def start_server():
         server.close()
 
 def initialize_log_storage():
-    """Ensures the logs directory and endpoint-integrity-logs.json exist."""
+    """Ensures necessary log directories and files exist with proper permissions."""
     try:
         # Ensure logs directory exists
-        if not os.path.exists(LOG_DIR):
-            os.makedirs(LOG_DIR)
-            logging.info(f"Created logs directory: {LOG_DIR}")
+        os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
 
-        # Ensure endpoint-integrity-logs.json exists
+        # Ensure main MoniSec Server log file exists
         if not os.path.exists(LOG_FILE):
             with open(LOG_FILE, "w") as f:
                 f.write("")  # Create an empty file
-            logging.info(f"Created log file: {LOG_FILE}")
+            os.chmod(LOG_FILE, 0o600)  # Secure permissions
+
+        # Ensure SIEM log file exists
+        SIEM_LOG_FILE = os.path.join(LOG_DIR, "siem-forwarding.log")
+        if not os.path.exists(SIEM_LOG_FILE):
+            with open(SIEM_LOG_FILE, "w") as f:
+                f.write("")  # Create empty file
+            os.chmod(SIEM_LOG_FILE, 0o600)  # Secure permissions
+
+        logging.info(f"Log storage initialized. Logs directory: {LOG_DIR}")
 
     except Exception as e:
         logging.error(f"Failed to initialize log storage: {e}")
