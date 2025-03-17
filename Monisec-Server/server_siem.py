@@ -7,6 +7,24 @@ import logging
 CONFIG_FILE = "monisec-server.config"
 SIEM_LOG_FILE = "./logs/siem-forwarding.log"
 
+
+def ensure_siem_log():
+    """Ensure the SIEM log directory and log file exist with correct permissions."""
+    log_dir = os.path.dirname(SIEM_LOG_FILE)
+
+    # Create logs directory if it doesn't exist
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir, mode=0o700)  # ✅ Set directory permissions to 700
+
+    # Create log file if it doesn't exist
+    if not os.path.exists(SIEM_LOG_FILE):
+        with open(SIEM_LOG_FILE, "w") as f:
+            f.write("")  # ✅ Create empty log file
+        os.chmod(SIEM_LOG_FILE, 0o600)  # ✅ Set file permissions to 600
+
+# Ensure SIEM log file exists before setting up logging
+ensure_siem_log()
+
 # Ensure separate logging for SIEM logs
 siem_log_handler = logging.FileHandler(SIEM_LOG_FILE)
 siem_log_handler.setLevel(logging.INFO)
