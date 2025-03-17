@@ -79,17 +79,6 @@ PSK_STORE_FILE = config["PSK_STORE_FILE"]
 MAX_CLIENTS = config["MAX_CLIENTS"]
 SIEM_CONFIG = config.get("siem_settings", {})
 
-# Ensure logs directory exists
-os.makedirs(LOG_DIR, exist_ok=True)
-
-# Set log file permissions
-try:
-    with open(LOG_FILE, 'a') as f:
-        pass
-    os.chmod(LOG_FILE, 0o600)
-except Exception as e:
-    print(f"Failed to set log file permissions: {e}")
-
 # Ensure separate logging for MoniSec Server logs
 server_log_handler = logging.FileHandler(LOG_FILE)
 server_log_handler.setLevel(logging.DEBUG)
@@ -101,9 +90,9 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(server_log_handler)
 
 # Ensure PSK store exists
-if not os.path.exists(PSK_STORE_FILE):
-    with open(PSK_STORE_FILE, "w") as f:
-        json.dump({}, f)
+#if not os.path.exists(PSK_STORE_FILE):
+#    with open(PSK_STORE_FILE, "w") as f:
+#        json.dump({}, f)
 
 def handle_shutdown(signum, frame):
     """Gracefully shuts down the MoniSec Server on signal (CTRL+C)."""
