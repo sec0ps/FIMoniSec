@@ -156,9 +156,9 @@ def print_help():
 Usage: python monisec-server.py [command] [client_name]
 
 Commands:
-  add-client <client_name>     Add a new client and generate a unique PSK.
-  remove-client <client_name>  Remove an existing client.
-  list-clients                 List all registered clients.
+  add-agent <agent_name>     Add a new client and generate a unique PSK.
+  remove-agent <agent_name>  Remove an existing client.
+  list-agents                 List all registered clients.
   configure-siem               Configure SIEM settings for log forwarding.
   -h, --help                   Show this help message.
 
@@ -177,11 +177,11 @@ if __name__ == "__main__":
             clients.list_clients()
             sys.exit(0)  # Exit before starting the server
 
-        elif action == "add-client":
+        elif action == "add-agent":
             clients.add_client()
             sys.exit(0)  # Exit before starting the server
 
-        elif action == "remove-client":
+        elif action == "remove-agent":
             if len(sys.argv) < 3:
                 print("[ERROR] Please specify an agent name to remove.")
                 sys.exit(1)
