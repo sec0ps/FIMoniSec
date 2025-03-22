@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import logging
 import server_siem
+import server_crypt
 
 PSK_STORE_FILE = "psk_store.json"
 ENDPOINT_LOG_FILE = "./logs/siem-forwarding.log"  # ✅ Change to correct log file
@@ -153,57 +154,71 @@ def authenticate_client(client_socket):
             return None
 
     except Exception as e:
-        logging.error(f"[ERROR] Authentication error: {e}")
+        logging.error(f"[ERROR] Unexpected authentication error: {e}")
         client_socket.sendall(b"AUTH_FAILED")
         return None
 
 def handle_client(client_socket, client_address):
-    """Handles authentication and logs reception from an authenticated client."""
+    """Handles encrypted log reception from authenticated client."""
     logging.info(f"New connection from {client_address}")
 
-    authenticated_client = authenticate_client(client_socket)
-    if not authenticated_client:
-        logging.warning(f"Authentication failed for client {client_address}")
-        client_socket.close()
-        return
-
-    logging.info(f"Client {authenticated_client} authenticated successfully. Awaiting logs...")
-
     try:
+        # Step 1: Receive client_name as JSON (unencrypted)
+        raw = client_socket.recv(1024)
+        try:
+            auth_payload = json.loads(raw.decode("utf-8"))
+            client_name = auth_payload.get("client_name")
+            if not client_name:
+                raise ValueError("Missing client_name")
+        except Exception:
+            logging.warning(f"[AUTH] Invalid handshake from {client_address}. Dropping connection.")
+            client_socket.close()
+            return
+
+        # Step 2: Load PSK for the client
+        try:
+            psk = server_crypt.load_psk(client_name)
+        except ValueError:
+            logging.warning(f"[AUTH] Unknown client '{client_name}' from {client_address}. Dropping connection.")
+            client_socket.close()
+            return
+
+        logging.info(f"[AUTH] Client '{client_name}' authenticated. Ready to receive logs.")
+
+        # Step 3: Receive and decrypt logs
         while True:
-            data = client_socket.recv(4096).decode("utf-8")
-            if not data:
-                break  # Disconnect if client stops sending
+            encrypted_data = client_socket.recv(4096)
+            if not encrypted_data:
+                break  # Client disconnected
 
             try:
-                log_data = json.loads(data)
-
-                # ✅ Ensure `log_data["logs"]` is always a list
+                log_data = server_crypt.decrypt_data_with_psk(psk, encrypted_data)
                 logs = log_data.get("logs", [])
 
                 if isinstance(logs, dict):
-                    logs = [logs]  # ✅ Convert single dict into a list
+                    logs = [logs]
 
                 for log_entry in logs:
-                    log_entry["client_name"] = authenticated_client  # ✅ Attach client_name
-                    append_log(log_entry)  # ✅ Write logs to monisec-endpoint.log
-                    server_siem.forward_log_to_siem(log_entry, authenticated_client)  # ✅ Send logs to SIEM
+                    log_entry["client_name"] = client_name
+                    append_log(log_entry)
+                    server_siem.forward_log_to_siem(log_entry, client_name)
 
-                logging.info(f"Received {len(logs)} logs from {authenticated_client}.")
-            except json.JSONDecodeError:
-                logging.warning(f"Received malformed log data from {authenticated_client}: {data}")
+                logging.info(f"[RECV] Received {len(logs)} logs from {client_name}")
+                client_socket.sendall(b"ACK")
+            except Exception as e:
+                logging.warning(f"[ERROR] Failed to process data from {client_name}: {e}")
+                break
 
     except Exception as e:
-        logging.error(f"Error with client {authenticated_client}: {e}")
+        logging.error(f"[ERROR] Unexpected exception from {client_address}: {e}")
     finally:
-        logging.info(f"Client {authenticated_client} disconnected.")
+        logging.info(f"[DISCONNECT] Client {client_address} disconnected.")
         client_socket.close()
 
 def append_log(log_entry):
-    """Appends logs from clients to monisec-endpoint.log."""
     try:
         with open(ENDPOINT_LOG_FILE, "a") as log_file:
-            log_file.write(json.dumps(log_entry) + "\n")  # ✅ Use newline separator
+            log_file.write(json.dumps(log_entry) + "\n")
     except Exception as e:
         logging.error(f"[ERROR] Failed to write client log: {e}")
 
