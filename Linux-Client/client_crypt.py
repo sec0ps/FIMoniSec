@@ -12,8 +12,13 @@ def load_psk():
 
     with open(AUTH_FILE, "r") as f:
         data = json.load(f)
-        psk = bytes.fromhex(data["psk"])
-        logging.info(f"[INFO] Loaded PSK from auth_token.json: {data['psk']}")  # ✅ Debugging log
+        raw_psk = data["psk"]
+
+        if len(raw_psk) != 64:
+            raise ValueError("[ERROR] PSK format invalid. Expected 64-character hex string.")
+
+        psk = bytes.fromhex(raw_psk)
+        logging.info(f"[INFO] Loaded PSK from auth_token.json: {raw_psk}")
         return psk
 
 def encrypt_data(plaintext):
@@ -27,6 +32,9 @@ def encrypt_data(plaintext):
 
 def decrypt_data(encrypted_data):
     """Decrypt received data."""
+    if len(encrypted_data) < 13:
+        raise ValueError("[ERROR] Encrypted data is too short to contain nonce and ciphertext.")
+
     psk = load_psk()
     aesgcm = AESGCM(psk)
 
@@ -34,7 +42,8 @@ def decrypt_data(encrypted_data):
     ciphertext = encrypted_data[12:]
 
     try:
-        decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")  # ✅ Decode to string
-        return json.loads(decrypted_text)  # ✅ Convert back to JSON
+        decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
+        return json.loads(decrypted_text)
     except Exception as e:
-        raise ValueError(f"[ERROR] Decryption failed: {e}")
+        logging.error(f"[ERROR] AES-GCM decryption failed: {e}")
+        return None
