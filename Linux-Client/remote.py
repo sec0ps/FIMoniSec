@@ -7,6 +7,7 @@ import os
 import hmac
 import hashlib
 import time
+from client_crypt import encrypt_data
 from monisec_client import start_process, stop_process, restart_process, is_process_running, PROCESSES
 
 CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
@@ -86,58 +87,38 @@ def import_psk():
     os.chmod("auth_token.json", 0o600)
 
     print("[INFO] PSK imported and stored securely.")
-
 def authenticate_with_server():
     """Authenticates with the MoniSec server using stored IP and PSK from auth_token.json."""
 
     token_file = "auth_token.json"
-
-#    print("[DEBUG] Loading authentication data...")
 
     # Load stored authentication data
     try:
         with open(token_file, "r") as f:
             token_data = json.load(f)
             server_ip = token_data.get("server_ip")
-            psk = token_data.get("psk")
             client_name = token_data.get("client_name")
 
-            if not server_ip or not psk or not client_name:
-                raise ValueError("Missing Server IP, PSK, or Client Name in auth_token.json.")
-
-#        print(f"[DEBUG] Server IP: {server_ip}")
-#        print(f"[DEBUG] Client Name: {client_name}")
-#        print(f"[DEBUG] PSK Loaded: {psk[:6]}********")  # Masked for security
+            if not server_ip or not client_name:
+                raise ValueError("Missing Server IP or Client Name in auth_token.json.")
 
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
         print(f"[ERROR] Failed to load authentication data: {e}")
         return False
 
-    # Generate authentication HMAC
-    nonce = os.urandom(16).hex()
-    client_hmac = hmac.new(psk.encode(), nonce.encode(), hashlib.sha256).hexdigest()
-
-#    print("[DEBUG] Connecting to server...")
-
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)  # Prevent infinite hangs
+        sock.settimeout(5)
         sock.connect((server_ip, 5555))
 
-#        print("[DEBUG] Sending authentication request...")
-        sock.sendall(f"{client_name}:{nonce}:{client_hmac}".encode("utf-8"))
+        # ✅ Send the initial JSON handshake with client_name
+        handshake = json.dumps({ "client_name": client_name })
+        sock.sendall(handshake.encode("utf-8"))
 
-        response = sock.recv(1024).decode("utf-8")
+        logging.info("Handshake sent to server.")
+        sock.close()
+        return True
 
-        if response == "AUTH_SUCCESS":
-            print("[SUCCESS] Authentication successful.")
-            return True
-        elif response == "AUTH_FAILED":
-            print("[ERROR] Authentication failed.")
-            return False
-        else:
-            print(f"[ERROR] Unexpected server response: {response}")
-            return False
     except Exception as e:
         print(f"[ERROR] Connection failed: {e}")
         return False
@@ -175,33 +156,23 @@ def connect_to_server(server_ip, client_name, psk):
         return None
 
 def send_logs_to_server():
-    """Sends only newly appended logs from MoniSec client to MoniSec server in real-time."""
     try:
         with open(AUTH_TOKEN_FILE, "r") as f:
             token_data = json.load(f)
-            server_ip = token_data.get("server_ip")
-            client_name = token_data.get("client_name")
-            psk = token_data.get("psk")
+            server_ip = token_data["server_ip"]
+            client_name = token_data["client_name"]
+            psk = token_data["psk"]  # Not used directly; client_crypt loads it
 
-            if not server_ip or not client_name or not psk:
-                logging.error("Missing Server IP, Client Name, or PSK in auth_token.json.")
-                return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((server_ip, 5555))
 
-        logging.info(f"Connecting to MoniSec Server at {server_ip}...")
-        sock = connect_to_server(server_ip, client_name, psk)  # ✅ Use reconnectable socket function
-        if not sock:
-            return  # Exit if unable to establish connection
+        # Step 1: Send cleartext client_name as JSON
+        handshake = json.dumps({"client_name": client_name})
+        sock.sendall(handshake.encode("utf-8"))
 
         file_positions = {}
-
-        # Move file pointers to end of file to avoid resending old logs
         for log_file in LOG_FILES:
-            if os.path.exists(log_file):
-                with open(log_file, "r") as f:
-                    f.seek(0, os.SEEK_END)
-                    file_positions[log_file] = f.tell()
-            else:
-                file_positions[log_file] = 0  # ✅ Ensure every file has a tracked position
+            file_positions[log_file] = os.path.getsize(log_file) if os.path.exists(log_file) else 0
 
         while True:
             logs_to_send = []
@@ -209,67 +180,46 @@ def send_logs_to_server():
             for log_file in LOG_FILES:
                 if os.path.exists(log_file):
                     with open(log_file, "r") as f:
-                        f.seek(file_positions[log_file])  # Move to last read position
+                        f.seek(file_positions[log_file])
                         new_logs = f.read().strip()
+                        file_positions[log_file] = f.tell()
 
-                        if not new_logs:
-                            continue  # Skip empty logs
-
-                        file_positions[log_file] = f.tell()  # ✅ Update file position
-
-                    try:
-                        # ✅ Extract JSON blocks correctly
-                        log_entries = extract_valid_json_objects(new_logs)
-
-                        # ✅ Attach client_name to every log entry
-                        for log in log_entries:
-                            if isinstance(log, dict):  # ✅ Ensure it's a dict
-                                log["client_name"] = client_name
-                                logs_to_send.append(log)
-                            else:
-                                logging.warning(f"Skipping malformed log entry: {log}")
-
-                    except json.JSONDecodeError as e:
-                        logging.warning(f"Skipping malformed log entry in {log_file}: {e}")
-                        continue
+                    if new_logs:
+                        entries = extract_valid_json_objects(new_logs)
+                        for entry in entries:
+                            if isinstance(entry, dict):
+                                entry["client_name"] = client_name
+                                logs_to_send.append(entry)
 
             if logs_to_send:
                 try:
-                    # ✅ Ensure logs are structured properly before sending
-                    log_data = json.dumps({"logs": logs_to_send})  # ✅ Fix potential assignment issue
-                    sock.sendall(log_data.encode("utf-8"))
-#                    logging.info(f"Sent {len(logs_to_send)} logs to server.")
-                except (socket.error, BrokenPipeError) as send_error:
-                    logging.error(f"Failed to send logs: {send_error}")
-                    sock.close()
-                    sock = connect_to_server(server_ip, client_name, psk)
-                    if not sock:
-                        logging.error("Reconnection failed. Retrying in 5 seconds...")
-                        time.sleep(5)
-                        continue
+                    message = json.dumps({"logs": logs_to_send})
+                    encrypted = encrypt_data(message)
+                    sock.sendall(encrypted)
+                    ack = sock.recv(1024)
+                    if ack != b"ACK":
+                        logging.warning("No ACK received from server.")
+                except Exception as e:
+                    logging.error(f"[SEND ERROR] {e}")
+                    break
 
-            time.sleep(2)  # Check for new logs every 2 seconds
+            time.sleep(2)
 
     except Exception as e:
-        logging.error(f"Connection to server failed: {e}")
+        logging.error(f"[CLIENT ERROR] {e}")
     finally:
-        logging.info("Closing log socket connection.")
-        if sock:
-            sock.close()
+        sock.close()
 
 def extract_valid_json_objects(buffer):
-    """Extracts valid JSON blocks from a buffer string."""
     logs = []
-    buffer = buffer.strip()  # ✅ Remove unnecessary whitespace
+    buffer = buffer.strip()
     while buffer:
         try:
-            obj, index = json.JSONDecoder().raw_decode(buffer)  # Decode first valid JSON object
-            if isinstance(obj, dict):  # ✅ Ensure valid JSON object
-                logs.append(obj)
-            buffer = buffer[index:].strip()  # Remove parsed JSON from buffer
+            obj, idx = json.JSONDecoder().raw_decode(buffer)
+            logs.append(obj)
+            buffer = buffer[idx:].strip()
         except json.JSONDecodeError:
-            break  # Stop if there's no full JSON object remaining
-
+            break
     return logs
 
 def check_auth_and_send_logs():
