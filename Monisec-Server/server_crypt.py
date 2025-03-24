@@ -41,18 +41,12 @@ def decrypt_data(client_name, encrypted_data):
         raise ValueError(f"[ERROR] Decryption failed: {e}")
 
 def decrypt_data_with_psk(psk, encrypted_data):
-    """Decrypts incoming encrypted logs using the provided PSK."""
-    if len(encrypted_data) < 13:
-        raise ValueError("[ERROR] Encrypted payload too short to contain nonce and ciphertext.")
-
     aesgcm = AESGCM(psk)
-
-    nonce = encrypted_data[:12]
-    ciphertext = encrypted_data[12:]
-
     try:
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
         decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
+        print(f"[DEBUG] Raw decrypted log: {decrypted_text}")
         return json.loads(decrypted_text)
     except Exception as e:
-        logging.warning(f"[SECURITY] Possible tampering or invalid log encryption. Reason: {e}")
         raise ValueError(f"[ERROR] Decryption failed: {e}")
