@@ -75,11 +75,14 @@ def restart_process(name):
     start_process(name)
 
 def is_process_running(name):
-    """Check if a process is running by matching a substring in the command line."""
-    for proc in psutil.process_iter(attrs=['pid', 'cmdline']):
+    """Check if a specific process is running by comparing executable name."""
+    for proc in psutil.process_iter(attrs=['pid', 'name', 'cmdline']):
         try:
+            exe_name = proc.info['name']
             cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
-            if name in cmdline:
+
+            # Only match exact script calls, avoid false positives like 'kate'
+            if exe_name == "python3" and f"{name}.py" in cmdline:
                 return proc.info['pid']
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -99,10 +102,13 @@ def monitor_processes():
 # Handle graceful shutdown on keyboard interrupt
 def handle_exit(signum, frame):
     logging.info("Keyboard interrupt received. Stopping MoniSec client and all related processes...")
+
+    # Prevent double SIGINT behavior
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     stop_process("fim_client")
     stop_process("pim")
 
-    # Ensure processes are fully stopped before exiting
     time.sleep(2)
     logging.info("MoniSec client shutdown complete.")
     sys.exit(0)
