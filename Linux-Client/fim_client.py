@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 CONFIG_FILE = os.path.abspath("fim.config")
 LOG_DIR = os.path.abspath("./logs")
 LOG_FILE = os.path.join(LOG_DIR, "file_monitor.json")
-PID_FILE = os.path.abspath("fim.pid")
+PID_FILE = os.path.join(OUTPUT_DIR, "fim.pid")
 OUTPUT_DIR = os.path.abspath("./output")
 HASH_FILE = os.path.join(OUTPUT_DIR, "file_hashes.txt")
 INTEGRITY_STATE_FILE = os.path.join(OUTPUT_DIR, "integrity_state.json")
