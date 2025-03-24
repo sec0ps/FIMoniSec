@@ -6,6 +6,8 @@ import os
 import hmac
 import hashlib
 import json
+import daemon
+import daemon.pidfile
 import clients
 import signal
 import server_siem
@@ -78,36 +80,48 @@ LOG_FILE = os.path.join(LOG_DIR, config["LOG_FILE"])
 PSK_STORE_FILE = config["PSK_STORE_FILE"]
 MAX_CLIENTS = config["MAX_CLIENTS"]
 SIEM_CONFIG = config.get("siem_settings", {})
-
-# Ensure separate logging for MoniSec Server logs
-server_log_handler = logging.FileHandler(LOG_FILE)
-server_log_handler.setLevel(logging.DEBUG)
-server_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-
-# Get the root logger and add the handler
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-logger.addHandler(server_log_handler)
-
-# Ensure PSK store exists
-#if not os.path.exists(PSK_STORE_FILE):
-#    with open(PSK_STORE_FILE, "w") as f:
-#        json.dump({}, f)
+PID_FILE = os.path.join(LOG_DIR, "monisec-server.pid")
 
 def handle_shutdown(signum, frame):
-    """Gracefully shuts down the MoniSec Server on signal (CTRL+C)."""
     logging.info("[INFO] Shutting down MoniSec Server...")
-    shutdown_event.set()  # Signal all threads to stop
+    shutdown_event.set()
 
     if server_socket:
-        server_socket.close()  # Close server socket to free the port
+        server_socket.close()
+
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+            logging.info(f"[INFO] Removed PID file: {PID_FILE}")
+    except Exception as e:
+        logging.warning(f"[WARNING] Failed to remove PID file: {e}")
 
     logging.info("[INFO] MoniSec Server stopped.")
-    exit(0)
+    sys.exit(0)
 
 # Register SIGINT (CTRL+C) and SIGTERM (kill command) for graceful shutdown
 signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
+
+def run_server():
+    siem_config = server_siem.load_siem_config()
+    if siem_config:
+        logging.info("[INFO] SIEM integration is enabled.")
+
+    initialize_log_storage()
+
+    # ✅ Setup logging here AFTER daemon starts
+    server_log_handler = logging.FileHandler(LOG_FILE)
+    server_log_handler.setLevel(logging.DEBUG)
+    server_log_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []  # Clear existing
+    logger.addHandler(server_log_handler)
+
+    logging.info("Starting MoniSec Server...")
+    start_server()
 
 def start_server():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -160,6 +174,8 @@ Commands:
   remove-agent <agent_name>  Remove an existing client.
   list-agents                 List all registered clients.
   configure-siem               Configure SIEM settings for log forwarding.
+  -d                         Launch the MoniSec Server as a daemon.
+  stop                       Stop the running MoniSec Server daemon.
   -h, --help                   Show this help message.
 
 If no command is provided, the server will start normally.
@@ -192,6 +208,41 @@ if __name__ == "__main__":
         elif action == "configure-siem":  # ✅ New SIEM configuration option
             server_siem.configure_siem()
             sys.exit(0)  # Exit after configuring SIEM
+        elif action == "-d":
+            print("[INFO] Daemonizing MoniSec Server...")
+
+            os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+
+            # Just redirect stdout/stderr to the main log file
+            with open(LOG_FILE, 'a+') as log_stream:
+                with daemon.DaemonContext(
+                    pidfile=daemon.pidfile.TimeoutPIDLockFile(PID_FILE),
+                    stdout=log_stream,
+                    stderr=log_stream,
+                    working_directory=os.path.dirname(os.path.abspath(__file__)),
+                    umask=0o022
+                ):
+                    run_server()
+            sys.exit(0)
+        elif action == "stop":
+            if not os.path.exists(PID_FILE):
+                print(f"[ERROR] PID file not found: {PID_FILE}")
+                sys.exit(1)
+
+            try:
+                with open(PID_FILE, "r") as f:
+                    pid = int(f.read().strip())
+                print(f"[INFO] Stopping MoniSec Server (PID: {pid})...")
+                os.kill(pid, signal.SIGTERM)
+                print("[INFO] SIGTERM signal sent.")
+            except ProcessLookupError:
+                print("[WARNING] Process not found. Removing stale PID file.")
+                os.remove(PID_FILE)
+            except Exception as e:
+                print(f"[ERROR] Failed to stop daemon: {e}")
+                sys.exit(1)
+
+            sys.exit(0)
 
     # ✅ Ensure SIEM settings are loaded
     siem_config = server_siem.load_siem_config()
