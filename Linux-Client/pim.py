@@ -17,6 +17,7 @@ PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
 INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
 PID_FILE = os.path.abspath("pim.pid")
 FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
+KNOWN_PORTS_FILE = os.path.join(OUTPUT_DIR, "known_ports.json")
 
 # Preserve environment variables for sudo and command execution
 daemon_env = os.environ.copy()
@@ -189,8 +190,96 @@ def get_listening_processes():
 
     return listening_processes
 
+def load_known_ports():
+    """Load the known process-port mapping."""
+    if not os.path.exists(KNOWN_PORTS_FILE):
+        return {}
+    with open(KNOWN_PORTS_FILE, "r") as f:
+        return json.load(f)
+
+def save_known_ports(mapping):
+    """Save the process-port mapping to known_ports.json."""
+    with open(KNOWN_PORTS_FILE, "w") as f:
+        json.dump(mapping, f, indent=4)
+    os.chmod(KNOWN_PORTS_FILE, 0o600)
+
+def build_known_ports_baseline(processes):
+    known_ports = {}
+
+    for proc in processes.values():
+        proc_name = proc.get("process_name", "UNKNOWN")
+        if proc_name == "UNKNOWN":
+            continue
+
+        if proc_name not in known_ports:
+            known_ports[proc_name] = {
+                "ports": [],
+                "metadata": proc  # store full metadata
+            }
+
+        port = proc.get("port")
+        if port not in known_ports[proc_name]["ports"]:
+            known_ports[proc_name]["ports"].append(port)
+
+    with open(KNOWN_PORTS_FILE, "w") as f:
+        json.dump(known_ports, f, indent=4)
+    os.chmod(KNOWN_PORTS_FILE, 0o600)
+
+def check_for_unusual_port_use(process_info):
+    """Check if a process is listening on a non-standard port or has unexpected metadata."""
+    if not os.path.exists(KNOWN_PORTS_FILE):
+        return
+
+    try:
+        with open(KNOWN_PORTS_FILE, "r") as f:
+            known_ports = json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Could not read known_ports.json: {e}")
+        return
+
+    from fim_client import log_event
+
+    proc_name = process_info.get("process_name")
+    proc_port = str(process_info.get("port"))
+
+    if proc_name not in known_ports:
+        return
+
+    expected_ports = list(map(str, known_ports[proc_name].get("ports", [])))
+    baseline_metadata = known_ports[proc_name].get("metadata", {})
+
+    if proc_port not in expected_ports:
+        print(f"[ALERT] {proc_name} listening on unexpected port {proc_port}. Expected: {expected_ports}")
+        log_event(
+            event_type="UNUSUAL_PORT_USE",
+            file_path=process_info.get("exe_path", "UNKNOWN"),
+            previous_metadata=baseline_metadata,
+            new_metadata=process_info,
+            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
+            new_hash=process_info.get("hash", "UNKNOWN")
+        )
+
+    # Check for critical metadata mismatches
+    mismatches = {}
+    for field in ["exe_path", "cmdline", "hash", "user"]:
+        expected = baseline_metadata.get(field)
+        actual = process_info.get(field)
+        if expected and actual and expected != actual:
+            mismatches[field] = {"expected": expected, "actual": actual}
+
+    if mismatches:
+        print(f"[ALERT] Metadata mismatch detected for {proc_name}: {mismatches}")
+        log_event(
+            event_type="PROCESS_METADATA_MISMATCH",
+            file_path=process_info.get("exe_path", "UNKNOWN"),
+            previous_metadata=baseline_metadata,
+            new_metadata=process_info,
+            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
+            new_hash=process_info.get("hash", "UNKNOWN")
+        )
+
 def monitor_listening_processes(interval=2):
-    """Continuously monitors for new and terminated listening processes."""
+    """Continuously monitors for new and terminated listening processes and detects non-standard port usage."""
     known_processes = get_listening_processes()
     terminated_pids = set()
 
@@ -204,7 +293,6 @@ def monitor_listening_processes(interval=2):
 
             # Handle new processes
             for pid, info in new_processes.items():
-                print(f"[REAL-TIME] New listening process detected: {info}")
                 log_event(
                     event_type="NEW_LISTENING_PROCESS",
                     file_path=info["exe_path"],
@@ -213,7 +301,10 @@ def monitor_listening_processes(interval=2):
                     previous_hash=None,
                     new_hash=info.get("hash", "UNKNOWN")
                 )
-                update_process_tracking(pid, info["hash"], info)
+                update_process_tracking(info["exe_path"], info["hash"], info)
+
+                # Check for unusual port or metadata
+                check_for_unusual_port_use(info)
 
             # Handle terminated processes
             for pid, info in terminated_processes.items():
@@ -221,8 +312,6 @@ def monitor_listening_processes(interval=2):
                     continue
 
                 stored_info = load_process_metadata().get(str(pid), None)
-
-                print(f"[REAL-TIME] Listening process terminated: {info}")
                 log_event(
                     event_type="PROCESS_TERMINATED",
                     file_path=info["exe_path"] if stored_info else "UNKNOWN",
@@ -231,8 +320,6 @@ def monitor_listening_processes(interval=2):
                     previous_hash=stored_info["hash"] if stored_info else "UNKNOWN",
                     new_hash=None
                 )
-
-                # Remove terminated process from tracking
                 remove_process_tracking(str(pid))
                 terminated_pids.add(pid)
 
@@ -241,7 +328,7 @@ def monitor_listening_processes(interval=2):
 
         except Exception as e:
             print(f"[ERROR] Exception in real-time monitoring loop: {e}")
-            continue  # ✅ Prevents script termination
+            continue
 
 def rescan_listening_processes(interval=120):
     """Periodically scans listening processes and ensures accurate tracking."""
@@ -376,39 +463,34 @@ def run_monitor():
 
         ensure_output_dir()
 
-        # ✅ Prevent stdout redirection in foreground mode
         if "--daemon" in sys.argv:
             sys.stdout = open(LOG_FILE, "a", buffering=1)
             sys.stderr = sys.stdout
 
-        # Handle SIGINT (Ctrl+C) and SIGTERM for graceful shutdown
         signal.signal(signal.SIGINT, lambda signum, frame: sys.exit(0))
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
 
         print("[INFO] Logging all listening processes on startup...")
         initial_processes = get_listening_processes()
 
+        # ✅ Generate baseline if not present
+        if not os.path.exists(KNOWN_PORTS_FILE):
+            build_known_ports_baseline(initial_processes)
+
         for pid, info in initial_processes.items():
             update_process_tracking(info["exe_path"], info["hash"], info)
 
         print("[INFO] Initial process tracking complete.")
 
-        # Start periodic integrity check in a separate thread
         integrity_thread = threading.Thread(target=rescan_listening_processes, daemon=True)
         integrity_thread.start()
 
-        try:
-            # Start real-time monitoring in the main thread
-            monitor_listening_processes()
-        except KeyboardInterrupt:
-            print("\n[INFO] Keyboard interrupt received. Exiting gracefully...")
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)  # Cleanup PID file if it exists
-            sys.exit(0)  # Exit the script cleanly
+        monitor_listening_processes()  # ⬅ Main monitoring loop
 
     except Exception as e:
         print(f"[ERROR] PIM encountered an error: {e}")
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process Integrity Monitor (PIM)")
