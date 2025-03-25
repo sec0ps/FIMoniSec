@@ -18,8 +18,8 @@ from concurrent.futures import ThreadPoolExecutor
 CONFIG_FILE = os.path.abspath("fim.config")
 LOG_DIR = os.path.abspath("./logs")
 LOG_FILE = os.path.join(LOG_DIR, "file_monitor.json")
-PID_FILE = os.path.join(OUTPUT_DIR, "fim.pid")
 OUTPUT_DIR = os.path.abspath("./output")
+PID_FILE = os.path.join(OUTPUT_DIR, "fim.pid")
 HASH_FILE = os.path.join(OUTPUT_DIR, "file_hashes.txt")
 INTEGRITY_STATE_FILE = os.path.join(OUTPUT_DIR, "integrity_state.json")
 
@@ -416,16 +416,6 @@ class EventHandler(pyinotify.ProcessEvent):
 
             update_file_tracking(full_path, file_hash, metadata)  # ✅ Save metadata after modification
 
-#    def process_IN_ACCESS(self, event):
-#        """Log file access events."""
-#        full_path = event.pathname
-#        log_event(
-#            event_type="FILE_ACCESSED",
-#            file_path=full_path,
-#            previous_metadata=None,
-#            new_metadata=None
-#        )
-
 def monitor_changes(real_time_directories, exclusions):
     """Monitors file system changes using pyinotify."""
     global file_hashes, integrity_state
@@ -528,6 +518,10 @@ def run_monitor():
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
+    signal.signal(signal.SIGTERM, handle_shutdown)  # kill <pid>
+
     ensure_log_file()
     ensure_output_dir()
     config = load_config()
@@ -541,9 +535,9 @@ def run_monitor():
 
     if not scheduled_directories and not real_time_directories:
         print("[ERROR] No directories specified for monitoring. Exiting.")
-        exit(1)
+        handle_shutdown()
 
-    # 🔹 Start real-time monitoring **immediately**
+    # 🔹 Start real-time monitoring in a background thread
     if real_time_directories:
         rt_monitor = Thread(target=monitor_changes, args=(real_time_directories, exclusions), daemon=True)
         rt_monitor.start()
@@ -551,24 +545,67 @@ def run_monitor():
 
     # 🔹 Run the scheduled scan loop in the main thread
     if scheduled_directories:
-        while True:
-            generate_file_hashes(scheduled_directories, real_time_directories, exclusions)
-            print(f"[INFO] Scheduled scan completed. Sleeping for {scan_interval} seconds.")
-            time.sleep(scan_interval)
+        try:
+            while True:
+                generate_file_hashes(scheduled_directories, real_time_directories, exclusions)
+                print(f"[INFO] Scheduled scan completed. Sleeping for {scan_interval} seconds.")
+                time.sleep(scan_interval)
+        except KeyboardInterrupt:
+            handle_shutdown()
+
+def handle_shutdown(signum=None, frame=None):
+    """Cleanly handle shutdown signals."""
+    print("[INFO] Caught termination signal. Cleaning up...")
+
+    if os.path.exists(PID_FILE):
+        os.remove(PID_FILE)
+        print(f"[INFO] Removed PID file: {PID_FILE}")
+
+    sys.exit(0)
+
+def print_help():
+    print("""
+File Integrity Monitor (FIM) Client
+
+Usage:
+  python fim_client.py [option]
+
+Options:
+  help               Show this help message and exit
+  -d or daemon       Run FIM in background (daemon) mode
+  -s or stop         Stop FIM daemon process
+  -l or log-config   Configure SIEM logging (interactive)
+""")
 
 if __name__ == "__main__":
-    args = parse_arguments()
+    args = sys.argv[1:]  # Get command-line arguments
 
-    if args.log_config:
+    if not args:
+        print("[INFO] Running in foreground mode...")
+        run_monitor()
+        sys.exit(0)
+
+    arg = args[0].lower()
+
+    if arg in ("help", "-h", "--help"):
+        print_help()
+        sys.exit(0)
+
+    elif arg in ("-l", "log-config"):
         audit.configure_siem()
-        exit(0)  # Exit after configuring SIEM
+        sys.exit(0)
 
-    if args.stop:
+    elif arg in ("-s", "stop"):
         stop_daemon()
-    elif args.daemon:
+        sys.exit(0)
+
+    elif arg in ("-d", "daemon"):
         print("[INFO] Running in background mode...")
         with daemon.DaemonContext():
             run_monitor()
+        sys.exit(0)
+
     else:
-        print("[INFO] Running in foreground mode...")
-        run_monitor()
+        print(f"[ERROR] Unknown option: {arg}")
+        print_help()
+        sys.exit(1)
