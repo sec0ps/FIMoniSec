@@ -15,7 +15,7 @@ LOG_DIR = os.path.abspath("./logs")  # Change from absolute path
 LOG_FILE = os.path.join(LOG_DIR, "process_monitor.log")
 PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
 INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
-PID_FILE = os.path.abspath("pim.pid")
+PID_FILE = os.path.join(OUTPUT_DIR, "pim.pid")
 FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
 KNOWN_PORTS_FILE = os.path.join(OUTPUT_DIR, "known_ports.json")
 
