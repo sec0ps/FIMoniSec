@@ -7,6 +7,7 @@ import hashlib
 import signal
 import argparse
 import daemon
+import daemon.pidfile
 import threading
 import traceback
 
@@ -16,8 +17,9 @@ LOG_FILE = os.path.join(LOG_DIR, "process_monitor.log")
 PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
 INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
 PID_FILE = os.path.join(OUTPUT_DIR, "pim.pid")
-FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
+FILE_MONITOR_JSON = os.path.abspath(os.path.join("logs", "file_monitor.json"))
 KNOWN_PORTS_FILE = os.path.join(OUTPUT_DIR, "known_ports.json")
+KNOWN_LINEAGES_FILE = os.path.join(OUTPUT_DIR, "known_lineages.json")
 
 # Preserve environment variables for sudo and command execution
 daemon_env = os.environ.copy()
@@ -49,6 +51,17 @@ def ensure_file_monitor_json():
         os.chmod(FILE_MONITOR_JSON, 0o600)
 
 ensure_file_monitor_json()
+
+def start_daemon():
+    with daemon.DaemonContext(
+        working_directory='.',
+        umask=0o022,
+        pidfile=daemon.pidfile.TimeoutPIDLockFile(PID_FILE),
+        stdout=open(LOG_FILE, 'a+'),
+        stderr=open(LOG_FILE, 'a+'),
+        stdin=open(os.devnull, 'r'),
+    ):
+        run_monitor()
 
 def load_process_hashes():
     """Load stored process hashes from process_hashes.txt."""
@@ -117,12 +130,11 @@ def get_listening_processes():
     listening_processes = {}
 
     try:
-        # Use full path for `lsof` to avoid daemon path issues
         lsof_command = "sudo -n /usr/bin/lsof -i -P -n | /bin/grep LISTEN"
         output = subprocess.getoutput(lsof_command)
 
         if not output:
-            print("[ERROR] lsof returned no output. Check sudo permissions.", file=sys.stderr)
+            print("[ERROR] lsof returned no output. Check sudo permissions.")
 
         for line in output.splitlines():
             parts = line.split()
@@ -133,24 +145,17 @@ def get_listening_processes():
             exe_path = f"/proc/{pid}/exe"
 
             try:
-                # Read actual executable path
                 exe_real_path = subprocess.getoutput(f"sudo -n /usr/bin/readlink -f {exe_path}").strip()
-
                 if "Permission denied" in exe_real_path or not exe_real_path:
                     raise PermissionError("Could not read process executable path")
-
-                # Extract full command line to locate the script being executed
                 cmdline_raw = subprocess.getoutput(f"sudo -n /bin/cat /proc/{pid}/cmdline 2>/dev/null").strip()
                 cmdline = cmdline_raw.replace("\x00", " ")
-
-                # Generate process hash from the actual script or binary
                 process_hash = get_process_hash(exe_real_path, cmdline)
-
             except (PermissionError, FileNotFoundError, subprocess.CalledProcessError):
                 exe_real_path = "PERMISSION_DENIED"
                 process_hash = "UNKNOWN"
+                cmdline = ""
 
-            # Extract port safely
             try:
                 port = parts[-2].split(':')[-1]
                 if not port.isdigit():
@@ -161,20 +166,20 @@ def get_listening_processes():
                 port = "UNKNOWN"
 
             try:
-                # Capture additional process details
                 user = subprocess.getoutput(f"sudo -n /bin/ps -o user= -p {pid}").strip()
                 start_time = subprocess.getoutput(f"sudo -n /bin/ps -o lstart= -p {pid}").strip()
                 ppid = subprocess.getoutput(f"sudo -n /bin/ps -o ppid= -p {pid}").strip()
                 ppid = int(ppid) if ppid.isdigit() else "UNKNOWN"
-
                 if not user:
                     user = "UNKNOWN"
-
             except Exception:
                 user, start_time, ppid = "UNKNOWN", "UNKNOWN", "UNKNOWN"
 
-            listening_processes[int(pid)] = {
-                "pid": int(pid),
+            pid_int = int(pid)
+            lineage = resolve_lineage(pid_int)
+
+            listening_processes[pid_int] = {
+                "pid": pid_int,
                 "exe_path": exe_real_path,
                 "process_name": os.path.basename(exe_real_path) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN",
                 "port": port,
@@ -183,10 +188,11 @@ def get_listening_processes():
                 "cmdline": cmdline,
                 "hash": process_hash,
                 "ppid": ppid,
+                "lineage": lineage  # ✅ resolved dynamically and included
             }
 
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] subprocess error in get_listening_processes: {e}", file=sys.stderr)
+        print(f"[ERROR] subprocess error in get_listening_processes: {e}")
 
     return listening_processes
 
@@ -259,18 +265,44 @@ def check_for_unusual_port_use(process_info):
             new_hash=process_info.get("hash", "UNKNOWN")
         )
 
-    # Check for critical metadata mismatches
-    mismatches = {}
-    for field in ["exe_path", "cmdline", "hash", "user"]:
-        expected = baseline_metadata.get(field)
-        actual = process_info.get(field)
-        if expected and actual and expected != actual:
-            mismatches[field] = {"expected": expected, "actual": actual}
-
-    if mismatches:
-        print(f"[ALERT] Metadata mismatch detected for {proc_name}: {mismatches}")
+    # Individual alerts for specific metadata mismatches
+    if baseline_metadata.get("exe_path") != process_info.get("exe_path"):
+        print(f"[ALERT] Executable path mismatch for {proc_name}: expected '{baseline_metadata.get('exe_path')}', got '{process_info.get('exe_path')}'")
         log_event(
-            event_type="PROCESS_METADATA_MISMATCH",
+            event_type="EXECUTABLE_PATH_MISMATCH",
+            file_path=process_info.get("exe_path", "UNKNOWN"),
+            previous_metadata=baseline_metadata,
+            new_metadata=process_info,
+            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
+            new_hash=process_info.get("hash", "UNKNOWN")
+        )
+
+    if baseline_metadata.get("cmdline") != process_info.get("cmdline"):
+        print(f"[ALERT] Command-line mismatch for {proc_name}: expected '{baseline_metadata.get('cmdline')}', got '{process_info.get('cmdline')}'")
+        log_event(
+            event_type="CMDLINE_MISMATCH",
+            file_path=process_info.get("exe_path", "UNKNOWN"),
+            previous_metadata=baseline_metadata,
+            new_metadata=process_info,
+            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
+            new_hash=process_info.get("hash", "UNKNOWN")
+        )
+
+    if baseline_metadata.get("hash") != process_info.get("hash"):
+        print(f"[ALERT] Binary hash mismatch for {proc_name}: expected '{baseline_metadata.get('hash')}', got '{process_info.get('hash')}'")
+        log_event(
+            event_type="HASH_MISMATCH",
+            file_path=process_info.get("exe_path", "UNKNOWN"),
+            previous_metadata=baseline_metadata,
+            new_metadata=process_info,
+            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
+            new_hash=process_info.get("hash", "UNKNOWN")
+        )
+
+    if baseline_metadata.get("user") != process_info.get("user"):
+        print(f"[ALERT] User mismatch for {proc_name}: expected '{baseline_metadata.get('user')}', got '{process_info.get('user')}'")
+        log_event(
+            event_type="USER_MISMATCH",
             file_path=process_info.get("exe_path", "UNKNOWN"),
             previous_metadata=baseline_metadata,
             new_metadata=process_info,
@@ -280,6 +312,7 @@ def check_for_unusual_port_use(process_info):
 
 def monitor_listening_processes(interval=2):
     """Continuously monitors for new and terminated listening processes and detects non-standard port usage."""
+    known_lineages = load_known_lineages()
     known_processes = get_listening_processes()
     terminated_pids = set()
 
@@ -305,6 +338,9 @@ def monitor_listening_processes(interval=2):
 
                 # Check for unusual port or metadata
                 check_for_unusual_port_use(info)
+
+                # ✅ Now safe: lineage check inside the loop
+                check_lineage_baseline(info, known_lineages)
 
             # Handle terminated processes
             for pid, info in terminated_processes.items():
@@ -396,18 +432,124 @@ def rescan_listening_processes(interval=120):
         except Exception as e:
             print(f"[ERROR] Exception in periodic scan: {e}")
 
+def load_known_lineages():
+    if not os.path.exists(KNOWN_LINEAGES_FILE):
+        print("[DEBUG] known_lineages.json does not exist, starting fresh.")
+        return {}
+    try:
+        with open(KNOWN_LINEAGES_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Failed to load known_lineages.json: {e}")
+        return {}
+
+def save_known_lineages(lineages):
+    try:
+        temp_file = f"{KNOWN_LINEAGES_FILE}.tmp"
+        with open(temp_file, "w") as f:
+            json.dump(lineages, f, indent=4)
+
+        os.replace(temp_file, KNOWN_LINEAGES_FILE)
+        os.chmod(KNOWN_LINEAGES_FILE, 0o600)
+        print("[DEBUG] Saved updated known_lineages.json")
+    except Exception as e:
+        print(f"[ERROR] Failed to save known_lineages.json: {e}")
+
+def check_lineage_baseline(process_info, known_lineages):
+    proc_name = process_info["process_name"]
+    lineage = process_info.get("lineage", [])
+
+    if not lineage:
+        return
+
+    baseline = known_lineages.get(proc_name)
+
+    if not baseline:
+        known_lineages[proc_name] = lineage
+        print(f"[INFO] Baseline lineage established for {proc_name}: {lineage}")
+        save_known_lineages(known_lineages)
+    elif lineage != baseline:
+        print(f"[ALERT] Lineage deviation for {proc_name}:")
+        print(f"  Expected: {baseline}")
+        print(f"  Found:    {lineage}")
+        from fim_client import log_event
+        log_event(
+            event_type="LINEAGE_DEVIATION",
+            file_path=process_info["exe_path"],
+            previous_metadata={"lineage": baseline},
+            new_metadata={"lineage": lineage},
+            previous_hash="N/A",
+            new_hash=process_info.get("hash", "UNKNOWN")
+        )
+
+def resolve_lineage(pid):
+    """Walks the PPID chain to build the process lineage as a list of process names."""
+    lineage = []
+
+    try:
+        seen = set()
+        while pid not in seen:
+            seen.add(pid)
+            status_path = f"/proc/{pid}/status"
+            if not os.path.exists(status_path):
+                break
+
+            with open(status_path, "r") as f:
+                lines = f.readlines()
+
+            name = None
+            ppid = None
+            for line in lines:
+                if line.startswith("Name:"):
+                    name = line.split()[1]
+                elif line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+
+            if name:
+                lineage.insert(0, name)
+
+            if not ppid or ppid == 0 or ppid == pid:
+                break
+            pid = ppid
+
+    except Exception as e:
+        print(f"[ERROR] Failed to resolve lineage for PID {pid}: {e}")
+    return lineage
+
 def remove_process_tracking(pid):
     """Remove process metadata from integrity_processes.json and process_hashes.txt using PID reference."""
     process_hashes = load_process_hashes()
     integrity_state = load_process_metadata()
+    known_lineages = load_known_lineages()
 
-    pid_str = str(pid)  # Convert PID to string since JSON keys are strings
+    pid_str = str(pid)
 
     if pid_str in integrity_state:
-        del integrity_state[pid_str]  # ✅ Remove from integrity records
+        process_info = integrity_state[pid_str]
+        proc_name = process_info.get("process_name", "UNKNOWN")
+        lineage = process_info.get("lineage", [])
 
-        # Save updated metadata
+        # Remove the process metadata
+        del integrity_state[pid_str]
         save_process_metadata(integrity_state)
+
+        # Check if lineage for that process name should still be retained
+        still_running_with_same_lineage = any(
+            p.get("process_name") == proc_name and p.get("lineage") == known_lineages.get(proc_name)
+            for p in integrity_state.values()
+        )
+
+        if proc_name in known_lineages and not still_running_with_same_lineage:
+            print(f"[INFO] Removing lineage for {proc_name} from known_lineages.json")
+            del known_lineages[proc_name]
+            save_known_lineages(known_lineages)
+
+        # Remove from hash tracking if necessary
+        exe_path = process_info.get("exe_path")
+        if exe_path and exe_path in process_hashes:
+            del process_hashes[exe_path]
+            save_process_hashes(process_hashes)
+
         print(f"[INFO] Process {pid_str} removed from tracking.")
     else:
         print(f"[WARNING] No matching process found for PID: {pid_str}. It may have already been removed.")
@@ -477,8 +619,13 @@ def run_monitor():
         if not os.path.exists(KNOWN_PORTS_FILE):
             build_known_ports_baseline(initial_processes)
 
+        # ✅ Load existing lineage map or create new one
+        known_lineages = load_known_lineages()
+
+        # ✅ Track and validate lineage for all currently listening processes
         for pid, info in initial_processes.items():
             update_process_tracking(info["exe_path"], info["hash"], info)
+            check_lineage_baseline(info, known_lineages)
 
         print("[INFO] Initial process tracking complete.")
 
@@ -491,32 +638,79 @@ def run_monitor():
         print(f"[ERROR] PIM encountered an error: {e}")
         traceback.print_exc()
 
+def print_help():
+    help_text = """
+Process Integrity Monitor (PIM) - Help Menu
+
+Usage:
+  python pim               Start the PIM monitoring service in foreground mode
+  python pim -s or stop    Stop the PIM service if running in background (daemon) mode
+  python pim restart       Restart the PIM monitoring service
+  python pim -d or daemon  Run PIM in background (daemon) mode
+  python pim help        Show this help message
+
+Description:
+  The Process Integrity Monitor continuously monitors system processes for:
+    - New or terminated listening processes
+    - Non-standard port use by known binaries
+    - Unexpected changes in process metadata (user, hash, command line, etc.)
+    - Suspicious memory regions (e.g., shellcode injection or anonymous executable pages)
+
+  It uses logging and alerting to flag any anomalies and supports integration with SIEM tools.
+
+Note:
+  Use the `-d` option to run PIM in background mode (daemon). This is recommended for long-term monitoring.
+"""
+    print(help_text.strip())
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process Integrity Monitor (PIM)")
+    parser = argparse.ArgumentParser(description="Process Integrity Monitor (PIM)", add_help=False)
     parser.add_argument("-d", "--daemon", action="store_true", help="Run PIM in daemon mode")
     parser.add_argument("-s", "--stop", action="store_true", help="Stop PIM daemon")
+    parser.add_argument("command", nargs="?", default=None)
+
     args = parser.parse_args()
+    cmd = args.command
 
-    if args.stop:
-        if os.path.exists(PID_FILE):
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGTERM)
-            os.remove(PID_FILE)
-            print("[INFO] PIM daemon stopped.")
-        else:
-            print("[ERROR] PIM daemon is not running.")
-        exit(0)
+    if cmd == "help":
+        print_help()
+        sys.exit(0)
 
-    if args.daemon:
+    elif args.stop or cmd == "stop":
+        stop_daemon()
+
+    elif args.daemon or cmd == "daemon":
         print("[INFO] Running PIM in daemon mode...")
+        try:
+            with daemon.DaemonContext(
+                working_directory=os.getcwd(),
+                stdout=open(LOG_FILE, "a+", buffering=1),
+                stderr=open(LOG_FILE, "a+", buffering=1),
+                detach_process=True,
+                umask=0o027
+            ):
+                run_monitor()
+        except Exception as e:
+            print(f"[ERROR] Failed to start in daemon mode: {e}")
+            traceback.print_exc()
 
-        # Set environment manually before daemonizing
-        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+    elif cmd == "restart":
+        stop_daemon()
+        time.sleep(1)
+        print("[INFO] Restarting PIM in daemon mode...")
+        try:
+            with daemon.DaemonContext(
+                working_directory=os.getcwd(),
+                stdout=open(LOG_FILE, "a+", buffering=1),
+                stderr=open(LOG_FILE, "a+", buffering=1),
+                detach_process=True,
+                umask=0o027
+            ):
+                run_monitor()
+        except Exception as e:
+            print(f"[ERROR] Failed to restart in daemon mode: {e}")
+            traceback.print_exc()
 
-        with daemon.DaemonContext(working_directory=os.getcwd()):
-            run_monitor()
     else:
         print("[INFO] Running PIM in foreground mode...")
         run_monitor()
