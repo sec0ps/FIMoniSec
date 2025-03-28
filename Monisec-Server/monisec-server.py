@@ -11,6 +11,7 @@ import daemon.pidfile
 import clients
 import signal
 import server_siem
+import updater
 
 CONFIG_FILE = "monisec-server.config"
 server_socket = None  # Global reference to the server socket
@@ -182,6 +183,12 @@ If no command is provided, the server will start normally.
 """)
 
 if __name__ == "__main__":
+    # Always check for updates before doing anything else
+    try:
+        updater.check_for_updates()
+    except Exception as e:
+        logging.warning(f"Updater failed: {e}")
+
     if len(sys.argv) > 1:
         action = sys.argv[1]
 
