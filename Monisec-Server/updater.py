@@ -51,6 +51,7 @@ FILES_TO_UPDATE = [
     "server_crypt.py",
     "server_siem.py",
     "updater.py",
+    "clients.py",
     "version.txt"
 ]
 
