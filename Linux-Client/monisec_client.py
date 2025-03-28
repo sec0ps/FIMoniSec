@@ -8,6 +8,7 @@ import signal
 import remote
 import threading
 import json
+import updater
 
 # Ensure logs directory exists
 LOG_DIR = "./logs"
@@ -118,6 +119,12 @@ signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
 if __name__ == "__main__":
+# Always check for updates before doing anything else
+    try:
+        updater.check_for_updates()
+    except Exception as e:
+        logging.warning(f"Updater failed: {e}")
+
     if len(sys.argv) > 1:
         action = sys.argv[1]
 
