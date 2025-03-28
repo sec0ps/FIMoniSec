@@ -21,13 +21,10 @@ GITHUB_VERSION_URL = GITHUB_RAW_BASE + "version.txt"
 LOCAL_VERSION_FILE = "version.txt"
 
 FILES_TO_UPDATE = [
-    "audit.py",
-    "client_crypt.py",
-    "fim_client.py",
-    "lim.py",
-    "log_detection_engine.py",
-    "monisec_client.py",
-    "remote.py",
+    "monisec-server.py",
+    "server_crypt.py",
+    "server_siem.py",
+    "updater.py",
     "version.txt"
 ]
 
