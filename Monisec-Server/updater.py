@@ -42,7 +42,7 @@ import argparse
 import requests
 import os
 
-GITHUB_RAW_BASE = "https://raw.githubusercontent.com/sec0ps/vapt-automation/main/"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/sec0ps/FIMoniSec/Monisec-Server/main/"
 GITHUB_VERSION_URL = GITHUB_RAW_BASE + "version.txt"
 LOCAL_VERSION_FILE = "version.txt"
 
