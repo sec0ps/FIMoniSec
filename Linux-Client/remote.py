@@ -112,6 +112,7 @@ def import_psk():
     os.chmod("auth_token.json", 0o600)
 
     print("[INFO] PSK imported and stored securely.")
+    
 def authenticate_with_server():
     """Authenticates with the MoniSec server using stored IP and PSK from auth_token.json."""
 
@@ -181,6 +182,9 @@ def connect_to_server(server_ip, client_name, psk):
         return None
 
 def send_logs_to_server():
+    RETRIES = 5
+    DELAY = 3  # seconds between retries
+
     try:
         with open(AUTH_TOKEN_FILE, "r") as f:
             token_data = json.load(f)
@@ -188,12 +192,25 @@ def send_logs_to_server():
             client_name = token_data["client_name"]
             psk = token_data["psk"]  # Not used directly; client_crypt loads it
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((server_ip, 5555))
+        sock = None
+        for attempt in range(RETRIES):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(10)
+                sock.connect((server_ip, 5555))
 
-        # Step 1: Send cleartext client_name as JSON
-        handshake = json.dumps({"client_name": client_name})
-        sock.sendall(handshake.encode("utf-8"))
+                # Send cleartext client_name as JSON handshake
+                handshake = json.dumps({"client_name": client_name})
+                sock.sendall(handshake.encode("utf-8"))
+
+                logging.info(f"[INFO] Connected to server and sent handshake. Attempt {attempt + 1}")
+                break
+            except Exception as e:
+                logging.error(f"[ERROR] Connection attempt {attempt + 1} failed: {e}")
+                time.sleep(DELAY)
+        else:
+            logging.critical("[CRITICAL] Could not connect to server after multiple attempts.")
+            return
 
         file_positions = {}
         for log_file in LOG_FILES:
@@ -233,7 +250,8 @@ def send_logs_to_server():
     except Exception as e:
         logging.error(f"[CLIENT ERROR] {e}")
     finally:
-        sock.close()
+        if sock:
+            sock.close()
 
 def extract_valid_json_objects(buffer):
     logs = []
@@ -246,7 +264,7 @@ def extract_valid_json_objects(buffer):
         except json.JSONDecodeError:
             break
     return logs
-
+    
 def check_auth_and_send_logs():
     """Checks if auth_token.json exists and starts log transmission if valid."""
     if os.path.exists(AUTH_TOKEN_FILE):
@@ -260,6 +278,7 @@ def check_auth_and_send_logs():
             if server_ip and client_name and psk:
                 logging.info("[INFO] Authentication token found. Connecting to server...")
 
+                # Authenticate with server and proceed if successful
                 success = authenticate_with_server()
                 if success:
                     logging.info("[INFO] Authentication successful. Starting real-time log transmission...")
