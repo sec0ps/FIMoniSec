@@ -146,7 +146,11 @@ def run_server():
     logger.handlers = []  # Clear existing
     logger.addHandler(server_log_handler)
 
+    # Verify PID file was created properly
+    verify_pid_file()
+    
     logging.info("Starting MoniSec Server...")
+    logging.info(f"Server PID: {os.getpid()}")
     start_server()
 
 def start_server():
@@ -190,6 +194,33 @@ def initialize_log_storage():
     except Exception as e:
         logging.error(f"Failed to initialize log storage: {e}")
 
+def ensure_directories():
+    """Ensures necessary directories exist with proper permissions."""
+    try:
+        # Ensure logs directory exists
+        os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+        logging.info(f"Ensured logs directory exists: {LOG_DIR}")
+    except Exception as e:
+        print(f"[ERROR] Failed to create directories: {e}")
+        sys.exit(1)
+
+# Add this new function to your code
+def verify_pid_file():
+    """Verifies that PID file exists and contains the current process ID."""
+    if not os.path.exists(PID_FILE):
+        logging.error(f"[ERROR] PID file {PID_FILE} was not created properly")
+        # Try to create it manually as a fallback
+        try:
+            with open(PID_FILE, "w") as f:
+                f.write(str(os.getpid()))
+            logging.info(f"[INFO] Created PID file manually: {PID_FILE}")
+            os.chmod(PID_FILE, 0o644)  # Make sure it's readable
+            return True
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to create PID file manually: {e}")
+            return False
+    return True
+    
 def print_help():
     """Prints the available command-line options for monisec-server.py"""
     print("""
@@ -208,26 +239,28 @@ If no command is provided, the server will start normally.
 """)
 
 if __name__ == "__main__":
-    # Always check for updates before doing anything else
-    try:
-        updater.check_for_updates()
-    except Exception as e:
-        logging.warning(f"Updater failed: {e}")
+    should_run_updater = (len(sys.argv) == 1) or (len(sys.argv) > 1 and sys.argv[1] == "-d")
+
+    if should_run_updater:
+        try:
+            updater.check_for_updates()
+        except Exception as e:
+            logging.warning(f"Updater failed: {e}")
 
     if len(sys.argv) > 1:
         action = sys.argv[1]
 
         if action in ["-h", "--help", "help"]:
-            print_help()  # Display help message
-            sys.exit(0)  # Exit before starting the server
+            print_help()
+            sys.exit(0)
 
         elif action == "list-agents":
             clients.list_clients()
-            sys.exit(0)  # Exit before starting the server
+            sys.exit(0)
 
         elif action == "add-agent":
             clients.add_client()
-            sys.exit(0)  # Exit before starting the server
+            sys.exit(0)
 
         elif action == "remove-agent":
             if len(sys.argv) < 3:
@@ -235,17 +268,16 @@ if __name__ == "__main__":
                 sys.exit(1)
             agent_name = sys.argv[2]
             clients.remove_client(agent_name)
-            sys.exit(0)  # Exit before starting the server
+            sys.exit(0)
 
-        elif action == "configure-siem":  # ✅ New SIEM configuration option
+        elif action == "configure-siem":
             server_siem.configure_siem()
-            sys.exit(0)  # Exit after configuring SIEM
+            sys.exit(0)
+
         elif action == "-d":
             print("[INFO] Daemonizing MoniSec Server...")
-
             os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
 
-            # Just redirect stdout/stderr to the main log file
             with open(LOG_FILE, 'a+') as log_stream:
                 with daemon.DaemonContext(
                     pidfile=daemon.pidfile.TimeoutPIDLockFile(PID_FILE),
@@ -256,11 +288,11 @@ if __name__ == "__main__":
                 ):
                     run_server()
             sys.exit(0)
+
         elif action == "stop":
             if not os.path.exists(PID_FILE):
                 print(f"[ERROR] PID file not found: {PID_FILE}")
                 sys.exit(1)
-
             try:
                 with open(PID_FILE, "r") as f:
                     pid = int(f.read().strip())
@@ -276,11 +308,11 @@ if __name__ == "__main__":
 
             sys.exit(0)
 
-    # ✅ Ensure SIEM settings are loaded
+    # No CLI args or unrecognized input — start server in foreground
     siem_config = server_siem.load_siem_config()
     if siem_config:
         logging.info("[INFO] SIEM integration is enabled.")
 
     initialize_log_storage()
     print("Starting MoniSec Server...")
-    start_server()  # Start the main server function
+    start_server()
