@@ -1,3 +1,6 @@
 daemon
 python-daemon
 pyinotify
+numpy
+pandas
+scikit-learn
