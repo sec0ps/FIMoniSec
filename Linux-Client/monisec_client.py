@@ -125,6 +125,71 @@ def monitor_processes():
 
         time.sleep(10 if not all_running else 60)  # Increase interval if stable
 
+def stop_monisec_client_daemon():
+    """Stop the MoniSec client running in daemon mode."""
+    pidfile = "/tmp/monisec_client.pid"
+    
+    try:
+        if os.path.exists(pidfile):
+            with open(pidfile, 'r') as f:
+                pid = int(f.read().strip())
+            
+            # Check if process is actually running
+            try:
+                os.kill(pid, 0)
+                logging.info(f"Sending SIGTERM to MoniSec client daemon (PID: {pid})")
+                os.kill(pid, signal.SIGTERM)
+                
+                # Wait for process to terminate
+                for _ in range(10):  # 10-second timeout
+                    try:
+                        os.kill(pid, 0)
+                        time.sleep(1)
+                    except OSError:
+                        logging.info("MoniSec client daemon stopped successfully.")
+                        os.remove(pidfile)
+                        return True
+                
+                # Force kill if not terminated
+                os.kill(pid, signal.SIGKILL)
+                os.remove(pidfile)
+                logging.warning("MoniSec client daemon forcefully terminated.")
+                return True
+            
+            except OSError:
+                logging.warning("No running MoniSec client daemon found.")
+                os.remove(pidfile)
+                return False
+        else:
+            logging.warning("No PID file found. MoniSec client daemon might not be running.")
+            return False
+    
+    except Exception as e:
+        logging.error(f"Error stopping MoniSec client daemon: {e}")
+        return False
+
+def start_daemon():
+    """Start MoniSec client in daemon mode with PID file tracking."""
+    pidfile = "/tmp/monisec_client.pid"
+    
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+    os.setsid()
+    os.umask(0)
+    sys.stdin = open(os.devnull, 'r')
+
+    # Write PID to file
+    with open(pidfile, 'w') as f:
+        f.write(str(os.getpid()))
+
+    logging.info("MoniSec Endpoint Monitor started in daemon mode.")
+
+    listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
+    listener_thread.start()
+
+    monitor_processes()
+    
 # Handle graceful shutdown on keyboard interrupt
 def handle_exit(signum, frame):
     logging.info("Keyboard interrupt received. Stopping MoniSec client and all related processes...")
@@ -144,25 +209,32 @@ signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
 if __name__ == "__main__":
-# Always check for updates before doing anything else
-    try:
-        updater.check_for_updates()
-    except Exception as e:
-        logging.warning(f"Updater failed: {e}")
+    should_run_updater = (len(sys.argv) == 1) or (len(sys.argv) > 1 and sys.argv[1] == "-d")
+
+    if should_run_updater:
+        try:
+            updater.check_for_updates()
+        except Exception as e:
+            logging.warning(f"Updater failed: {e}")
 
     if len(sys.argv) > 1:
         action = sys.argv[1]
 
         # Restart MoniSec Client
         if action == "restart":
-            stop_process("monisec_client")
+            stop_monisec_client_daemon()
             time.sleep(2)
             start_process("monisec_client")
+
+        # Stop MoniSec Client Daemon
+        elif action == "stop":
+            stop_monisec_client_daemon()
 
         # Start, Stop, Restart PIM or FIM
         elif action in ["pim", "fim"]:
             if len(sys.argv) > 2 and sys.argv[2] in ["start", "stop", "restart"]:
-                target_process = f"{action}_client"
+                # Fix: Only append "_client" if the action is "fim"
+                target_process = f"{action}_client" if action == "fim" else action
                 if sys.argv[2] == "start":
                     start_process(target_process)
                 elif sys.argv[2] == "stop":
@@ -184,10 +256,10 @@ if __name__ == "__main__":
                 success = remote.authenticate_with_server()
                 if success:
                     print("[SUCCESS] Authentication successful.")
-                    sys.exit(0)  # ✅ Exit gracefully on success
+                    sys.exit(0)
                 else:
                     print("[ERROR] Authentication failed.")
-                    sys.exit(1)  # ✅ Exit with error code
+                    sys.exit(1)
             else:
                 print("[ERROR] Invalid command. Usage: monisec_client auth test")
                 sys.exit(1)
@@ -196,39 +268,43 @@ if __name__ == "__main__":
         elif action == "-d":
             pid = os.fork()
             if pid > 0:
-                sys.exit(0)  # Exit parent process
+                sys.exit(0)
             os.setsid()
             os.umask(0)
             sys.stdin = open(os.devnull, 'r')
-
+        
+            # Write PID to file
+            with open("/tmp/monisec_client.pid", 'w') as f:
+                f.write(str(os.getpid()))
+        
             logging.info("MoniSec Endpoint Monitor started in daemon mode.")
-
-            # Start remote command listener in a separate thread
+        
+            # Add this line to start log transmission in daemon mode
+            remote.check_auth_and_send_logs()
+        
             listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
             listener_thread.start()
-
+        
             monitor_processes()
 
-        # Print usage information for invalid commands
+        # Invalid command
         else:
             print(
                 """Usage:
     monisec_client restart                  # Restart monisec_client
+    monisec_client stop                     # Stop monisec_client daemon
     monisec_client pim start|stop|restart   # Control PIM process
     monisec_client fim start|stop|restart   # Control FIM process
     monisec_client import-psk               # Import PSK for authentication
-    monisec_client auth test                 # Test authentication, then exit"""
+    monisec_client auth test                # Test authentication, then exit"""
             )
             sys.exit(1)
 
     else:
-        # Run in foreground mode (default behavior)
         logging.info("MoniSec Endpoint Monitor started in foreground.")
 
-        # Start remote command listener in a separate thread
         listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
         listener_thread.start()
 
         remote.check_auth_and_send_logs()
         monitor_processes()
-
