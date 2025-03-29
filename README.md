@@ -1,6 +1,6 @@
-# MoniSec: Comprehensive System Security Monitoring
+# FIMoniSec: Comprehensive System Security Monitoring
 
-MoniSec is a lightweight yet powerful Python-based system security monitoring application designed for Linux environments. It offers comprehensive intrusion detection through advanced behavioral analysis, machine learning, and real-time monitoring of process and file integrity.
+FIMoniSec is a lightweight yet powerful Python-based system security monitoring application designed for Linux environments. It offers comprehensive intrusion detection through advanced behavioral analysis, machine learning, and real-time monitoring of process and file integrity.
 
 ## Features
 
