@@ -38,7 +38,7 @@ from monisec_client import start_process, stop_process, restart_process, is_proc
 CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
 CLIENT_PORT = 6000       # Port for receiving commands
 AUTH_TOKEN_FILE = "auth_token.json"
-LOG_FILES = ["./logs/monisec-endpoint.log", "./logs/file_monitor.json"]
+LOG_FILES = ["./logs/file_monitor.json"]
 LOG_FILE = "./logs/file_monitor.json"
 
 def start_client_listener():
@@ -181,9 +181,45 @@ def connect_to_server(server_ip, client_name, psk):
         logging.error(f"Connection to server failed: {e}. Retrying...")
         return None
 
+def send_chunked_data(sock, data):
+    """Send data in manageable chunks with length prefixes."""
+    try:
+        # Get total message size
+        total_size = len(data)
+        logging.debug(f"Sending total of {total_size} bytes")
+        
+        # Send in chunks of 4KB max
+        CHUNK_SIZE = 4096
+        position = 0
+        
+        while position < total_size:
+            # Determine chunk size
+            chunk = data[position:position + CHUNK_SIZE]
+            chunk_size = len(chunk)
+            
+            # Send chunk size as a 4-byte header
+            size_bytes = chunk_size.to_bytes(4, byteorder='big')
+            sock.sendall(size_bytes)
+            
+            # Send the chunk
+            sock.sendall(chunk)
+            
+            position += chunk_size
+            logging.debug(f"Sent chunk of {chunk_size} bytes, position {position}/{total_size}")
+        
+        # Send a zero-length marker to indicate end of message
+        sock.sendall((0).to_bytes(4, byteorder='big'))
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error sending chunked data: {e}")
+        return False
+
 def send_logs_to_server():
     RETRIES = 5
     DELAY = 3  # seconds between retries
+    # Threshold for using chunked transfer (bytes)
+    CHUNKING_THRESHOLD = 4000
 
     try:
         with open(AUTH_TOKEN_FILE, "r") as f:
@@ -215,32 +251,64 @@ def send_logs_to_server():
         file_positions = {}
         for log_file in LOG_FILES:
             file_positions[log_file] = os.path.getsize(log_file) if os.path.exists(log_file) else 0
+            logging.info(f"Initial position for {log_file}: {file_positions[log_file]}")
 
         while True:
             logs_to_send = []
 
             for log_file in LOG_FILES:
                 if os.path.exists(log_file):
-                    with open(log_file, "r") as f:
-                        f.seek(file_positions[log_file])
-                        new_logs = f.read().strip()
-                        file_positions[log_file] = f.tell()
-
-                    if new_logs:
-                        entries = extract_valid_json_objects(new_logs)
-                        for entry in entries:
-                            if isinstance(entry, dict):
-                                entry["client_name"] = client_name
-                                logs_to_send.append(entry)
+                    try:
+                        current_size = os.path.getsize(log_file)
+                        
+                        if current_size <= file_positions[log_file]:
+                            continue
+                            
+                        with open(log_file, "r") as f:
+                            f.seek(file_positions[log_file])
+                            new_logs = f.read()
+                            new_position = f.tell()
+                            
+                            if new_logs:
+                                file_positions[log_file] = new_position
+                                entries = extract_valid_json_objects(new_logs)
+                                logging.info(f"Extracted {len(entries)} valid entries from {log_file}")
+                                
+                                for entry in entries:
+                                    if isinstance(entry, dict):
+                                        # Clone the entry and add client_name
+                                        full_entry = entry.copy()
+                                        full_entry["client_name"] = client_name
+                                        logs_to_send.append(full_entry)
+                    except Exception as e:
+                        logging.error(f"Error reading log file {log_file}: {e}")
 
             if logs_to_send:
                 try:
                     message = json.dumps({"logs": logs_to_send})
+                    message_size = len(message)
+                    logging.debug(f"Sending {len(logs_to_send)} logs, message size: {message_size} bytes")
+                    
                     encrypted = encrypt_data(message)
-                    sock.sendall(encrypted)
+                    encrypted_size = len(encrypted)
+                    
+                    # Use chunked transfer for large messages
+                    if encrypted_size > CHUNKING_THRESHOLD:
+                        logging.info(f"Using chunked transfer for large message ({encrypted_size} bytes)")
+                        success = send_chunked_data(sock, encrypted)
+                        if not success:
+                            logging.error("Failed to send chunked data")
+                            break
+                    else:
+                        # Use original method for smaller messages
+                        sock.sendall(encrypted)
+                    
                     ack = sock.recv(1024)
                     if ack != b"ACK":
-                        logging.warning("No ACK received from server.")
+                        logging.warning(f"Unexpected server response: {ack}")
+                        break
+                    else:
+                        logging.info(f"Successfully sent {len(logs_to_send)} logs to server")
                 except Exception as e:
                     logging.error(f"[SEND ERROR] {e}")
                     break
@@ -252,19 +320,93 @@ def send_logs_to_server():
     finally:
         if sock:
             sock.close()
+            logging.info("Connection to server closed")
 
 def extract_valid_json_objects(buffer):
+    """Extract valid JSON objects from a buffer, handling complete JSON objects at the root level."""
     logs = []
-    buffer = buffer.strip()
-    while buffer:
-        try:
-            obj, idx = json.JSONDecoder().raw_decode(buffer)
-            logs.append(obj)
-            buffer = buffer[idx:].strip()
-        except json.JSONDecodeError:
-            break
-    return logs
+    if not buffer or not buffer.strip():
+        return logs
     
+    # Split by line and look for complete objects
+    lines = buffer.strip().split('\n')
+    
+    # Handle multi-line JSON objects
+    current_object = ""
+    bracket_count = 0
+    
+    for line in lines:
+        # Count opening and closing brackets to track JSON object boundaries
+        bracket_count += line.count('{') - line.count('}')
+        
+        # Add this line to the current object we're building
+        current_object += line
+        
+        # If brackets are balanced, we might have a complete object
+        if bracket_count == 0 and current_object.strip():
+            try:
+                obj = json.loads(current_object)
+                logs.append(obj)
+                current_object = ""
+            except json.JSONDecodeError:
+                # Not a valid object yet, keep going
+                pass
+    
+    # If we couldn't parse any objects the standard way, try as a last resort
+    if not logs and buffer.strip():
+        try:
+            # Try to find all JSON objects in the buffer using regex
+            import re
+            json_pattern = r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}'
+            matches = re.findall(json_pattern, buffer)
+            
+            for match in matches:
+                try:
+                    obj = json.loads(match)
+                    logs.append(obj)
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
+    
+    logging.info(f"Successfully extracted {len(logs)} log entries")
+    return logs
+
+# Add new functions for chunked transfers
+def send_chunked_data(sock, data):
+    """Send data in manageable chunks with length prefixes."""
+    try:
+        # Get total message size
+        total_size = len(data)
+        logging.debug(f"Sending total of {total_size} bytes")
+        
+        # Send in chunks of 4KB max
+        CHUNK_SIZE = 4096
+        position = 0
+        
+        while position < total_size:
+            # Determine chunk size
+            chunk = data[position:position + CHUNK_SIZE]
+            chunk_size = len(chunk)
+            
+            # Send chunk size as a 4-byte header
+            size_bytes = chunk_size.to_bytes(4, byteorder='big')
+            sock.sendall(size_bytes)
+            
+            # Send the chunk
+            sock.sendall(chunk)
+            
+            position += chunk_size
+            logging.debug(f"Sent chunk of {chunk_size} bytes, position {position}/{total_size}")
+        
+        # Send a zero-length marker to indicate end of message
+        sock.sendall((0).to_bytes(4, byteorder='big'))
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error sending chunked data: {e}")
+        return False
+
 def check_auth_and_send_logs():
     """Checks if auth_token.json exists and starts log transmission if valid."""
     if os.path.exists(AUTH_TOKEN_FILE):
