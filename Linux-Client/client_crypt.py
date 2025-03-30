@@ -46,14 +46,28 @@ def load_psk():
         logging.info(f"[INFO] Loaded PSK from auth_token.json: {raw_psk}")
         return psk
 
+# Keep the original function signature but improve the implementation
 def encrypt_data(plaintext):
     """Encrypts authentication request or logs before sending to the server."""
-    psk = load_psk()
-    aesgcm = AESGCM(psk)
+    try:
+        psk = load_psk()
+        aesgcm = AESGCM(psk)
 
-    nonce = os.urandom(12)  # ✅ Generate a 12-byte nonce
-    ciphertext = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)  # ✅ Ensure plaintext is encoded
-    return nonce + ciphertext  # ✅ Prepend nonce to encrypted data
+        # Generate a fresh nonce for every message
+        nonce = os.urandom(12)
+        plaintext_bytes = plaintext.encode("utf-8")
+        logging.debug(f"Encrypting data of length: {len(plaintext_bytes)} bytes")
+        
+        ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, None)
+        encrypted_data = nonce + ciphertext
+        
+        logging.debug(f"Encrypted data length: {len(encrypted_data)} bytes")
+        return encrypted_data
+    
+    except Exception as e:
+        logging.error(f"Error encrypting data: {e}")
+        logging.error(f"Plaintext sample: {plaintext[:100]}")
+        raise
 
 def decrypt_data(encrypted_data):
     """Decrypt received data."""
