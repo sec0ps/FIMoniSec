@@ -28,6 +28,8 @@ import json
 import hmac
 import hashlib
 import logging
+import select
+import socket
 import server_siem
 import server_crypt
 
@@ -183,6 +185,72 @@ def authenticate_client(client_socket):
         client_socket.sendall(b"AUTH_FAILED")
         return None
 
+def receive_chunked_data(client_socket):
+    """Receive data sent in chunks with length prefixes."""
+    try:
+        full_data = bytearray()
+        
+        while True:
+            # Receive chunk size (4 bytes)
+            size_bytes = b""
+            while len(size_bytes) < 4:
+                chunk = client_socket.recv(4 - len(size_bytes))
+                if not chunk:
+                    if not size_bytes:  # Clean disconnect
+                        return None
+                    logging.error(f"Connection closed while receiving size header. Got {len(size_bytes)} bytes")
+                    return None
+                size_bytes += chunk
+                
+            chunk_size = int.from_bytes(size_bytes, byteorder='big')
+            
+            # A zero-length chunk means end of message
+            if chunk_size == 0:
+                break
+                
+            # Receive the chunk data
+            chunk = bytearray()
+            bytes_received = 0
+            
+            # Keep receiving until we get all bytes for this chunk
+            while bytes_received < chunk_size:
+                remaining = chunk_size - bytes_received
+                buffer = client_socket.recv(min(4096, remaining))
+                
+                if not buffer:
+                    logging.error("Connection closed during chunk receive")
+                    return None
+                    
+                chunk.extend(buffer)
+                bytes_received += len(buffer)
+            
+            full_data.extend(chunk)
+            logging.debug(f"Received chunk of {chunk_size} bytes, total so far: {len(full_data)}")
+        
+        return bytes(full_data)
+    except Exception as e:
+        logging.error(f"Error receiving chunked data: {e}")
+        return None
+
+def is_chunked_message(client_socket):
+    """Try to detect if the incoming message is using chunked protocol."""
+    try:
+        # Peek at the first 4 bytes without consuming them
+        peek_data = client_socket.recv(4, socket.MSG_PEEK)
+        
+        # If we got less than 4 bytes, it's not enough to tell
+        if len(peek_data) < 4:
+            return False
+            
+        # Convert the first 4 bytes to an integer
+        possible_size = int.from_bytes(peek_data, byteorder='big')
+        
+        # If the size is reasonable (less than 16MB but greater than 0),
+        # it's likely a chunked message header
+        return 0 < possible_size < 16 * 1024 * 1024
+    except:
+        return False
+
 def handle_client(client_socket, client_address):
     """Handles encrypted log reception from authenticated client."""
     logging.info(f"New connection from {client_address}")
@@ -212,27 +280,81 @@ def handle_client(client_socket, client_address):
 
         # Step 3: Receive and decrypt logs
         while True:
-            encrypted_data = client_socket.recv(4096)
-            if not encrypted_data:
-                break  # Client disconnected
-
+            # First, check if there's any data available before trying to receive
+            import select
+            readable, _, _ = select.select([client_socket], [], [], 0.5)
+            if not readable:
+                continue  # No data yet, keep waiting
+                
+            # Peek at the first 4 bytes to check if this might be a chunked message
+            try:
+                peek_bytes = client_socket.recv(4, socket.MSG_PEEK)
+                if len(peek_bytes) == 0:
+                    # Client disconnected
+                    break
+                    
+                if len(peek_bytes) == 4:
+                    # Check if this could be a chunk size header
+                    potential_size = int.from_bytes(peek_bytes, byteorder='big')
+                    
+                    # If the first 4 bytes represent a reasonable chunk size,
+                    # assume this is a chunked message
+                    if 0 < potential_size < 8192:
+                        logging.debug(f"Detected potential chunked message (size: {potential_size})")
+                        # Read the chunked data using the existing function
+                        encrypted_data = receive_chunked_data(client_socket)
+                        if not encrypted_data:
+                            logging.error("Failed to receive chunked data completely")
+                            break
+                        logging.debug(f"Successfully received chunked data: {len(encrypted_data)} bytes")
+                    else:
+                        # Not a chunked message, use standard receive
+                        encrypted_data = client_socket.recv(4096)
+                        if not encrypted_data:
+                            break
+                else:
+                    # Not enough bytes to determine, use standard receive
+                    encrypted_data = client_socket.recv(4096)
+                    if not encrypted_data:
+                        break
+            except Exception as e:
+                logging.error(f"Error detecting message type: {e}")
+                # Fall back to standard receive
+                encrypted_data = client_socket.recv(4096)
+                if not encrypted_data:
+                    break
+            
+            # Process the received data
             try:
                 log_data = server_crypt.decrypt_data_with_psk(psk, encrypted_data)
                 logs = log_data.get("logs", [])
 
                 if isinstance(logs, dict):
                     logs = [logs]
-
+                    
+                # Process the logs
                 for log_entry in logs:
                     log_entry["client_name"] = client_name
-                    append_log(log_entry)
+                    # Write log to file
+                    try:
+                        with open(ENDPOINT_LOG_FILE, "a") as log_file:
+                            log_file.write(json.dumps(log_entry) + "\n")
+                    except Exception as e:
+                        logging.error(f"[ERROR] Failed to write client log: {e}")
+                    
+                    # Forward to SIEM if configured
                     server_siem.forward_log_to_siem(log_entry, client_name)
 
                 logging.info(f"[RECV] Received {len(logs)} logs from {client_name}")
                 client_socket.sendall(b"ACK")
             except Exception as e:
-                logging.warning(f"[ERROR] Failed to process data from {client_name}: {e}")
-                break
+                logging.error(f"Decryption failed: {str(e)}")
+                logging.info(f"[RECV] Received 0 logs from {client_name}")
+                # Try to send ACK to maintain connection
+                try:
+                    client_socket.sendall(b"ACK")
+                except:
+                    break
 
     except Exception as e:
         logging.error(f"[ERROR] Unexpected exception from {client_address}: {e}")
@@ -240,13 +362,49 @@ def handle_client(client_socket, client_address):
         logging.info(f"[DISCONNECT] Client {client_address} disconnected.")
         client_socket.close()
 
-def append_log(log_entry):
+# Add new function for receiving chunked data
+def receive_chunked_data(client_socket):
+    """Receive data sent in chunks with length prefixes."""
     try:
-        with open(ENDPOINT_LOG_FILE, "a") as log_file:
-            log_file.write(json.dumps(log_entry) + "\n")
+        full_data = bytearray()
+        
+        while True:
+            # Receive chunk size (4 bytes)
+            size_bytes = client_socket.recv(4)
+            if not size_bytes or len(size_bytes) < 4:
+                logging.error("Incomplete size header received")
+                return None
+                
+            chunk_size = int.from_bytes(size_bytes, byteorder='big')
+            
+            # A zero-length chunk means end of message
+            if chunk_size == 0:
+                break
+                
+            # Receive the chunk data
+            chunk = bytearray()
+            bytes_received = 0
+            
+            # Keep receiving until we get all bytes for this chunk
+            while bytes_received < chunk_size:
+                remaining = chunk_size - bytes_received
+                buffer = client_socket.recv(min(4096, remaining))
+                
+                if not buffer:
+                    logging.error("Connection closed during chunk receive")
+                    return None
+                    
+                chunk.extend(buffer)
+                bytes_received += len(buffer)
+            
+            full_data.extend(chunk)
+            logging.debug(f"Received chunk of {chunk_size} bytes, total so far: {len(full_data)}")
+        
+        return bytes(full_data)
     except Exception as e:
-        logging.error(f"[ERROR] Failed to write client log: {e}")
-
+        logging.error(f"Error receiving chunked data: {e}")
+        return None
+        
 # Function to send commands to clients
 def send_command(client_ip, command):
     try:
