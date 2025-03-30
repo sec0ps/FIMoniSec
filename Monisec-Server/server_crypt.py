@@ -58,20 +58,46 @@ def decrypt_data(client_name, encrypted_data):
     aesgcm = AESGCM(psk)
 
     try:
+        if len(encrypted_data) < 12:
+            raise ValueError(f"[ERROR] Data too short to contain nonce ({len(encrypted_data)} bytes)")
+            
         nonce = encrypted_data[:12]
         ciphertext = encrypted_data[12:]
-        decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")  # ✅ Decode string
-        return json.loads(decrypted_text)  # ✅ Convert back to JSON
-    except Exception as e:
-        raise ValueError(f"[ERROR] Decryption failed: {e}")
-
-def decrypt_data_with_psk(psk, encrypted_data):
-    aesgcm = AESGCM(psk)
-    try:
-        nonce = encrypted_data[:12]
-        ciphertext = encrypted_data[12:]
+        
         decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
-        print(f"[DEBUG] Raw decrypted log: {decrypted_text}")
         return json.loads(decrypted_text)
     except Exception as e:
         raise ValueError(f"[ERROR] Decryption failed: {e}")
+        
+def decrypt_data_with_psk(psk, encrypted_data):
+    """Decrypt received log data using the provided PSK."""
+    aesgcm = AESGCM(psk)
+    
+    try:
+        logging.debug(f"Decrypting data of length: {len(encrypted_data)} bytes")
+        
+        if len(encrypted_data) < 12:
+            logging.error(f"Encrypted data too short ({len(encrypted_data)} bytes)")
+            return {"logs": []}
+            
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        
+        try:
+            decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
+            logging.debug(f"Successfully decrypted {len(decrypted_text)} bytes of text")
+        except Exception as e:
+            logging.error(f"AES-GCM decryption failed: {str(e)}")
+            return {"logs": []}
+        
+        try:
+            result = json.loads(decrypted_text)
+            return result
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON decode error: {e}")
+            logging.error(f"Decrypted text sample: {decrypted_text[:100]}")
+            return {"logs": []}
+            
+    except Exception as e:
+        logging.error(f"Decryption failed: {str(e)}")
+        return {"logs": []}
