@@ -24,65 +24,75 @@
 #
 # =============================================================================
 import json
-import os
 import logging
+import os
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-AUTH_FILE = "auth_token.json"
+PSK_FILE = "psk_store.json"
 
-def load_psk():
-    """Load the PSK from auth_token.json and return it as bytes."""
-    if not os.path.exists(AUTH_FILE):
-        raise FileNotFoundError("[ERROR] auth_token.json not found.")
+def load_psk(client_name):
+    """Retrieve PSK for a client from psk_store.json and ensure it is in bytes."""
+    if not os.path.exists(PSK_FILE):
+        raise FileNotFoundError("[ERROR] psk_store.json not found.")
 
-    with open(AUTH_FILE, "r") as f:
+    with open(PSK_FILE, "r") as f:
         data = json.load(f)
-        raw_psk = data["psk"]
+        for agent in data.values():
+            if agent["AgentName"] == client_name:
+                raw_psk = agent["AgentPSK"]
+                if len(raw_psk) != 64:
+                    raise ValueError(f"[ERROR] Invalid PSK length for client '{client_name}'. Expected 64 hex chars.")
+                psk = bytes.fromhex(raw_psk)
+                logging.info(f"[INFO] Loaded PSK for {client_name}: {raw_psk}")
+                return psk
 
-        if len(raw_psk) != 64:
-            raise ValueError("[ERROR] PSK format invalid. Expected 64-character hex string.")
+    raise ValueError(f"[ERROR] No PSK found for client: {client_name}")
 
-        psk = bytes.fromhex(raw_psk)
-        logging.info(f"[INFO] Loaded PSK from auth_token.json: {raw_psk}")
-        return psk
-
-# Keep the original function signature but improve the implementation
-def encrypt_data(plaintext):
-    """Encrypts authentication request or logs before sending to the server."""
+def decrypt_data(client_name, encrypted_data):
+    """Decrypt received log data."""
     try:
-        psk = load_psk()
-        aesgcm = AESGCM(psk)
+        psk = load_psk(client_name)
+    except ValueError:
+        raise ValueError(f"[ERROR] No PSK found for client: {client_name}")
 
-        # Generate a fresh nonce for every message
-        nonce = os.urandom(12)
-        plaintext_bytes = plaintext.encode("utf-8")
-        logging.debug(f"Encrypting data of length: {len(plaintext_bytes)} bytes")
-        
-        ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, None)
-        encrypted_data = nonce + ciphertext
-        
-        logging.debug(f"Encrypted data length: {len(encrypted_data)} bytes")
-        return encrypted_data
-    
-    except Exception as e:
-        logging.error(f"Error encrypting data: {e}")
-        logging.error(f"Plaintext sample: {plaintext[:100]}")
-        raise
-
-def decrypt_data(encrypted_data):
-    """Decrypt received data."""
-    if len(encrypted_data) < 13:
-        raise ValueError("[ERROR] Encrypted data is too short to contain nonce and ciphertext.")
-
-    psk = load_psk()
     aesgcm = AESGCM(psk)
 
-    nonce = encrypted_data[:12]
-    ciphertext = encrypted_data[12:]
-
     try:
-        decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
-        return json.loads(decrypted_text)
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")  # ✅ Decode string
+        return json.loads(decrypted_text)  # ✅ Convert back to JSON
     except Exception as e:
-        logging.error(f"[ERROR] AES-GCM decryption failed: {e}")
-        return None
+        raise ValueError(f"[ERROR] Decryption failed: {e}")
+        
+def decrypt_data_with_psk(psk, encrypted_data):
+    """Decrypt received log data using the provided PSK."""
+    aesgcm = AESGCM(psk)
+    
+    try:
+        logging.debug(f"Decrypting data of length: {len(encrypted_data)} bytes")
+        
+        if len(encrypted_data) < 12:
+            logging.error(f"Encrypted data too short ({len(encrypted_data)} bytes)")
+            return {"logs": []}
+            
+        nonce = encrypted_data[:12]
+        ciphertext = encrypted_data[12:]
+        
+        try:
+            decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
+            logging.debug(f"Successfully decrypted {len(decrypted_text)} bytes of text")
+        except Exception as e:
+            logging.error(f"AES-GCM decryption failed: {e}")
+            return {"logs": []}
+        
+        try:
+            return json.loads(decrypted_text)
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON decode error: {e}")
+            logging.error(f"Decrypted text sample: {decrypted_text[:100]}")
+            return {"logs": []}
+            
+    except Exception as e:
+        logging.error(f"Decryption failed: {e}")
+        return {"logs": []}
