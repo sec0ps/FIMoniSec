@@ -54,23 +54,43 @@ def print_banner():
 
 def start_monitor(foreground=True):
     """Start the LIM monitoring service"""
-    if os.path.exists(PID_FILE) and foreground:
+    if os.path.exists(PID_FILE):
         print("LIM is already running or PID file exists.")
         print(f"To force start, delete the PID file: {PID_FILE}")
         return
-        
+
     if not foreground:
-        # Start in daemon mode
-        p = Process(target=run_monitor)
-        p.daemon = True
-        p.start()
-        
-        with open(PID_FILE, 'w') as f:
-            f.write(str(p.pid))
-            
-        print(f"LIM started in daemon mode with PID {p.pid}")
+        # Proper daemonization using double-fork
+        pid = os.fork()
+        if pid > 0:
+            # Exit parent
+            print(f"LIM started in daemon mode with PID {pid}")
+            with open(PID_FILE, 'w') as f:
+                f.write(str(pid))
+            sys.exit(0)
+
+        # Decouple from parent environment
+        os.setsid()
+        os.umask(0)
+
+        # Second fork to prevent reacquisition of terminal
+        pid2 = os.fork()
+        if pid2 > 0:
+            with open(PID_FILE, 'w') as f:
+                f.write(str(pid2))
+            sys.exit(0)
+
+        # Redirect standard file descriptors
+        sys.stdout.flush()
+        sys.stderr.flush()
+        with open("lim_output.log", 'a+') as out, open("lim_error.log", 'a+') as err:
+            os.dup2(out.fileno(), sys.stdout.fileno())
+            os.dup2(err.fileno(), sys.stderr.fileno())
+
+        # In final daemon process
+        run_monitor()
         return
-        
+
     # Start in foreground mode
     try:
         run_monitor()
