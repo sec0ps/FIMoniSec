@@ -1,3 +1,7 @@
+# =============================================================================
+# FIMonsec Tool - File Integrity Monitoring Security Solution
+# =============================================================================
+#
 # Author: Keith Pachulski
 # Company: Red Cell Security, LLC
 # Email: keith@redcellsecurity.org
@@ -9,10 +13,10 @@
 #          You are free to use, modify, and distribute this software
 #          in accordance with the terms of the license.
 #
-# Purpose: This script is part of the DumpSec-Py tool, which is designed to
-#          perform detailed security audits on Windows systems. It covers
-#          user rights, services, registry permissions, file/share permissions,
-#          group policy enumeration, risk assessments, and more.
+# Purpose: This script is part of the FIMoniSec Tool, which provides enterprise-grade
+#          system integrity monitoring with real-time alerting capabilities. It monitors
+#          critical system and application files for unauthorized modifications,
+#          supports baseline comparisons, and integrates with SIEM solutions.
 #
 # DISCLAIMER: This software is provided "as-is," without warranty of any kind,
 #             express or implied, including but not limited to the warranties
@@ -23,6 +27,7 @@
 #             in the software.
 #
 # =============================================================================
+
 import socket
 import threading
 import logging
