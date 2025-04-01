@@ -13,7 +13,7 @@
 #          You are free to use, modify, and distribute this software
 #          in accordance with the terms of the license.
 #
-# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
+# Purpose: This script is part of the FIMoniSec Tool, which provides enterprise-grade
 #          system integrity monitoring with real-time alerting capabilities. It monitors
 #          critical system and application files for unauthorized modifications,
 #          supports baseline comparisons, and integrates with SIEM solutions.
