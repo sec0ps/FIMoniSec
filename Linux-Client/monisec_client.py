@@ -64,7 +64,6 @@ def ensure_directories_and_files(base_dir):
         else:
             # Ensure existing directories have correct permissions
             os.chmod(directory, 0o700)
-#            logging.info(f"Updated permissions for directory: {directory}")
     
     # Create files if they don't exist
     for log_file in log_files:
@@ -85,12 +84,9 @@ def ensure_directories_and_files(base_dir):
         else:
             # Ensure existing files have correct permissions
             os.chmod(log_file, 0o600)
- #           logging.info(f"Updated permissions for file: {log_file}")
-    
-#    logging.info(f"Directory and file structure initialized successfully at {base_dir}")
+
     return True
  
-# First, set up basic console logging for startup without basicConfig
 # Define the base directory function
 def get_base_dir():
     """Get the base directory for the application based on script location"""
@@ -367,13 +363,12 @@ def monitor_processes():
                 else:
                     logging.error(f"Failed to restart {name} after multiple attempts")
                     all_running = False
-            else:
-                logging.debug(f"{name} is running with PID {pid}")
+            # Removed debug logging here
         
         # Adaptive sleep: shorter interval if there were issues, longer if stable
         if processes_checked > 0:  # Only sleep if we're monitoring at least one process
             sleep_time = 60 if all_running else 10
-            logging.debug(f"Process monitoring sleeping for {sleep_time} seconds")
+            # Removed debug logging here
             time.sleep(sleep_time)
         else:
             # If no processes to monitor, use a longer sleep
