@@ -1,32 +1,3 @@
-# =============================================================================
-# FIMonsec Tool - File Integrity Monitoring Security Solution
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This script is part of the FIMoniSec Tool, which provides enterprise-grade
-#          system integrity monitoring with real-time alerting capabilities. It monitors
-#          critical system and application files for unauthorized modifications,
-#          supports baseline comparisons, and integrates with SIEM solutions.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
 import os
 import json
 import time
@@ -43,8 +14,8 @@ import shutil
 import pyinotify
 import audit
 from concurrent.futures import ThreadPoolExecutor
+#from monisec_client import BASE_DIR
 
-# Try importing ML libraries - handle gracefully if missing
 try:
     import numpy as np
     import pandas as pd
@@ -62,22 +33,47 @@ ml_model_info = None
 # Global variable for exclusions config
 exclusions = {}
 
-CONFIG_FILE = os.path.abspath("fim.config")
-LOG_DIR = os.path.abspath("./logs")
+def get_base_dir():
+    """Get the base directory for the application based on script location"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+# Set BASE_DIR
+BASE_DIR = get_base_dir()
+
+# Define all paths relative to BASE_DIR
+CONFIG_FILE = os.path.join(BASE_DIR, "fim.config")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "file_monitor.json")
-OUTPUT_DIR = os.path.abspath("./output")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 PID_FILE = os.path.join(OUTPUT_DIR, "fim.pid")
 HASH_FILE = os.path.join(OUTPUT_DIR, "file_hashes.txt")
 INTEGRITY_STATE_FILE = os.path.join(OUTPUT_DIR, "integrity_state.json")
 
-def ensure_log_file():
-    """Ensure that the log directory and log file exist with appropriate permissions."""
-    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)  # Ensure directory exists with correct permissions
-    if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "w") as f:
-            json.dump([], f)
-    os.chmod(LOG_FILE, 0o600)
+def load_config():
+    """Load configuration settings from fim.config file."""
+    if not os.path.exists(CONFIG_FILE):
+        print("[ERROR] Configuration file not found. Creating default config...")
+        create_default_config()
+        return load_config()  # Reload after creating the default config
 
+    with open(CONFIG_FILE, "r") as f:
+        try:
+            config = json.load(f)
+#            print(f"[DEBUG] Loaded config: {json.dumps(config, indent=4)}")  # Debugging line
+
+            # Ensure the 'siem_settings' key exists
+            if "siem_settings" not in config:
+                print("[WARNING] 'siem_settings' key missing in fim.config.")
+                audit.configure_siem()  # Prompt user for SIEM settings
+                return load_config()  # Reload config after setting SIEM
+
+            return config
+
+        except json.JSONDecodeError:
+            print("[ERROR] Invalid JSON format in fim.config. Creating a new default config...")
+            create_default_config()  # Create default config if JSON is invalid
+            return load_config()  # Reload the default config
+            
 def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None, changes=None):
     """Log file change events with exact details of what changed."""
     global ml_model_info
@@ -126,87 +122,6 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
     audit.send_to_siem(log_entry)
     
     return log_entry
-
-def ensure_output_dir():
-    """Ensure that the output directory exists with appropriate permissions."""
-    os.makedirs(OUTPUT_DIR, mode=0o700, exist_ok=True)
-
-def create_default_config():
-    """Create a default configuration file if it does not exist and set permissions."""
-    default_config = {
-        "scheduled_scan": {
-            "directories": ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/var/www"],
-            "scan_interval": 60
-        },
-        "real_time_monitoring": {
-            "directories": ["/var/www"]
-        },
-        "exclusions": {
-            "directories": ["/var/log"],
-            "files": [
-                "/etc/mnttab",
-                "/etc/mtab",
-                "/etc/hosts.deny",
-                "/etc/mail/statistics",
-                "/etc/random-seed",
-                "/etc/adjtime",
-                "/etc/httpd/logs",
-                "/etc/utmpx",
-                "/etc/wtmpx",
-                "/etc/cups/certs",
-                "/etc/dumpdates",
-                "/etc/svc/volatile"
-            ],
-            "patterns": ["*.tmp", "*.log", "*.swp", "*~"],
-            "extensions": [".bak", ".tmp", ".swp", ".cache"],
-            "max_size": 1073741824  # 1GB
-        },
-        "performance": {
-            "worker_threads": os.cpu_count() or 4,
-            "chunk_size": 65536  # Default chunk size for hash calculation
-        },
-        "siem_settings": {
-            "enabled": False,  # Default to disabled
-            "siem_server": "",
-            "siem_port": 0
-        },
-        "instructions": {
-            "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
-            "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
-            "exclusions": "Specify directories or files to be excluded from scanning and monitoring.",
-            "performance": "Adjust performance settings based on system resources.",
-            "siem_settings": "Set 'enabled' to true, and provide 'siem_server' and 'siem_port' for SIEM logging."
-        }
-    }
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(default_config, f, indent=4)
-    os.chmod(CONFIG_FILE, 0o600)
-    print(f"[INFO] Default configuration file created at {CONFIG_FILE}. Please update it as needed.")
-
-def load_config():
-    """Load configuration settings from fim.config file."""
-    if not os.path.exists(CONFIG_FILE):
-        print("[ERROR] Configuration file not found. Creating default config...")
-        create_default_config()
-        return load_config()  # Reload after creating the default config
-
-    with open(CONFIG_FILE, "r") as f:
-        try:
-            config = json.load(f)
-#            print(f"[DEBUG] Loaded config: {json.dumps(config, indent=4)}")  # Debugging line
-
-            # Ensure the 'siem_settings' key exists
-            if "siem_settings" not in config:
-                print("[WARNING] 'siem_settings' key missing in fim.config.")
-                audit.configure_siem()  # Prompt user for SIEM settings
-                return load_config()  # Reload config after setting SIEM
-
-            return config
-
-        except json.JSONDecodeError:
-            print("[ERROR] Invalid JSON format in fim.config. Creating a new default config...")
-            create_default_config()  # Create default config if JSON is invalid
-            return load_config()  # Reload the default config
 
 def process_file(filepath, file_hashes, integrity_state):
     """Process a single file for hashing and metadata tracking."""
@@ -414,16 +329,125 @@ def save_file_hashes(file_hashes):
     os.chmod(HASH_FILE, 0o600)
 
 def load_integrity_state():
-    """Load previous integrity state from the integrity_state.json file."""
+    """Load previous integrity state from the integrity_state.json file with error handling."""
     if os.path.exists(INTEGRITY_STATE_FILE):
-        with open(INTEGRITY_STATE_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(INTEGRITY_STATE_FILE, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Corrupted integrity state file: {e}")
+            print("[INFO] Creating backup of corrupted file and starting with empty state")
+            
+            # Create backup of corrupted file
+            backup_file = f"{INTEGRITY_STATE_FILE}.corrupt_{int(time.time())}"
+            try:
+                shutil.copy(INTEGRITY_STATE_FILE, backup_file)
+                print(f"[INFO] Backup created at: {backup_file}")
+            except Exception as backup_error:
+                print(f"[ERROR] Failed to create backup: {backup_error}")
+            
+            # Try to repair the JSON file if possible
+            try:
+                repaired = repair_json_file(INTEGRITY_STATE_FILE)
+                if repaired:
+                    print("[INFO] Successfully repaired integrity state file")
+                    with open(INTEGRITY_STATE_FILE, "r") as f:
+                        return json.load(f)
+            except Exception as repair_error:
+                print(f"[ERROR] Could not repair file: {repair_error}")
+            
+            # If repair failed or wasn't attempted, create an empty state
+            return {}
     return {}
 
+def repair_json_file(file_path):
+    """Attempt to repair a corrupted JSON file by finding and fixing syntax errors."""
+    try:
+        with open(file_path, "r") as f:
+            content = f.read()
+        
+        # Common JSON corruption patterns and fixes
+        # 1. Truncated file - add missing closing braces
+        if content.count('{') > content.count('}'):
+            content += '}' * (content.count('{') - content.count('}'))
+        
+        # 2. Handle trailing commas in arrays/objects
+        content = re.sub(r',\s*}', '}', content)
+        content = re.sub(r',\s*]', ']', content)
+        
+        # 3. Fix unescaped quotes in strings
+        # This is a simplified approach - a full repair might need more sophisticated handling
+        
+        # Test if the repaired content is valid JSON
+        json.loads(content)
+        
+        # If we got here, the repair worked - write it back
+        with open(file_path, "w") as f:
+            f.write(content)
+        
+        return True
+    except Exception as e:
+        print(f"[ERROR] Repair attempt failed: {e}")
+        
+        # If repair failed, create a new empty JSON object
+        try:
+            with open(file_path, "w") as f:
+                f.write('{}')
+            return True
+        except Exception as write_error:
+            print(f"[ERROR] Failed to write new empty file: {write_error}")
+            return False
+
 def save_integrity_state(state):
-    """Save the integrity state to the integrity_state.json file."""
-    with open(INTEGRITY_STATE_FILE, "w") as f:
-        json.dump(state, f, indent=4)
+    """Save the integrity state to the integrity_state.json file with validation."""
+    if not isinstance(state, dict):
+        print(f"[ERROR] Invalid integrity state type: {type(state)}. Expected dict.")
+        return False
+    
+    # Create a temporary file first
+    temp_file = f"{INTEGRITY_STATE_FILE}.tmp"
+    
+    try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(INTEGRITY_STATE_FILE), exist_ok=True)
+        
+        # Validate the state can be serialized to JSON
+        json_data = json.dumps(state, indent=4)
+        
+        # Write to temporary file first
+        with open(temp_file, "w") as f:
+            f.write(json_data)
+        
+        # Verify the file was written correctly by reading it back
+        with open(temp_file, "r") as f:
+            json.load(f)
+        
+        # Create a backup of the current file if it exists
+        if os.path.exists(INTEGRITY_STATE_FILE):
+            backup_file = f"{INTEGRITY_STATE_FILE}.bak"
+            try:
+                shutil.copy(INTEGRITY_STATE_FILE, backup_file)
+            except Exception as e:
+                print(f"[WARNING] Failed to create backup: {e}")
+        
+        # Move the temp file to the final location
+        shutil.move(temp_file, INTEGRITY_STATE_FILE)
+        
+        # Set permissions
+        os.chmod(INTEGRITY_STATE_FILE, 0o600)
+        
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to save integrity state: {e}")
+        
+        # If anything went wrong, try to remove the temp file
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        
+        return False
 
 def get_file_metadata(filepath):
     """Retrieve metadata of a file while tracking but ignoring last accessed time."""
@@ -545,31 +569,40 @@ class EventHandler(pyinotify.ProcessEvent):
             update_file_tracking(full_path, file_hash, metadata)
 
 def monitor_changes(real_time_directories, exclusions):
-    """Monitors file system changes using pyinotify with enhanced detection."""
+    """Monitors file system changes using pyinotify with enhanced detection and error handling."""
     global file_hashes, integrity_state
-    file_hashes = load_file_hashes()
-    integrity_state = load_integrity_state()
+    
+    try:
+        file_hashes = load_file_hashes()
+        integrity_state = load_integrity_state()
 
-    wm = pyinotify.WatchManager()
-    handler = EventHandler()
-    notifier = pyinotify.Notifier(wm, handler)
+        wm = pyinotify.WatchManager()
+        handler = EventHandler()
+        notifier = pyinotify.Notifier(wm, handler)
 
-    # Watch all directories and subdirectories
-    for directory in real_time_directories:
-        if directory in exclusions.get("directories", []):
-            continue
+        # Watch all directories and subdirectories
+        for directory in real_time_directories:
+            if directory in exclusions.get("directories", []):
+                continue
+            
+            try:
+                mask = pyinotify.IN_CREATE | pyinotify.IN_DELETE | pyinotify.IN_MODIFY | pyinotify.IN_ATTRIB
+                wm.add_watch(directory, mask, rec=True, auto_add=True)
+                print(f"[INFO] Watching directory: {directory}")
+            except Exception as e:
+                print(f"[ERROR] Failed to watch directory {directory}: {e}")
+
+        print("[INFO] Real-time monitoring started using pyinotify...")
+
+        # Start monitoring
+        notifier.loop()
+    except Exception as e:
+        print(f"[ERROR] Real-time monitoring thread crashed: {e}")
+        print("[INFO] Attempting to restart real-time monitoring in 10 seconds...")
+        time.sleep(10)
         
-        try:
-            mask = pyinotify.IN_CREATE | pyinotify.IN_DELETE | pyinotify.IN_MODIFY | pyinotify.IN_ATTRIB
-            wm.add_watch(directory, mask, rec=True, auto_add=True)
-            print(f"[INFO] Watching directory: {directory}")
-        except Exception as e:
-            print(f"[ERROR] Failed to watch directory {directory}: {e}")
-
-    print("[INFO] Real-time monitoring started using pyinotify...")
-
-    # Start monitoring
-    notifier.loop()
+        # Recursive call to restart the monitoring
+        monitor_changes(real_time_directories, exclusions)
 
 def remove_file_tracking(file_path):
     """Remove deleted file from tracking."""
@@ -739,8 +772,8 @@ def run_monitor():
     signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
     signal.signal(signal.SIGTERM, handle_shutdown)  # kill <pid>
 
-    ensure_log_file()
-    ensure_output_dir()
+#    ensure_log_file()
+#    ensure_output_dir()
     config = load_config()
     scheduled_scan = config.get("scheduled_scan", {})
     real_time_monitoring = config.get("real_time_monitoring", {})
