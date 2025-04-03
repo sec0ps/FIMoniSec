@@ -122,17 +122,46 @@ fi
 # Install Python requirements
 su - fimonisec -c "cd /opt/FIMoniSec && pip install -r requirements.txt" || error_exit "Failed to install Python requirements"
 
-# Step 6: Install YARA
+# Step 6: Add Python local bin to PATH for both current user and fimonisec
+status_message "Adding Python local bin directories to PATH..."
+
+# For fimonisec user
+if ! grep -q 'PATH="$HOME/.local/bin:$PATH"' /opt/FIMoniSec/.bashrc 2>/dev/null; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> /opt/FIMoniSec/.bashrc
+    chown fimonisec:fimonisec /opt/FIMoniSec/.bashrc
+fi
+
+# For current user (if not root)
+if [ "$CURRENT_USER" != "root" ]; then
+    USER_HOME=$(eval echo ~$CURRENT_USER)
+    if [ -d "$USER_HOME" ]; then
+        if ! grep -q 'PATH="$HOME/.local/bin:$PATH"' $USER_HOME/.bashrc 2>/dev/null; then
+            echo 'export PATH="$HOME/.local/bin:$PATH"' >> $USER_HOME/.bashrc
+            chown $CURRENT_USER: $USER_HOME/.bashrc
+        fi
+    fi
+fi
+
+# Also add it to system-wide profile to take effect immediately
+if [ ! -f "/etc/profile.d/fimonisec_path.sh" ]; then
+    echo 'export PATH="/opt/FIMoniSec/.local/bin:$PATH"' > /etc/profile.d/fimonisec_path.sh
+    chmod +x /etc/profile.d/fimonisec_path.sh
+fi
+
+# Export it for the current session
+export PATH="/opt/FIMoniSec/.local/bin:$PATH"
+
+# Step 7: Install YARA
 status_message "Installing YARA..."
 apt-get update
 apt-get install -y yara || error_exit "Failed to install YARA"
 
-# Step 7: Set up proper permissions for the FIMoniSec directory
+# Step 8: Set up proper permissions for the FIMoniSec directory
 status_message "Setting up proper permissions..."
 chmod -R 750 /opt/FIMoniSec
 chmod -R g+s /opt/FIMoniSec/logs 2>/dev/null || mkdir -p /opt/FIMoniSec/logs && chmod -R g+s /opt/FIMoniSec/logs
 
-# Step 8: Detect the init system
+# Step 9: Detect the init system
 INIT_SYSTEM=""
 if command -v systemctl >/dev/null 2>&1; then
     INIT_SYSTEM="systemd"
@@ -145,10 +174,6 @@ else
 fi
 
 status_message "Detected init system: $INIT_SYSTEM"
-
-# Create client service if needed
-if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "Creating FIMoniSec client service..."
     
     if [ "$INIT_SYSTEM" = "systemd" ]; then
         # Create systemd service for client
@@ -548,9 +573,9 @@ if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
     status_message "Client control script: /opt/FIMoniSec/control-client.sh"
     
     # Ask if user wants to start the client service now
-    read -p "Do you want to start the FIMoniSec client service now? (y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    status_message "Do you want to start the FIMoniSec client service now? (y/n): "
+    read REPLY
+    if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
         if [ "$INIT_SYSTEM" = "systemd" ]; then
             systemctl start fimonisec-client
         elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
@@ -567,9 +592,9 @@ if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
     status_message "Server control script: /opt/FIMoniSec/control-server.sh"
     
     # Ask if user wants to start the server service now
-    read -p "Do you want to start the FIMoniSec server service now? (y/n): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    status_message "Do you want to start the FIMoniSec server service now? (y/n): "
+    read REPLY
+    if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
         if [ "$INIT_SYSTEM" = "systemd" ]; then
             systemctl start fimonisec-server
         elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
