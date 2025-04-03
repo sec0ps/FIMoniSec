@@ -1,3 +1,7 @@
+# =============================================================================
+# FIMonsec Tool - File Integrity Monitoring Security Solution
+# =============================================================================
+#
 # Author: Keith Pachulski
 # Company: Red Cell Security, LLC
 # Email: keith@redcellsecurity.org
@@ -9,10 +13,10 @@
 #          You are free to use, modify, and distribute this software
 #          in accordance with the terms of the license.
 #
-# Purpose: This script is part of the DumpSec-Py tool, which is designed to
-#          perform detailed security audits on Windows systems. It covers
-#          user rights, services, registry permissions, file/share permissions,
-#          group policy enumeration, risk assessments, and more.
+# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
+#          system integrity monitoring with real-time alerting capabilities. It monitors
+#          critical system and application files for unauthorized modifications,
+#          supports baseline comparisons, and integrates with SIEM solutions.
 #
 # DISCLAIMER: This software is provided "as-is," without warranty of any kind,
 #             express or implied, including but not limited to the warranties
@@ -226,14 +230,22 @@ def print_help():
     print("""
 Usage: python monisec-server.py [command] [client_name]
 
-Commands:
-  add-agent <agent_name>     Add a new client and generate a unique PSK.
-  remove-agent <agent_name>  Remove an existing client.
-  list-agents                 List all registered clients.
-  configure-siem               Configure SIEM settings for log forwarding.
-  -d                         Launch the MoniSec Server as a daemon.
-  stop                       Stop the running MoniSec Server daemon.
-  -h, --help                   Show this help message.
+Management Commands:
+  add-agent <agent_name>         Add a new client and generate a unique PSK.
+  remove-agent <agent_name>      Remove an existing client.
+  list-agents                    List all registered clients.
+  configure-siem                 Configure SIEM settings for log forwarding.
+
+Remote Commands:
+  restart-service <client> <svc> Restart a service on a client (monisec_client, fim_client, pim, lim).
+  yara-scan <client> <path>      Run a YARA scan on a client.
+  ir-shell <client>              Spawn an incident response shell on a client.
+  update-client <client>         Trigger a client update.
+
+Server Control:
+  -d                             Launch the MoniSec Server as a daemon.
+  stop                           Stop the running MoniSec Server daemon.
+  -h, --help                     Show this help message.
 
 If no command is provided, the server will start normally.
 """)
@@ -273,6 +285,82 @@ if __name__ == "__main__":
         elif action == "configure-siem":
             server_siem.configure_siem()
             sys.exit(0)
+            
+        elif action == "restart-service":
+            if len(sys.argv) < 4:
+                print("[ERROR] Usage: python monisec-server.py restart-service <client_name> <service>")
+                print("Services: monisec_client, fim_client, pim, lim")
+                sys.exit(1)
+                
+            client_name = sys.argv[2]
+            service = sys.argv[3]
+            
+            print(f"[INFO] Sending restart command for {service} to {client_name}...")
+            result = clients.restart_client_service(client_name, service)
+            
+            if result.get("status") == "success":
+                print(f"[SUCCESS] {service} restarted on {client_name}")
+            else:
+                print(f"[ERROR] Failed to restart {service} on {client_name}: {result.get('message')}")
+            sys.exit(0)
+
+        elif action == "yara-scan":
+            if len(sys.argv) < 4:
+                print("[ERROR] Usage: python monisec-server.py yara-scan <client_name> <target_path> [rule_name]")
+                sys.exit(1)
+                
+            client_name = sys.argv[2]
+            target_path = sys.argv[3]
+            rule_name = sys.argv[4] if len(sys.argv) > 4 else None
+            
+            print(f"[INFO] Triggering YARA scan on {client_name} for path {target_path}...")
+            result = clients.run_yara_scan(client_name, target_path, rule_name)
+            
+            if result.get("status") == "success":
+                print(f"[SUCCESS] YARA scan completed on {client_name}")
+                scan_results = result.get("results", [])
+                if scan_results:
+                    print(f"Found {len(scan_results)} matches:")
+                    for match in scan_results:
+                        print(f"  - Rule: {match.get('rule')}")
+                        print(f"    File: {match.get('file')}")
+                        print(f"    Tags: {', '.join(match.get('tags', []))}")
+                        print("")
+                else:
+                    print("No YARA matches found.")
+            else:
+                print(f"[ERROR] YARA scan failed on {client_name}: {result.get('message')}")
+            sys.exit(0)
+
+        elif action == "ir-shell":
+            if len(sys.argv) < 3:
+                print("[ERROR] Usage: python monisec-server.py ir-shell <client_name>")
+                sys.exit(1)
+                
+            client_name = sys.argv[2]
+            
+            print(f"[INFO] Establishing IR shell with {client_name}...")
+            clients.spawn_ir_shell(client_name)
+            # The function will handle the interactive shell session
+            sys.exit(0)
+
+        elif action == "update-client":
+            if len(sys.argv) < 3:
+                print("[ERROR] Usage: python monisec-server.py update-client <client_name>")
+                sys.exit(1)
+                
+            client_name = sys.argv[2]
+            
+            print(f"[INFO] Triggering update on {client_name}...")
+            result = clients.update_client(client_name)
+            
+            if result.get("status") == "success":
+                print(f"[SUCCESS] Update triggered on {client_name}")
+                update_info = result.get("update_info", {})
+                print(f"New version: {update_info.get('version', 'Unknown')}")
+            else:
+                print(f"[ERROR] Failed to update {client_name}: {result.get('message')}")
+            sys.exit(0)
 
         elif action == "-d":
             print("[INFO] Daemonizing MoniSec Server...")
@@ -307,6 +395,10 @@ if __name__ == "__main__":
                 sys.exit(1)
 
             sys.exit(0)
+        
+        else:
+            print("Unknown command. Use --help for available commands.")
+            sys.exit(1)
 
     # No CLI args or unrecognized input — start server in foreground
     siem_config = server_siem.load_siem_config()
