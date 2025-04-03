@@ -13,7 +13,7 @@
 #          You are free to use, modify, and distribute this software
 #          in accordance with the terms of the license.
 #
-# Purpose: This script is part of the FIMoniSec Tool, which provides enterprise-grade
+# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
 #          system integrity monitoring with real-time alerting capabilities. It monitors
 #          critical system and application files for unauthorized modifications,
 #          supports baseline comparisons, and integrates with SIEM solutions.
@@ -32,6 +32,7 @@ import os
 import json
 import logging
 import yaml
+import sys
 from pathlib import Path
 
 class ConfigManager:
@@ -61,22 +62,31 @@ class ConfigManager:
         }
     }
     
-    def __init__(self, config_file=None):
+    def __init__(self, base_dir=None, config_file=None):
         """Initialize the configuration manager"""
-        self.config_file = config_file or self.DEFAULT_CONFIG_FILE
+        self.base_dir = base_dir
+        
+        # If config_file is provided, use it directly; otherwise construct it from base_dir
+        if config_file:
+            self.config_file = config_file
+        elif base_dir:
+            self.config_file = os.path.join(base_dir, self.DEFAULT_CONFIG_FILE)
+        else:
+            self.config_file = self.DEFAULT_CONFIG_FILE
         
         # Set up logging
         self.logger = logging.getLogger("lim.config")
+        
+        # Check if config file exists
+        if not os.path.exists(self.config_file):
+            self.logger.error(f"Configuration file {self.config_file} not found.")
+            raise FileNotFoundError(f"Configuration file {self.config_file} not found.")
         
         # Load configuration
         self.config = self.load_config()
         
     def load_config(self):
-        """Load configuration from file or create default if not exists"""
-        if not os.path.exists(self.config_file):
-            self.logger.warning(f"Configuration file {self.config_file} not found. Creating default config.")
-            return self._create_default_config()
-            
+        """Load configuration from file and merge with default settings"""
         try:
             # Determine file type by extension
             if self.config_file.endswith('.yaml') or self.config_file.endswith('.yml'):
@@ -86,29 +96,27 @@ class ConfigManager:
                 # Default to JSON
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
-                
-            # Ensure log_integrity_monitor section exists
-            if "log_integrity_monitor" not in config:
-                config["log_integrity_monitor"] = self.DEFAULT_CONFIG["log_integrity_monitor"]
-                self.save_config(config)
-                
-            # Ensure all required fields exist
-            self._ensure_config_structure(config)
+            
+            # Merge log_integrity_monitor settings with defaults
+            self._merge_defaults(config)
+            
+            # Save the updated config with merged defaults
+            self.save_config(config)
             
             return config
         except Exception as e:
             self.logger.error(f"Error loading configuration: {str(e)}")
-            return self._create_default_config()
+            raise
     
-    def _create_default_config(self):
-        """Create and save a default configuration"""
-        config = self.DEFAULT_CONFIG.copy()
-        self.save_config(config)
-        return config
-    
-    def _ensure_config_structure(self, config):
-        """Ensure all required configuration sections and fields exist"""
-        lim_config = config.get("log_integrity_monitor", {})
+    def _merge_defaults(self, config):
+        """Merge the default settings into the existing config"""
+        # Ensure log_integrity_monitor section exists
+        if "log_integrity_monitor" not in config:
+            config["log_integrity_monitor"] = self.DEFAULT_CONFIG["log_integrity_monitor"]
+            return
+            
+        # Get existing log_integrity_monitor configuration
+        lim_config = config["log_integrity_monitor"]
         default_lim = self.DEFAULT_CONFIG["log_integrity_monitor"]
         
         # Check for each field and use default if missing
@@ -127,7 +135,7 @@ class ConfigManager:
         
         # Update the config
         config["log_integrity_monitor"] = lim_config
-        
+    
     def save_config(self, config=None):
         """Save configuration to file"""
         if config is None:
@@ -200,7 +208,7 @@ class ConfigManager:
             
         # Update configuration
         self.config["log_integrity_monitor"]["log_categories"] = log_categories
-        self.config["log_integrity_monitor"]["monitored_logs"] = sorted(all_logs)
+        self.config["log_integrity_monitor"]["monitored_logs"] = sorted(list(set(all_logs)))  # Remove duplicates
         
         # Save the updated configuration
         return self.save_config()
@@ -304,11 +312,6 @@ class ConfigManager:
                 
         return self.save_config()
     
-    def reset_to_defaults(self):
-        """Reset configuration to default values"""
-        self.config = self.DEFAULT_CONFIG.copy()
-        return self.save_config()
-
     def validate_config(self):
         """
         Validate the configuration
