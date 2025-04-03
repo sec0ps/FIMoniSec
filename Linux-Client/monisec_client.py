@@ -41,6 +41,12 @@ import updater
 import yara
 from pathlib import Path
 
+# Define BASE_DIR as a static path
+BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+
+# Define CONFIG_FILE using the BASE_DIR
+CONFIG_FILE = os.path.join(BASE_DIR, "fim.config")
+
 def ensure_directories_and_files(base_dir):
     # Define the directory structure
     directories = [
@@ -86,14 +92,6 @@ def ensure_directories_and_files(base_dir):
             os.chmod(log_file, 0o600)
 
     return True
- 
-# Define the base directory function
-def get_base_dir():
-    """Get the base directory for the application based on script location"""
-    return os.path.dirname(os.path.abspath(__file__))
-
-# Set BASE_DIR
-BASE_DIR = get_base_dir()
 
 # Create directories and files before setting up logging
 ensure_directories_and_files(BASE_DIR)
@@ -128,9 +126,18 @@ PROCESSES = {
     "lim": "python3 lim.py -d",
 }
 
+# Define BASE_DIR as a static path
+BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+
+# Define CONFIG_FILE using the BASE_DIR
+CONFIG_FILE = os.path.join(BASE_DIR, "fim.config")
+
 def create_default_config():
     """Create a default configuration file if it does not exist and set permissions."""
     default_config = {
+        "client_settings": {
+            "BASE_DIR": BASE_DIR
+        },
         "scheduled_scan": {
             "directories": ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/var/www"],
             "scan_interval": 60
@@ -175,33 +182,32 @@ def create_default_config():
             "siem_settings": "Set 'enabled' to true, and provide 'siem_server' and 'siem_port' for SIEM logging."
         }
     }
+    
     with open(CONFIG_FILE, "w") as f:
         json.dump(default_config, f, indent=4)
     os.chmod(CONFIG_FILE, 0o600)
     print(f"[INFO] Default configuration file created at {CONFIG_FILE}. Please update it as needed.")
+    return default_config
 
 def load_or_create_config():
     """
     Load the configuration file if it exists, otherwise create it with default settings.
     The configuration file is expected to be in the BASE_DIR.
     """
-    base_dir = get_base_dir()
-    config_path = os.path.join(base_dir, "fim.config")
-    
     # Check if config file exists
-    if os.path.isfile(config_path):
+    if os.path.isfile(CONFIG_FILE):
         # Load existing config
         try:
-            with open(config_path, 'r') as f:
+            with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
                 
             # Ensure BASE_DIR is set correctly in the loaded config
-            if "general_settings" not in config:
-                config["general_settings"] = {"BASE_DIR": base_dir, "log_level": "INFO"}
+            if "client_settings" not in config:
+                config["client_settings"] = {"BASE_DIR": BASE_DIR}
             else:
-                config["general_settings"]["BASE_DIR"] = base_dir
+                config["client_settings"]["BASE_DIR"] = BASE_DIR
                 
-            print(f"Loaded configuration from {config_path}")
+            print(f"Loaded configuration from {CONFIG_FILE}")
             return config
             
         except Exception as e:
@@ -209,17 +215,9 @@ def load_or_create_config():
             sys.exit(1)
     else:
         # Config doesn't exist, create a new one
-        default_config = create_default_config(base_dir)
-        try:
-            with open(config_path, 'w') as f:
-                json.dump(default_config, f, indent=4)
-                
-            print(f"Created default configuration at {config_path}")
-            return default_config
-            
-        except Exception as e:
-            print(f"Failed to create default configuration file: {e}")
-            sys.exit(1)
+        default_config = create_default_config()
+        print(f"Created default configuration at {CONFIG_FILE}")
+        return default_config
 
 #create default config
 config = load_or_create_config()
