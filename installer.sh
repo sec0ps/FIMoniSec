@@ -47,15 +47,14 @@ done
 
 status_message "Performing $INSTALL_TYPE installation"
 
-# Step 1: Clone the FIMoniSec repository
-status_message "Cloning FIMoniSec repository..."
-if [ -d "FIMoniSec" ]; then
-    status_message "FIMoniSec directory already exists. Removing it to ensure clean installation."
-    rm -rf FIMoniSec
+# Step 1: Verify we're in the FIMoniSec directory
+if [ ! -f "$(pwd)/README.md" ] || [ ! -d "$(pwd)/.git" ]; then
+    status_message "This script should be run from within the FIMoniSec repository."
+    status_message "Please navigate to the FIMoniSec directory and try again."
+    exit 1
 fi
 
-git clone https://github.com/sec0ps/FIMoniSec.git || error_exit "Failed to clone repository"
-status_message "Repository successfully cloned"
+status_message "FIMoniSec repository detected in current directory."
 
 # Step 2: Create fimonisec user and group
 status_message "Creating fimonisec user and group..."
@@ -71,15 +70,23 @@ else
     useradd -m -d /opt/FIMoniSec -g fimonisec -s /bin/bash fimonisec || error_exit "Failed to create fimonisec user"
 fi
 
-# Step 3: Move FIMoniSec directory to /opt
+# Step 3: Move current directory to /opt
 status_message "Moving FIMoniSec to /opt..."
 if [ -d "/opt/FIMoniSec" ]; then
     status_message "Backing up existing /opt/FIMoniSec directory"
     mv /opt/FIMoniSec /opt/FIMoniSec.backup.$(date +%Y%m%d%H%M%S)
 fi
 
-mv FIMoniSec /opt/ || error_exit "Failed to move FIMoniSec to /opt"
+# Get the current directory name
+CURRENT_DIR=$(basename "$(pwd)")
+cd ..
+
+# Move the directory to /opt
+cp -r "$CURRENT_DIR" /opt/FIMoniSec || error_exit "Failed to copy FIMoniSec to /opt"
 chown -R fimonisec:fimonisec /opt/FIMoniSec || error_exit "Failed to set ownership on /opt/FIMoniSec"
+
+# Change to the new directory
+cd /opt/FIMoniSec || error_exit "Failed to change directory to /opt/FIMoniSec"
 
 # Step 4: Modify sudoers file for required commands
 status_message "Updating sudoers file..."
