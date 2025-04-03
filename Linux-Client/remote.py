@@ -1,33 +1,3 @@
-# =============================================================================
-# FIMonsec Tool - File Integrity Monitoring Security Solution
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This script is part of the FIMoniSec Tool, which provides enterprise-grade
-#          system integrity monitoring with real-time alerting capabilities. It monitors
-#          critical system and application files for unauthorized modifications,
-#          supports baseline comparisons, and integrates with SIEM solutions.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
-
 import socket
 import threading
 import logging
@@ -37,8 +7,16 @@ import os
 import hmac
 import hashlib
 import time
+from pathlib import Path
 from client_crypt import encrypt_data
 from monisec_client import start_process, stop_process, restart_process, is_process_running, PROCESSES
+
+def get_base_dir():
+    """Get the base directory for the application based on script location"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+# Set BASE_DIR
+BASE_DIR = get_base_dir()
 
 CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
 CLIENT_PORT = 6000       # Port for receiving commands
@@ -46,19 +24,47 @@ AUTH_TOKEN_FILE = "auth_token.json"
 LOG_FILES = ["./logs/file_monitor.json"]
 LOG_FILE = "./logs/file_monitor.json"
 
+def should_start_listener():
+    """
+    Checks if the auth_token.json file exists in BASE_DIR.
+    Returns True if the file exists, False otherwise.
+    """
+    token_path = Path(BASE_DIR) / AUTH_TOKEN_FILE
+    return token_path.exists()
+
+def start_listener_if_authorized():
+    """
+    Starts the listening service only if the auth_token.json file exists.
+    """
+    if should_start_listener():
+        # Start the listening service
+        start_client_listener()  # Changed from start_listener to start_client_listener
+        logging.info(f"Listening service started on {CLIENT_HOST}:{CLIENT_PORT}")
+    else:
+        logging.info("Auth token file not found. Listening service not started.")
+        
 def start_client_listener():
     """Starts a TCP server to receive and execute remote commands from monisec-server."""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((CLIENT_HOST, CLIENT_PORT))
-    server_socket.listen(5)
-    logging.info(f"MoniSec client listening for commands on {CLIENT_HOST}:{CLIENT_PORT}")
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Ensure this is working
+    
+    # Add a small delay to ensure the socket is properly released
+    time.sleep(1)
+    
+    try:
+        server_socket.bind((CLIENT_HOST, CLIENT_PORT))
+        server_socket.listen(5)
+        logging.info(f"MoniSec client listening for commands on {CLIENT_HOST}:{CLIENT_PORT}")
 
-    while True:
-        client_socket, addr = server_socket.accept()
-        logging.info(f"Received connection from {addr}")
-        client_thread = threading.Thread(target=handle_server_commands, args=(client_socket,))
-        client_thread.start()
+        while True:
+            client_socket, addr = server_socket.accept()
+            logging.info(f"Received connection from {addr}")
+            client_thread = threading.Thread(target=handle_server_commands, args=(client_socket,))
+            client_thread.start()
+    except OSError as e:
+        logging.error(f"Could not start listening service: {e}")
+        # Gracefully exit or handle the error
+        return
 
 def handle_server_commands(client_socket):
     """Handles incoming commands from monisec-server and executes only allowed actions."""
@@ -439,3 +445,4 @@ def check_auth_and_send_logs():
             logging.error(f"[ERROR] Failed to parse auth_token.json: {e}")
     else:
         logging.info("[INFO] No authentication token found. Logging locally only.")
+
