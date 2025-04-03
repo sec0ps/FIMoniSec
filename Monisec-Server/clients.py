@@ -13,7 +13,7 @@
 #          You are free to use, modify, and distribute this software
 #          in accordance with the terms of the license.
 #
-# Purpose: This script is part of the FIMoniSec Tool, which provides enterprise-grade
+# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
 #          system integrity monitoring with real-time alerting capabilities. It monitors
 #          critical system and application files for unauthorized modifications,
 #          supports baseline comparisons, and integrates with SIEM solutions.
@@ -229,7 +229,6 @@ def receive_chunked_data(client_socket):
                 bytes_received += len(buffer)
             
             full_data.extend(chunk)
-            logging.debug(f"Received chunk of {chunk_size} bytes, total so far: {len(full_data)}")
         
         return bytes(full_data)
     except Exception as e:
@@ -267,16 +266,21 @@ def handle_client(client_socket, client_address):
             client_name = auth_payload.get("client_name")
             if not client_name:
                 raise ValueError("Missing client_name")
-        except Exception:
-            logging.warning(f"[AUTH] Invalid handshake from {client_address}. Dropping connection.")
+        except Exception as e:
+            logging.warning(f"[AUTH] Invalid handshake from {client_address}: {e}")
+            logging.warning(f"[AUTH] Raw data: {raw[:100].hex()}")
             client_socket.close()
             return
 
         # Step 2: Load PSK for the client
         try:
-            psk = server_crypt.load_psk(client_name)
-        except ValueError:
-            logging.warning(f"[AUTH] Unknown client '{client_name}' from {client_address}. Dropping connection.")
+            psk = server_crypt.load_psks(client_name)
+        except ValueError as e:
+            logging.warning(f"[AUTH] Unknown client '{client_name}' from {client_address}: {e}")
+            client_socket.close()
+            return
+        except Exception as e:
+            logging.error(f"[AUTH] Error loading PSK for '{client_name}': {e}")
             client_socket.close()
             return
 
@@ -304,13 +308,10 @@ def handle_client(client_socket, client_address):
                     # If the first 4 bytes represent a reasonable chunk size,
                     # assume this is a chunked message
                     if 0 < potential_size < 8192:
-                        logging.debug(f"Detected potential chunked message (size: {potential_size})")
                         # Read the chunked data using the existing function
                         encrypted_data = receive_chunked_data(client_socket)
                         if not encrypted_data:
-                            logging.error("Failed to receive chunked data completely")
                             break
-                        logging.debug(f"Successfully received chunked data: {len(encrypted_data)} bytes")
                     else:
                         # Not a chunked message, use standard receive
                         encrypted_data = client_socket.recv(4096)
@@ -320,17 +321,20 @@ def handle_client(client_socket, client_address):
                     # Not enough bytes to determine, use standard receive
                     encrypted_data = client_socket.recv(4096)
                     if not encrypted_data:
+                        logging.info("Client disconnected (standard receive, not enough bytes)")
                         break
             except Exception as e:
-                logging.error(f"Error detecting message type: {e}")
                 # Fall back to standard receive
                 encrypted_data = client_socket.recv(4096)
                 if not encrypted_data:
+                    logging.info("Client disconnected (fallback receive)")
                     break
             
             # Process the received data
             try:
+                
                 log_data = server_crypt.decrypt_data_with_psk(psk, encrypted_data)
+                
                 logs = log_data.get("logs", [])
 
                 if isinstance(logs, dict):
@@ -349,15 +353,14 @@ def handle_client(client_socket, client_address):
                     # Forward to SIEM if configured
                     server_siem.forward_log_to_siem(log_entry, client_name)
 
-                logging.info(f"[RECV] Received {len(logs)} logs from {client_name}")
                 client_socket.sendall(b"ACK")
             except Exception as e:
-                logging.error(f"Decryption failed: {str(e)}")
                 logging.info(f"[RECV] Received 0 logs from {client_name}")
                 # Try to send ACK to maintain connection
                 try:
                     client_socket.sendall(b"ACK")
-                except:
+                except Exception as send_err:
+                    logging.error(f"Failed to send ACK: {str(send_err)}")
                     break
 
     except Exception as e:
@@ -402,21 +405,206 @@ def receive_chunked_data(client_socket):
                 bytes_received += len(buffer)
             
             full_data.extend(chunk)
-            logging.debug(f"Received chunk of {chunk_size} bytes, total so far: {len(full_data)}")
         
         return bytes(full_data)
     except Exception as e:
         logging.error(f"Error receiving chunked data: {e}")
         return None
         
-# Function to send commands to clients
-def send_command(client_ip, command):
+def get_client_ip_by_name(client_name):
+    """Retrieve a client's IP address by name from PSK store."""
+    psks = load_psks()
+    
+    for agent_id, agent_data in psks.items():
+        if agent_data["AgentName"] == client_name:
+            return agent_data["AgentIP"]
+    
+    return None
+
+def send_command_to_client(client_name, command, params=None):
+    """
+    Send a command to a specific client.
+    
+    Args:
+        client_name (str): The name of the client to send the command to
+        command (str): Command type (restart, yara-scan, ir-shell)
+        params (dict, optional): Additional parameters for the command
+        
+    Returns:
+        dict: Result of the command execution
+    """
+    # Get client IP from name
+    client_ip = get_client_ip_by_name(client_name)
+    if not client_ip:
+        logging.error(f"[ERROR] Unknown client: {client_name}")
+        return {"status": "error", "message": f"Unknown client: {client_name}"}
+    
+    # Build command payload
+    command_payload = {
+        "command": command,
+        "params": params or {}
+    }
+    
     try:
+        # Load PSK for this client - FIX: use proper PSK loading method
+        # Original line that causes the error:
+        # psk = load_psks(client_name)
+        
+        # Fixed version - load all PSKs and then find the one for this client:
+        psks = load_psks()
+        client_psk = None
+        
+        for agent_data in psks.values():
+            if agent_data["AgentName"] == client_name:
+                client_psk = bytes.fromhex(agent_data["AgentPSK"])
+                break
+                
+        if not client_psk:
+            logging.error(f"[ERROR] No PSK found for client: {client_name}")
+            return {"status": "error", "message": f"No PSK found for client: {client_name}"}
+        
+        # Connect to client's command port
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.connect((client_ip, PORT))
-        client_socket.sendall(f"COMMAND:{command}".encode("utf-8"))
-        response = client_socket.recv(1024).decode("utf-8")
-        logging.info(f"Client {client_ip} response: {response}")
-        client_socket.close()
+        client_socket.settimeout(10)  # 10 second timeout
+        
+        # Try to connect to the client's command port (6000)
+        try:
+            client_socket.connect((client_ip, 6000))
+            logging.info(f"[COMMAND] Connected to client {client_name} at {client_ip}:6000")
+        except Exception as e:
+            logging.error(f"[ERROR] Failed to connect to client {client_name} at {client_ip}:6000: {e}")
+            return {"status": "error", "message": f"Connection failed: {e}"}
+        
+        # Encrypt the command
+        serialized_command = json.dumps(command_payload)
+        encrypted_command = server_crypt.encrypt_data(client_psk, serialized_command)
+        
+        # Send the encrypted command
+        client_socket.sendall(encrypted_command)
+        logging.info(f"[COMMAND] Sent '{command}' to {client_name}")
+        
+        # Wait for response (with timeout)
+        try:
+            client_socket.settimeout(30)  # Longer timeout for response
+            encrypted_response = client_socket.recv(8192)
+            if not encrypted_response:
+                return {"status": "error", "message": "Empty response from client"}
+                
+            response_data = server_crypt.decrypt_data_with_psk(client_psk, encrypted_response)
+            logging.info(f"[COMMAND] Received response from {client_name}: {response_data.get('status', 'unknown')}")
+            return response_data
+        except socket.timeout:
+            return {"status": "error", "message": "Response timeout"}
+        
     except Exception as e:
-        logging.error(f"Error sending command to {client_ip}: {e}")
+        logging.error(f"[ERROR] Failed to send command to {client_name}: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        if 'client_socket' in locals():
+            client_socket.close()
+
+# Command-specific functions
+def restart_client_service(client_name, service):
+    """
+    Restart a specific service on a client.
+    
+    Args:
+        client_name (str): Client name
+        service (str): Service to restart (monisec_client, fim_client, pim, lim)
+        
+    Returns:
+        dict: Result of the restart operation
+    """
+    if service not in ["monisec_client", "fim_client", "pim", "lim"]:
+        return {"status": "error", "message": f"Invalid service: {service}"}
+        
+    return send_command_to_client(client_name, "restart", {"service": service})
+
+def run_yara_scan(client_name, target_path, rule_name=None):
+    """
+    Run a YARA scan on a client.
+    
+    Args:
+        client_name (str): Client name
+        target_path (str): Path to scan on the client
+        rule_name (str, optional): Specific YARA rule to use
+        
+    Returns:
+        dict: Scan results
+    """
+    params = {
+        "target_path": target_path
+    }
+    
+    if rule_name:
+        params["rule_name"] = rule_name
+        
+    return send_command_to_client(client_name, "yara-scan", params)
+
+def spawn_ir_shell(client_name):
+    """
+    Initiate an interactive IR shell session with a client through the encrypted channel.
+    
+    Args:
+        client_name (str): Client name
+        
+    Returns:
+        dict: Result of the shell initialization
+    """
+    # Initialize the shell session
+    result = send_command_to_client(client_name, "ir-shell-init")
+    
+    if result.get("status") != "success":
+        return result
+        
+    print(f"\n[INFO] IR Shell session established with {client_name}")
+    print("[INFO] Type 'exit' to end the session")
+    print("[INFO] All commands are executed within the client's security context")
+    print("="*60)
+    
+    try:
+        # Interactive shell loop
+        while True:
+            command = input(f"{client_name}> ").strip()
+            
+            if command.lower() in ["exit", "quit"]:
+                # Cleanly terminate the shell session
+                send_command_to_client(client_name, "ir-shell-exit")
+                print(f"[INFO] IR Shell session with {client_name} terminated")
+                break
+                
+            if not command:
+                continue
+                
+            # Send the command through the encrypted channel
+            result = send_command_to_client(client_name, "ir-shell-command", {
+                "command": command
+            })
+            
+            if result.get("status") == "success":
+                # Display command output
+                output = result.get("output", "")
+                print(output)
+            else:
+                print(f"[ERROR] Command failed: {result.get('message', 'Unknown error')}")
+    
+    except KeyboardInterrupt:
+        print("\n[INFO] IR Shell session terminated by user")
+        # Attempt to cleanly exit
+        send_command_to_client(client_name, "ir-shell-exit")
+    except Exception as e:
+        print(f"\n[ERROR] IR Shell error: {e}")
+        
+    return {"status": "success", "message": "IR Shell session completed"}
+
+def update_client(client_name):
+    """
+    Trigger a client update.
+    
+    Args:
+        client_name (str): Client name
+        
+    Returns:
+        dict: Update result
+    """
+    return send_command_to_client(client_name, "update")
