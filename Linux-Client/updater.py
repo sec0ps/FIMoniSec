@@ -1,34 +1,4 @@
-# =============================================================================
-# FIMonsec Tool - File Integrity Monitoring Security Solution
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This script is part of the FIMoniSec Tool, which provides enterprise-grade
-#          system integrity monitoring with real-time alerting capabilities. It monitors
-#          critical system and application files for unauthorized modifications,
-#          supports baseline comparisons, and integrates with SIEM solutions.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
-
-# === TODO: Integrate GitHub Updater ===
+ # === TODO: Integrate GitHub Updater ===
 # Step 1: Import the updater module
 #import updater
 
@@ -46,7 +16,27 @@ import argparse
 import requests
 import os
 
-GITHUB_RAW_BASE = "https://raw.githubusercontent.com/sec0ps/vapt-automation/main/"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/sec0ps/FIMoniSec/main/Linux-Client/"
+GITHUB_VERSION_URL = "https://raw.githubusercontent.com/sec0ps/FIMoniSec/main/Linux-Client/version.txt"
+LOCAL_VERSION_FILE = "version.txt"
+
+FILES_TO_UPDATE = [
+    "audit.py",
+    "client_crypt.py",
+    "fim_client.py",
+    "lim.py",
+    "log_detection_engine.py",
+    "monisec_client.py",
+    "remote.py",
+    "version.txt"
+]
+
+import argparse
+import requests
+import os
+
+# ✅ Correct repo path
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/sec0ps/FIMoniSec/main/Linux-Client/"
 GITHUB_VERSION_URL = GITHUB_RAW_BASE + "version.txt"
 LOCAL_VERSION_FILE = "version.txt"
 
@@ -58,7 +48,6 @@ FILES_TO_UPDATE = [
     "log_detection_engine.py",
     "monisec_client.py",
     "remote.py",
-    "updater.py",
     "version.txt"
 ]
 
@@ -128,7 +117,6 @@ def check_for_updates(force=False, dry_run=False):
     return updated
 
 def parse_version(v):
-    """Convert version string like '1.2.3' into a tuple (1, 2, 3) for comparison."""
     return tuple(map(int, v.strip().split(".")))
 
 if __name__ == "__main__":
