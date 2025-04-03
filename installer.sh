@@ -70,6 +70,11 @@ else
     useradd -m -d /opt/FIMoniSec -g fimonisec -s /bin/bash fimonisec || error_exit "Failed to create fimonisec user"
 fi
 
+# Add current user to fimonisec group
+status_message "Adding current user to fimonisec group..."
+usermod -a -G fimonisec $CURRENT_USER || error_exit "Failed to add current user to fimonisec group"
+status_message "User $CURRENT_USER added to fimonisec group"
+
 # Step 3: Move current directory to /opt
 status_message "Moving FIMoniSec to /opt..."
 if [ -d "/opt/FIMoniSec" ]; then
@@ -119,15 +124,27 @@ if ! command -v pip &> /dev/null; then
     apt-get install -y python3-pip -qq > /dev/null 2>&1 || error_exit "Failed to install pip"
 fi
 
-# Install Python requirements
-status_message "Installing Python requirements. This may take a few minutes..."
-su - fimonisec -c "cd /opt/FIMoniSec && pip install -r requirements.txt -q" || error_exit "Failed to install Python requirements"
+# Install Python requirements for both current user and fimonisec
+status_message "Installing Python requirements for fimonisec user. This may take a few minutes..."
+su - fimonisec -c "cd /opt/FIMoniSec && pip install -r requirements.txt -q" || error_exit "Failed to install Python requirements for fimonisec"
+
+status_message "Installing Python requirements for current user. This may take a few minutes..."
+if [ "$CURRENT_USER" != "root" ]; then
+    su - $CURRENT_USER -c "cd /opt/FIMoniSec && pip install -r requirements.txt -q" || error_exit "Failed to install Python requirements for $CURRENT_USER"
+else
+    pip install -r requirements.txt -q || error_exit "Failed to install Python requirements for root"
+fi
 
 # Step 6: Add Python local bin to PATH for both current user and fimonisec
 status_message "Adding Python local bin directories to PATH..."
 
 # For fimonisec user
-if ! grep -q 'PATH="$HOME/.local/bin:$PATH"' /opt/FIMoniSec/.bashrc 2>/dev/null; then
+if [ ! -f "/opt/FIMoniSec/.bashrc" ]; then
+    touch /opt/FIMoniSec/.bashrc
+    chown fimonisec:fimonisec /opt/FIMoniSec/.bashrc
+fi
+
+if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' /opt/FIMoniSec/.bashrc 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> /opt/FIMoniSec/.bashrc
     chown fimonisec:fimonisec /opt/FIMoniSec/.bashrc
 fi
@@ -136,7 +153,7 @@ fi
 if [ "$CURRENT_USER" != "root" ]; then
     USER_HOME=$(eval echo ~$CURRENT_USER)
     if [ -d "$USER_HOME" ]; then
-        if ! grep -q 'PATH="$HOME/.local/bin:$PATH"' $USER_HOME/.bashrc 2>/dev/null; then
+        if ! grep -q 'export PATH="$HOME/.local/bin:$PATH"' $USER_HOME/.bashrc 2>/dev/null; then
             echo 'export PATH="$HOME/.local/bin:$PATH"' >> $USER_HOME/.bashrc
             chown $CURRENT_USER: $USER_HOME/.bashrc
         fi
@@ -146,11 +163,13 @@ fi
 # Also add it to system-wide profile to take effect immediately
 if [ ! -f "/etc/profile.d/fimonisec_path.sh" ]; then
     echo 'export PATH="/opt/FIMoniSec/.local/bin:$PATH"' > /etc/profile.d/fimonisec_path.sh
+    echo 'export PATH="/home/'$CURRENT_USER'/.local/bin:$PATH"' >> /etc/profile.d/fimonisec_path.sh
     chmod +x /etc/profile.d/fimonisec_path.sh
 fi
 
 # Export it for the current session
 export PATH="/opt/FIMoniSec/.local/bin:$PATH"
+export PATH="/home/$CURRENT_USER/.local/bin:$PATH"
 
 # Step 7: Install YARA
 status_message "Installing YARA..."
@@ -160,7 +179,8 @@ apt-get install -y yara -qq > /dev/null 2>&1 || error_exit "Failed to install YA
 # Step 8: Set up proper permissions for the FIMoniSec directory
 status_message "Setting up proper permissions..."
 chmod -R 750 /opt/FIMoniSec
-chmod -R g+s /opt/FIMoniSec/logs 2>/dev/null || mkdir -p /opt/FIMoniSec/logs && chmod -R g+s /opt/FIMoniSec/logs
+mkdir -p /opt/FIMoniSec/logs 2>/dev/null
+chmod -R g+s /opt/FIMoniSec/logs
 
 # Step 9: Detect the init system
 INIT_SYSTEM=""
@@ -175,6 +195,10 @@ else
 fi
 
 status_message "Detected init system: $INIT_SYSTEM"
+
+# Step 10: Create client service if needed
+if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
+    status_message "Creating FIMoniSec client service..."
     
     if [ "$INIT_SYSTEM" = "systemd" ]; then
         # Create systemd service for client
@@ -369,7 +393,7 @@ EOF
     status_message "Client control script created at /opt/FIMoniSec/control-client.sh"
 fi
 
-# Create server service if needed
+# Step 11: Create server service if needed
 if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
     status_message "Creating FIMoniSec server service..."
     
@@ -571,38 +595,24 @@ status_message "Installation completed successfully!"
 
 if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
     status_message "Client components installed in /opt/FIMoniSec"
-    status_message "Client control script: /opt/FIMoniSec/control-client.sh"
     
     # Ask if user wants to start the client service now
     status_message "Do you want to start the FIMoniSec client service now? (y/n): "
     read REPLY
     if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-        if [ "$INIT_SYSTEM" = "systemd" ]; then
-            systemctl start fimonisec-client
-        elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
-            service fimonisec-client start
-        elif [ "$INIT_SYSTEM" = "upstart" ]; then
-            start fimonisec-client
-        fi
+        cd /opt/FIMoniSec && python3 monisec_client.py -d
         status_message "FIMoniSec client service started"
     fi
 fi
 
 if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
     status_message "Server components installed in /opt/FIMoniSec"
-    status_message "Server control script: /opt/FIMoniSec/control-server.sh"
     
     # Ask if user wants to start the server service now
     status_message "Do you want to start the FIMoniSec server service now? (y/n): "
     read REPLY
     if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-        if [ "$INIT_SYSTEM" = "systemd" ]; then
-            systemctl start fimonisec-server
-        elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
-            service fimonisec-server start
-        elif [ "$INIT_SYSTEM" = "upstart" ]; then
-            start fimonisec-server
-        fi
+        cd /opt/FIMoniSec && python3 monisec-server.py -d
         status_message "FIMoniSec server service started"
     fi
 fi
@@ -612,8 +622,20 @@ status_message "----------------------------------------------"
 status_message "FIMoniSec Service Management Instructions:"
 status_message "----------------------------------------------"
 
+status_message "Direct command execution (recommended):"
+if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
+    status_message "  Start client:   cd /opt/FIMoniSec && python3 monisec_client.py -d"
+    status_message "  Stop client:    cd /opt/FIMoniSec && python3 monisec_client.py stop"
+    status_message "  Restart client: cd /opt/FIMoniSec && python3 monisec_client.py stop && python3 monisec_client.py -d"
+fi
+if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
+    status_message "  Start server:   cd /opt/FIMoniSec && python3 monisec-server.py -d"
+    status_message "  Stop server:    cd /opt/FIMoniSec && python3 monisec-server.py stop"
+    status_message "  Restart server: cd /opt/FIMoniSec && python3 monisec-server.py stop && python3 monisec-server.py -d"
+fi
+
 if [ "$INIT_SYSTEM" = "systemd" ]; then
-    status_message "Using systemd commands:"
+    status_message "Using systemd commands (alternative):"
     if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
         status_message "  Start client:   sudo systemctl start fimonisec-client"
         status_message "  Stop client:    sudo systemctl stop fimonisec-client"
@@ -627,7 +649,7 @@ if [ "$INIT_SYSTEM" = "systemd" ]; then
         status_message "  Status server:  sudo systemctl status fimonisec-server"
     fi
 elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
-    status_message "Using service commands:"
+    status_message "Using service commands (alternative):"
     if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
         status_message "  Start client:   sudo service fimonisec-client start"
         status_message "  Stop client:    sudo service fimonisec-client stop"
@@ -641,7 +663,7 @@ elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
         status_message "  Status server:  sudo service fimonisec-server status"
     fi
 elif [ "$INIT_SYSTEM" = "upstart" ]; then
-    status_message "Using upstart commands:"
+    status_message "Using upstart commands (alternative):"
     if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
         status_message "  Start client:   sudo start fimonisec-client"
         status_message "  Stop client:    sudo stop fimonisec-client"
@@ -654,14 +676,6 @@ elif [ "$INIT_SYSTEM" = "upstart" ]; then
         status_message "  Restart server: sudo restart fimonisec-server"
         status_message "  Status server:  sudo status fimonisec-server"
     fi
-fi
-
-status_message "Using control scripts:"
-if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "  Client:  sudo /opt/FIMoniSec/control-client.sh {start|stop|restart|status}"
-fi
-if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "  Server:  sudo /opt/FIMoniSec/control-server.sh {start|stop|restart|status}"
 fi
 
 status_message "----------------------------------------------"
