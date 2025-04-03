@@ -60,11 +60,8 @@ DEFAULT_CONFIG = {
     }
 }
 
-ALLOWED_COMMANDS = {
-    "monisec_client": ["start", "stop", "restart"],
-    "fim_client": ["start", "stop", "restart"],
-    "pim": ["start", "stop", "restart"]
-}
+# List of valid modules for the restart command
+VALID_MODULES = ["monisec_client", "fim_client", "pim", "lim"]
 
 # Function to create default config file if missing
 def create_default_config():
@@ -228,7 +225,7 @@ def verify_pid_file():
 def print_help():
     """Prints the available command-line options for monisec-server.py"""
     print("""
-Usage: python monisec-server.py [command] [client_name]
+Usage: python monisec-server.py [command] [options]
 
 Management Commands:
   add-agent <agent_name>         Add a new client and generate a unique PSK.
@@ -237,10 +234,16 @@ Management Commands:
   configure-siem                 Configure SIEM settings for log forwarding.
 
 Remote Commands:
-  restart-service <client> <svc> Restart a service on a client (monisec_client, fim_client, pim, lim).
+  <module> [client_name]         Directly restart a module on all clients or a specific client.
+                                 Example: python monisec-server.py fim_client server1
+  restart <module> [client_name] Alternative syntax for restarting modules.
+                                 Example: python monisec-server.py restart fim_client server1
+  
+  Valid modules: monisec_client, fim_client, pim, lim
+  
   yara-scan <client> <path>      Run a YARA scan on a client.
   ir-shell <client>              Spawn an incident response shell on a client.
-  update-client <client>         Trigger a client update.
+  update <client>                Trigger a client update.
 
 Server Control:
   -d                             Launch the MoniSec Server as a daemon.
@@ -249,6 +252,43 @@ Server Control:
 
 If no command is provided, the server will start normally.
 """)
+
+def restart_service(module, client_name=None):
+    """Restart a service module on a client or all clients."""
+    if module not in VALID_MODULES:
+        print(f"[ERROR] Invalid module: {module}")
+        print(f"Valid modules: {', '.join(VALID_MODULES)}")
+        return False
+    
+    if client_name:
+        # Restart module on a specific client
+        print(f"[INFO] Sending restart command for {module} to client: {client_name}")
+        result = clients.restart_client_service(client_name, module)
+        
+        if result.get("status") == "success":
+            print(f"[SUCCESS] {module} restarted on {client_name}")
+            return True
+        else:
+            print(f"[ERROR] Failed to restart {module} on {client_name}: {result.get('message')}")
+            return False
+    else:
+        # Restart module on all clients
+        print(f"[INFO] Sending restart command for {module} to all clients...")
+        all_clients = clients.get_all_clients()
+        success_count = 0
+        
+        for client in all_clients:
+            print(f"[INFO] Restarting {module} on {client}...")
+            result = clients.restart_client_service(client, module)
+            
+            if result.get("status") == "success":
+                print(f"[SUCCESS] {module} restarted on {client}")
+                success_count += 1
+            else:
+                print(f"[ERROR] Failed to restart {module} on {client}: {result.get('message')}")
+        
+        print(f"[INFO] Restart complete. Successful on {success_count}/{len(all_clients)} clients.")
+        return success_count > 0
 
 if __name__ == "__main__":
     should_run_updater = (len(sys.argv) == 1) or (len(sys.argv) > 1 and sys.argv[1] == "-d")
@@ -262,7 +302,19 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         action = sys.argv[1]
 
-        if action in ["-h", "--help", "help"]:
+        # Check if the first argument is a valid module name
+        if action in VALID_MODULES:
+            # Handle direct module command: python monisec-server.py module_name [client_name]
+            module = action
+            client_name = sys.argv[2] if len(sys.argv) > 2 else None
+            
+            print(f"[INFO] Running restart command for module: {module}")
+            if restart_service(module, client_name):
+                sys.exit(0)
+            else:
+                sys.exit(1)
+                
+        elif action in ["-h", "--help", "help"]:
             print_help()
             sys.exit(0)
 
@@ -286,23 +338,19 @@ if __name__ == "__main__":
             server_siem.configure_siem()
             sys.exit(0)
             
-        elif action == "restart-service":
-            if len(sys.argv) < 4:
-                print("[ERROR] Usage: python monisec-server.py restart-service <client_name> <service>")
-                print("Services: monisec_client, fim_client, pim, lim")
+        elif action == "restart":
+            if len(sys.argv) < 3:
+                print("[ERROR] Usage: python monisec-server.py restart <module> [client_name]")
+                print(f"Valid modules: {', '.join(VALID_MODULES)}")
                 sys.exit(1)
                 
-            client_name = sys.argv[2]
-            service = sys.argv[3]
+            module = sys.argv[2]
+            client_name = sys.argv[3] if len(sys.argv) > 3 else None
             
-            print(f"[INFO] Sending restart command for {service} to {client_name}...")
-            result = clients.restart_client_service(client_name, service)
-            
-            if result.get("status") == "success":
-                print(f"[SUCCESS] {service} restarted on {client_name}")
+            if restart_service(module, client_name):
+                sys.exit(0)
             else:
-                print(f"[ERROR] Failed to restart {service} on {client_name}: {result.get('message')}")
-            sys.exit(0)
+                sys.exit(1)
 
         elif action == "yara-scan":
             if len(sys.argv) < 4:
@@ -344,9 +392,9 @@ if __name__ == "__main__":
             # The function will handle the interactive shell session
             sys.exit(0)
 
-        elif action == "update-client":
+        elif action == "update":
             if len(sys.argv) < 3:
-                print("[ERROR] Usage: python monisec-server.py update-client <client_name>")
+                print("[ERROR] Usage: python monisec-server.py update <client_name>")
                 sys.exit(1)
                 
             client_name = sys.argv[2]
