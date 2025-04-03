@@ -220,6 +220,8 @@ def load_or_create_config():
         except Exception as e:
             print(f"Failed to create default configuration file: {e}")
             sys.exit(1)
+#create default config
+config = load_or_create_config()
 
 def start_process(name):
     if name in PROCESSES:
