@@ -49,21 +49,6 @@ def load_psks(client_name):
                 return psk
     raise ValueError(f"[ERROR] No PSK found for client: {client_name}")
 
-def decrypt_data(client_name, encrypted_data):
-    """Decrypt received log data."""
-    try:
-        psk = load_psks(client_name)
-    except ValueError:
-        raise ValueError(f"[ERROR] No PSK found for client: {client_name}")
-    aesgcm = AESGCM(psk)
-    try:
-        nonce = encrypted_data[:12]
-        ciphertext = encrypted_data[12:]
-        decrypted_text = aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")  # ✅ Decode string
-        return json.loads(decrypted_text)  # ✅ Convert back to JSON
-    except Exception as e:
-        raise ValueError(f"[ERROR] Decryption failed: {e}")
-        
 def decrypt_data_with_psk(psk, encrypted_data):
     """Decrypt received log data using the provided PSK."""
     aesgcm = AESGCM(psk)
