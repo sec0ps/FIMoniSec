@@ -4,3 +4,4 @@ pyinotify
 numpy
 pandas
 scikit-learn
+psutil
