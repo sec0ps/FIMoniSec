@@ -129,7 +129,7 @@ if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
 PROCESSES = {
     "fim_client": "python3 fim_client.py -d",
     "pim": "python3 pim.py -d",
-    "lim": "python3 lim.py -d",  # Add this line
+    "lim": "python3 lim.py -d",
 }
 
 def create_default_config():
@@ -249,36 +249,135 @@ def stop_process(name):
     else:
         logging.warning(f"[ERROR] Attempted to stop unknown process: {name}")
 
-# Function to restart a process
 def restart_process(name):
+    """
+    Restart a process with verification and multiple attempts if needed.
+    
+    Args:
+        name: Name of the process to restart
+        
+    Returns:
+        bool: True if restart was successful, False otherwise
+    """
+    logging.info(f"Attempting to restart {name}...")
+    
+    # First, ensure the process is stopped
     stop_process(name)
-    time.sleep(2)
+    
+    # Wait for process to fully terminate
+    attempts = 0
+    while is_process_running(name) and attempts < 5:
+        logging.info(f"Waiting for {name} to terminate...")
+        time.sleep(1)
+        attempts += 1
+    
+    if is_process_running(name):
+        logging.error(f"Could not terminate {name} gracefully, forcing...")
+        force_stop_process(name)
+        time.sleep(1)
+    
+    # Now start the process
     start_process(name)
+    
+    # Verify process started successfully
+    time.sleep(2)  # Allow time for startup
+    pid = is_process_running(name)
+    
+    if pid:
+        logging.info(f"{name} successfully restarted with PID {pid}")
+        return True
+    else:
+        # Try one more time
+        logging.warning(f"First restart attempt for {name} failed, trying again...")
+        start_process(name)
+        time.sleep(3)  # Give a bit more time on second attempt
+        
+        pid = is_process_running(name)
+        if pid:
+            logging.info(f"{name} successfully restarted on second attempt with PID {pid}")
+            return True
+        else:
+            logging.error(f"Failed to restart {name} after multiple attempts")
+            return False
 
 def is_process_running(name):
-    """Check if a specific process is running by comparing executable name."""
+    """
+    Check if a specific process is running by comparing executable name.
+    Returns the PID if running, None otherwise.
+    """
     for proc in psutil.process_iter(attrs=['pid', 'name', 'cmdline']):
         try:
             exe_name = proc.info['name']
             cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
 
-            # Only match exact script calls, avoid false positives like 'kate'
-            if exe_name == "python3" and f"{name}.py" in cmdline:
+            # Match based on process type
+            if exe_name == "python3" and any([
+                # These patterns ensure we match the exact process
+                f"{name}.py" in cmdline,
+                f"/{name}.py" in cmdline,
+                f"./{name}.py" in cmdline
+            ]):
                 return proc.info['pid']
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
     return None
+    
+def force_stop_process(name):
+    """Force stop a process that won't terminate gracefully"""
+    pid = is_process_running(name)
+    if pid:
+        try:
+            logging.warning(f"Force stopping {name} with PID {pid}...")
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(1)
+            return not is_process_running(name)
+        except Exception as e:
+            logging.error(f"Error force stopping {name}: {e}")
+            return False
+    return True  # Already stopped
 
 def monitor_processes():
+    """
+    Monitor all required processes and restart any that aren't running.
+    Maintains a health check loop to ensure continuous operation.
+    """
+    logging.info("Starting process monitoring service")
+    
     while True:
         all_running = True
+        processes_checked = 0
+        
         for name in PROCESSES:
-            if not is_process_running(name):
-                logging.warning(f"{name} is not running. Restarting...")
+            # Skip monisec_client as it shouldn't be self-monitored
+            if name == "monisec_client":
+                continue
+                
+            processes_checked += 1
+            pid = is_process_running(name)
+            
+            if not pid:
+                logging.warning(f"{name} is not running. Attempting restart...")
                 start_process(name)
-                all_running = False  # Mark that at least one process was restarted
-
-        time.sleep(10 if not all_running else 60)  # Increase interval if stable
+                time.sleep(2)  # Brief pause to let process initialize
+                
+                # Verify the process actually started
+                new_pid = is_process_running(name)
+                if new_pid:
+                    logging.info(f"{name} successfully restarted with PID {new_pid}")
+                else:
+                    logging.error(f"Failed to restart {name} after multiple attempts")
+                    all_running = False
+            else:
+                logging.debug(f"{name} is running with PID {pid}")
+        
+        # Adaptive sleep: shorter interval if there were issues, longer if stable
+        if processes_checked > 0:  # Only sleep if we're monitoring at least one process
+            sleep_time = 60 if all_running else 10
+            logging.debug(f"Process monitoring sleeping for {sleep_time} seconds")
+            time.sleep(sleep_time)
+        else:
+            # If no processes to monitor, use a longer sleep
+            time.sleep(300)
 
 def stop_monisec_client_daemon():
     """Stop the MoniSec client running in daemon mode."""
