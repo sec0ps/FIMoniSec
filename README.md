@@ -34,37 +34,17 @@ FIMoniSec is a lightweight yet powerful Python-based system security monitoring 
   - `scikit-learn`
   - `psutil`
 
-### Required Permissions
-To ensure proper functionality, the user running the management scripts must have sudo access to the following commands:
-
-```
-username ALL=(ALL) NOPASSWD: /usr/bin/lsof, /bin/cat, /bin/ps, /bin/netstat, /bin/ss, /usr/bin/readlink
-```
-
-Add the above line to your sudoers file using `visudo` to ensure MoniSec has the necessary permissions to monitor system processes.
-
 ## Installation
 
-1. Clone the repository:
-   ```
-   git clone https://github.com/yourusername/monisec.git
-   cd monisec
-   ```
-
-2. Install required Python packages:
-   ```
-   pip install numpy pandas scikit-learn psutil
-   ```
-
-3. Set up the proper permissions in the sudoers file:
-   ```
-   sudo visudo
-   ```
-   Add the required permissions line mentioned above.
+1. Execute the installer
+    ```
+    sudo sh installer.sh
 
 4. Run the server component (central monitoring):
    ```
-   python monisec-server.py
+   python monisec-server.py (create the initial configuration file)
+   python monisec-server.py -d
+   python monisec-server.py add-agent
    ```
 
 5. On each client, configure and run the client:
