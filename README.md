@@ -1,4 +1,4 @@
-# FIMoniSec: Comprehensive System Security Monitoring
+# FIMoniSec: System Security Monitoring
 
 FIMoniSec is a lightweight yet powerful Python-based system security monitoring application designed for Linux environments. It offers comprehensive intrusion detection through advanced behavioral analysis, machine learning, and real-time monitoring of process and file integrity.
 
