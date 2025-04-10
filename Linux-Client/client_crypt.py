@@ -42,11 +42,14 @@ def load_psks():
         raw_psk = data["psk"]
         if len(raw_psk) != 64:
             raise ValueError("[ERROR] PSK format invalid. Expected 64-character hex string.")
-        psk = bytes.fromhex(raw_psk)
-        logging.info(f"[INFO] Loaded PSK from auth_token.json: {raw_psk}")
-        return psk
+        try:
+            psk = bytes.fromhex(raw_psk)
+            logging.info(f"[INFO] Loaded PSK from auth_token.json")
+            return psk
+        except ValueError as e:
+            logging.error(f"[ERROR] Failed to convert PSK to bytes: {e}")
+            raise ValueError("[ERROR] Invalid PSK format. Must be a valid hex string.")
 
-# Keep the original function signature but improve the implementation
 def encrypt_data(plaintext):
     """Encrypts authentication request or logs before sending to the server."""
     try:
@@ -54,8 +57,13 @@ def encrypt_data(plaintext):
         aesgcm = AESGCM(psk)
         # Generate a fresh nonce for every message
         nonce = os.urandom(12)
-        plaintext_bytes = plaintext.encode("utf-8")
         
+        # Ensure plaintext is bytes
+        if isinstance(plaintext, str):
+            plaintext_bytes = plaintext.encode("utf-8")
+        else:
+            plaintext_bytes = plaintext
+            
         ciphertext = aesgcm.encrypt(nonce, plaintext_bytes, None)
         encrypted_data = nonce + ciphertext
         
@@ -63,7 +71,8 @@ def encrypt_data(plaintext):
     
     except Exception as e:
         logging.error(f"Error encrypting data: {e}")
-        logging.error(f"Plaintext sample: {plaintext[:100]}")
+        if isinstance(plaintext, str):
+            logging.error(f"Plaintext sample: {plaintext[:100]}")
         raise
 
 def decrypt_data(encrypted_data):
