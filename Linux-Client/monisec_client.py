@@ -111,6 +111,8 @@ log_handler = logging.FileHandler(LOG_FILE)
 log_handler.setFormatter(log_formatter)
 log_handler.setLevel(logging.DEBUG)
 root_logger.addHandler(log_handler)
+logging.getLogger('websockets').setLevel(logging.WARNING)
+logging.getLogger('asyncio').setLevel(logging.WARNING)
 
 # Only add console output if not running in daemon mode
 if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
@@ -588,10 +590,10 @@ if __name__ == "__main__":
         
             # Add this line to start log transmission in daemon mode
             remote.check_auth_and_send_logs()
-        
-            listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
-            listener_thread.start()
-        
+            
+            # Let start_listener_if_authorized handle the listener starting
+            remote.start_listener_if_authorized()
+            
             monitor_processes()
 
         # Invalid command
@@ -633,9 +635,13 @@ if __name__ == "__main__":
 
         logging.info("MoniSec Endpoint Monitor started in foreground.")
 
-        listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
-        listener_thread.start()
-
         remote.check_auth_and_send_logs()
+        # Start the connection maintenance thread
+        connection_monitor = threading.Thread(target=remote.maintain_websocket_connection, daemon=True)
+        connection_monitor.start()
+        logging.info("[INIT] Started WebSocket connection monitoring")
+        # Only use start_listener_if_authorized to handle listener starting
         remote.start_listener_if_authorized()
+        # Start WebSocket client (after authentication)
+        remote.start_websocket_client()
         monitor_processes()
