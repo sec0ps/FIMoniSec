@@ -28,17 +28,23 @@
 #
 # =============================================================================
 import os
+import sys
 import json
 import hmac
 import hashlib
 import logging
 import select
 import socket
+import threading
+import time
 import server_siem
 import server_crypt
+from shared_state import websocket_lock, IPC_SOCKET_PATH
 
+# Define a fixed base directory for the server
+SERVER_BASE_DIR = "/opt/FIMoniSec/Monisec-Server"
 PSK_STORE_FILE = "psk_store.json"
-ENDPOINT_LOG_FILE = "./logs/siem-forwarding.log"  # ✅ Change to correct log file
+ENDPOINT_LOG_FILE = os.path.join(SERVER_BASE_DIR, "logs", "siem-forwarding.log")
 
 # Configure logging
 logging.basicConfig(
@@ -197,44 +203,70 @@ def receive_chunked_data(client_socket):
         while True:
             # Receive chunk size (4 bytes)
             size_bytes = b""
-            while len(size_bytes) < 4:
-                chunk = client_socket.recv(4 - len(size_bytes))
-                if not chunk:
-                    if not size_bytes:  # Clean disconnect
-                        return None
-                    logging.error(f"Connection closed while receiving size header. Got {len(size_bytes)} bytes")
-                    return None
-                size_bytes += chunk
-                
-            chunk_size = int.from_bytes(size_bytes, byteorder='big')
-            
-            # A zero-length chunk means end of message
-            if chunk_size == 0:
-                break
-                
-            # Receive the chunk data
-            chunk = bytearray()
             bytes_received = 0
             
-            # Keep receiving until we get all bytes for this chunk
-            while bytes_received < chunk_size:
-                remaining = chunk_size - bytes_received
-                buffer = client_socket.recv(min(4096, remaining))
-                
-                if not buffer:
-                    logging.error("Connection closed during chunk receive")
+            # Ensure we get all 4 bytes of the size header
+            while bytes_received < 4:
+                try:
+                    chunk = client_socket.recv(4 - bytes_received)
+                    if not chunk:  # Connection closed
+                        if bytes_received == 0:  # No data at all
+                            return None
+                        logging.error(f"[CHUNK] Connection closed while receiving size header. Got {bytes_received}/4 bytes")
+                        return None
+                    size_bytes += chunk
+                    bytes_received += len(chunk)
+                except Exception as e:
+                    logging.error(f"[CHUNK] Error receiving chunk header: {e}")
                     return None
-                    
-                chunk.extend(buffer)
-                bytes_received += len(buffer)
             
-            full_data.extend(chunk)
+            # Convert size bytes to integer
+            chunk_size = int.from_bytes(size_bytes, byteorder='big')
+            logging.debug(f"[CHUNK] Received size header: {chunk_size} bytes")
+            
+            # End of message marker
+            if chunk_size == 0:
+                logging.debug(f"[CHUNK] End of chunked message marker received")
+                break
+            
+            # Sanity check on chunk size
+            if chunk_size > 10*1024*1024:  # >10MB is probably invalid
+                logging.error(f"[CHUNK] Invalid chunk size: {chunk_size} bytes")
+                return None
+            
+            # Receive the chunk data
+            chunk_data = bytearray()
+            bytes_received = 0
+            
+            while bytes_received < chunk_size:
+                try:
+                    buffer_size = min(4096, chunk_size - bytes_received)
+                    buffer = client_socket.recv(buffer_size)
+                    
+                    if not buffer:  # Connection closed
+                        logging.error(f"[CHUNK] Connection closed prematurely. Got {bytes_received}/{chunk_size} bytes")
+                        return None
+                    
+                    chunk_data.extend(buffer)
+                    bytes_received += len(buffer)
+                    
+                except Exception as e:
+                    logging.error(f"[CHUNK] Error receiving chunk data: {e}")
+                    return None
+            
+            # Add this chunk to our accumulated data
+            full_data.extend(chunk_data)
         
+        # Return the complete message
+        logging.info(f"[CHUNK] Successfully received complete chunked message, total size: {len(full_data)} bytes")
         return bytes(full_data)
+    
     except Exception as e:
-        logging.error(f"Error receiving chunked data: {e}")
+        logging.error(f"[CHUNK] Error in receive_chunked_data: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
         return None
-
+        
 def is_chunked_message(client_socket):
     """Try to detect if the incoming message is using chunked protocol."""
     try:
@@ -255,121 +287,187 @@ def is_chunked_message(client_socket):
         return False
 
 def handle_client(client_socket, client_address):
-    """Handles encrypted log reception from authenticated client."""
-    logging.info(f"New connection from {client_address}")
+    """Handles encrypted log reception and NAT detection from authenticated client."""
+    logging.info(f"[DEBUG] → 1. Starting client handler for {client_address}")
+    logging.info(f"New connection from {client_address[0]}:{client_address[1]}")
 
     try:
-        # Step 1: Receive client_name as JSON (unencrypted)
         raw = client_socket.recv(1024)
+        logging.info(f"[DEBUG] → 2. Received initial data: {raw[:50]!r}")
+
+        if raw and (raw[0] < 32 or raw[0] > 126):
+            logging.debug(f"[CONN-DEBUG] Received binary data from {client_address}, first 20 bytes: {raw[:20].hex()}")
+
         try:
-            auth_payload = json.loads(raw.decode("utf-8"))
-            client_name = auth_payload.get("client_name")
-            if not client_name:
-                raise ValueError("Missing client_name")
-        except Exception as e:
-            logging.warning(f"[AUTH] Invalid handshake from {client_address}: {e}")
-            logging.warning(f"[AUTH] Raw data: {raw[:100].hex()}")
-            client_socket.close()
-            return
-
-        # Step 2: Load PSK for the client
-        try:
-            psk = server_crypt.load_psks(client_name)
-        except ValueError as e:
-            logging.warning(f"[AUTH] Unknown client '{client_name}' from {client_address}: {e}")
-            client_socket.close()
-            return
-        except Exception as e:
-            logging.error(f"[AUTH] Error loading PSK for '{client_name}': {e}")
-            client_socket.close()
-            return
-
-        logging.info(f"[AUTH] Client '{client_name}' authenticated. Ready to receive logs.")
-
-        # Step 3: Receive and decrypt logs
-        while True:
-            # First, check if there's any data available before trying to receive
-            import select
-            readable, _, _ = select.select([client_socket], [], [], 0.5)
-            if not readable:
-                continue  # No data yet, keep waiting
-                
-            # Peek at the first 4 bytes to check if this might be a chunked message
             try:
-                peek_bytes = client_socket.recv(4, socket.MSG_PEEK)
-                if len(peek_bytes) == 0:
-                    # Client disconnected
-                    break
-                    
-                if len(peek_bytes) == 4:
-                    # Check if this could be a chunk size header
-                    potential_size = int.from_bytes(peek_bytes, byteorder='big')
-                    
-                    # If the first 4 bytes represent a reasonable chunk size,
-                    # assume this is a chunked message
-                    if 0 < potential_size < 8192:
-                        # Read the chunked data using the existing function
-                        encrypted_data = receive_chunked_data(client_socket)
-                        if not encrypted_data:
-                            break
-                    else:
-                        # Not a chunked message, use standard receive
-                        encrypted_data = client_socket.recv(4096)
-                        if not encrypted_data:
-                            break
-                else:
-                    # Not enough bytes to determine, use standard receive
-                    encrypted_data = client_socket.recv(4096)
-                    if not encrypted_data:
-                        logging.info("Client disconnected (standard receive, not enough bytes)")
-                        break
-            except Exception as e:
-                # Fall back to standard receive
-                encrypted_data = client_socket.recv(4096)
-                if not encrypted_data:
-                    logging.info("Client disconnected (fallback receive)")
-                    break
-            
-            # Process the received data
-            try:
-                
-                log_data = server_crypt.decrypt_data_with_psk(psk, encrypted_data)
-                
-                logs = log_data.get("logs", [])
+                payload = json.loads(raw.decode("utf-8"))
 
-                if isinstance(logs, dict):
-                    logs = [logs]
-                    
-                # Process the logs
-                for log_entry in logs:
-                    log_entry["client_name"] = client_name
-                    # Write log to file
+                if payload.get("command") == "get_client_ip":
+                    client_ip = client_address[0]
+                    response = json.dumps({"client_ip": client_ip})
+                    client_socket.sendall(response.encode("utf-8"))
+                    logging.info(f"[NAT-DETECT] Responded to IP check from {client_ip}")
+                    return
+
+                client_name = payload.get("client_name")
+                if client_name:
+                    logging.info(f"[AUTH] Client '{client_name}' connecting from {client_address[0]}")
+
                     try:
-                        with open(ENDPOINT_LOG_FILE, "a") as log_file:
-                            log_file.write(json.dumps(log_entry) + "\n")
-                    except Exception as e:
-                        logging.error(f"[ERROR] Failed to write client log: {e}")
-                    
-                    # Forward to SIEM if configured
-                    server_siem.forward_log_to_siem(log_entry, client_name)
+                        try:
+                            psk = server_crypt.load_psks(client_name)
+                        except ValueError as e:
+                            logging.warning(f"[AUTH] Unknown client '{client_name}' from {client_address}: {e}")
+                            client_socket.close()
+                            return
+                        except Exception as e:
+                            logging.error(f"[AUTH] Error loading PSK for '{client_name}': {e}")
+                            client_socket.close()
+                            return
 
-                client_socket.sendall(b"ACK")
-            except Exception as e:
-                logging.info(f"[RECV] Received 0 logs from {client_name}")
-                # Try to send ACK to maintain connection
+                        logging.info(f"[AUTH] Client '{client_name}' authenticated. Ready to receive logs.")
+                        client_socket.sendall(b"OK")
+
+                        # ✅ Retain PSK for log decryption
+                        psk = server_crypt.load_psks(client_name)
+                        logging.info(f"[DEBUG] → 3. Sent OK to client {client_address}, entering log receive loop")
+
+                        #websocket_status = "Not connected"
+                        #with websocket_lock:
+                        #    if client_name in active_websocket_connections:
+                        #        websocket_status = "Connected"
+                        #logging.info(f"[CONN-DEBUG] Client '{client_name}' WebSocket status: {websocket_status}")
+                        # ✅ Log reception loop
+                        while True:
+                            logging.info(f"[DEBUG] → 4. Inside log receive loop for {client_address}")
+                            readable, _, _ = select.select([client_socket], [], [], 0.5)
+                            if not readable:
+                                continue
+
+                            try:
+                                peek_bytes = client_socket.recv(4, socket.MSG_PEEK)
+                                if len(peek_bytes) == 0:
+                                    logging.info(f"[DISCONNECT] Client {client_name} disconnected (empty data)")
+                                    break
+
+                                if len(peek_bytes) == 4:
+                                    potential_size = int.from_bytes(peek_bytes, byteorder='big')
+                                    if 0 < potential_size < 8192:
+                                        logging.info(f"[RECV] Preparing to receive chunked data of size ~{potential_size}")
+                                        encrypted_data = receive_chunked_data(client_socket)
+                                        if not encrypted_data:
+                                            logging.info(f"[DISCONNECT] Client {client_name} disconnected during chunk receive")
+                                            break
+                                    else:
+                                        logging.info(f"[RECV] Receiving standard block (non-chunked)")
+                                        encrypted_data = client_socket.recv(4096)
+                                        if not encrypted_data:
+                                            logging.info(f"[DISCONNECT] Client {client_name} disconnected (standard receive)")
+                                            break
+                                else:
+                                    logging.warning(f"[RECV] Peek data not 4 bytes: {len(peek_bytes)}")
+                                    encrypted_data = client_socket.recv(4096)
+                                    if not encrypted_data:
+                                        logging.info(f"[DISCONNECT] Client {client_name} disconnected (fallback receive)")
+                                        break
+                            except Exception as e:
+                                logging.warning(f"[RECV] Error peeking at data: {e}, falling back to standard receive")
+                                encrypted_data = client_socket.recv(4096)
+                                if not encrypted_data:
+                                    logging.info(f"[DISCONNECT] Client {client_name} disconnected (fallback receive)")
+                                    break
+
+                            try:
+                                if not psk:
+                                    logging.error(f"[RECV] PSK not available for {client_name}")
+                                    try:
+                                        psk = server_crypt.load_psks(client_name)
+                                        logging.info(f"[RECV] Reloaded PSK for {client_name}")
+                                    except Exception as e:
+                                        logging.error(f"[RECV] Failed to reload PSK: {e}")
+                                        continue
+
+                                logging.info(f"[RECV] Attempting decryption of {len(encrypted_data)} bytes from {client_name}")
+                                log_data = server_crypt.decrypt_data_with_psk(psk, encrypted_data)
+
+                                if not log_data:
+                                    logging.warning(f"[RECV] Decryption failed or no logs in decrypted data from {client_name}")
+                                    client_socket.sendall(b"ERROR")
+                                    continue
+
+                                logs = log_data.get("logs", [])
+                                if isinstance(logs, dict):
+                                    logs = [logs]
+
+                                log_count = len(logs)
+                                logging.info(f"[RECV] Successfully decrypted {log_count} logs from {client_name}")
+
+                                for log_entry in logs:
+                                    log_entry["client_name"] = client_name
+                                    try:
+                                        with open(ENDPOINT_LOG_FILE, "a") as log_file:
+                                            log_file.write(json.dumps(log_entry) + "\n")
+                                    except Exception as e:
+                                        logging.error(f"[ERROR] Failed to write client log: {e}")
+
+                                    server_siem.forward_log_to_siem(log_entry, client_name)
+
+                                client_socket.sendall(b"ACK")
+                                logging.debug(f"[RECV] Sent ACK for {log_count} logs to {client_name}")
+
+                            except Exception as e:
+                                logging.error(f"[RECV] Unexpected processing error from {client_name}: {e}")
+                                try:
+                                    client_socket.sendall(b"ERROR")
+                                except Exception as send_err:
+                                    logging.error(f"[SEND] Failed to send ERROR response: {send_err}")
+                                    break
+
+                    except Exception as e:
+                        logging.error(f"[CLIENT] Exception handling client {client_name}: {e}")
+
+            except json.JSONDecodeError:
+                logging.debug(f"[CONN-DEBUG] Received non-JSON data from {client_address[0]}, length: {len(raw)}")
+
                 try:
-                    client_socket.sendall(b"ACK")
-                except Exception as send_err:
-                    logging.error(f"Failed to send ACK: {str(send_err)}")
-                    break
+                    parts = raw.decode("utf-8").split(":")
+                    if len(parts) == 3:
+                        client_name, nonce, client_hmac = parts
+                        try:
+                            psk = server_crypt.load_psks(client_name)
+                        except Exception as e:
+                            logging.warning(f"[AUTH] Unknown client in HMAC fallback: {e}")
+                            client_socket.close()
+                            return
+
+                        expected_hmac = hmac.new(psk, nonce.encode(), hashlib.sha256).hexdigest()
+                        if hmac.compare_digest(client_hmac, expected_hmac):
+                            logging.info(f"[AUTH] HMAC authentication succeeded for {client_name}")
+                            client_socket.sendall(b"AUTH_SUCCESS")
+                        else:
+                            logging.warning(f"[AUTH] Invalid HMAC from {client_address}")
+                            client_socket.close()
+                            return
+                    else:
+                        logging.warning("[AUTH] Invalid HMAC handshake format")
+                        client_socket.close()
+                        return
+                except Exception as e:
+                    logging.warning(f"[AUTH] Error parsing HMAC handshake: {e}")
+                    client_socket.close()
+                    return
+
+        except UnicodeDecodeError:
+            logging.debug(f"[CONN-DEBUG] Non-UTF8 data received from {client_address[0]}, length: {len(raw)}")
 
     except Exception as e:
-        logging.error(f"[ERROR] Unexpected exception from {client_address}: {e}")
+        logging.error(f"[ERROR] Unexpected top-level error from {client_address}: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
     finally:
         logging.info(f"[DISCONNECT] Client {client_address} disconnected.")
         client_socket.close()
-
-# Add new function for receiving chunked data
+        
 def receive_chunked_data(client_socket):
     """Receive data sent in chunks with length prefixes."""
     try:
@@ -412,11 +510,21 @@ def receive_chunked_data(client_socket):
         return None
         
 def get_client_ip_by_name(client_name):
-    """Retrieve a client's IP address by name from PSK store."""
+    """Retrieve a client's IP address with NAT awareness."""
     psks = load_psks()
     
     for agent_id, agent_data in psks.items():
         if agent_data["AgentName"] == client_name:
+            # Check if there's a NAT-detected IP in the connections file
+            from shared_state import get_active_connections
+            connections = get_active_connections()
+            
+            if client_name in connections and "detected_ip" in connections[client_name]:
+                detected_ip = connections[client_name]["detected_ip"]
+                if detected_ip:
+                    return detected_ip
+                
+            # Fall back to stored IP
             return agent_data["AgentIP"]
     
     return None
@@ -541,23 +649,91 @@ def run_yara_scan(client_name, target_path, rule_name=None):
         
     return send_command_to_client(client_name, "yara-scan", params)
 
+# In clients.py
+
 def spawn_ir_shell(client_name):
+    """Initiate an interactive IR shell session with a client."""
+    print(f"[INFO] Establishing IR shell with {client_name}...")
+    
+    # Get client IP address
+    client_ip = get_client_ip_by_name(client_name)
+    if not client_ip:
+        print(f"[ERROR] Unknown client: {client_name}")
+        return {"status": "error", "message": f"Unknown client: {client_name}"}
+    
+    # First try direct connection
+    try:
+        # Try to connect directly to the client on port 6000
+        shell_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        shell_socket.settimeout(5)  # Short timeout for connection attempt
+        
+        print(f"[INFO] Attempting direct connection to {client_name} at {client_ip}:6000...")
+        shell_socket.connect((client_ip, 6000))
+        shell_socket.close()
+        
+        # If we get here, direct connection is possible
+        direct_shell_successful = True
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        print(f"[INFO] Direct connection failed: {e}")
+        direct_shell_successful = False
+    
+    if direct_shell_successful:
+        # Use direct connection for IR shell
+        print(f"[INFO] Using direct connection for IR shell with {client_name}")
+        result = direct_ir_shell(client_name)
+        return result
+    else:
+        # Check if client has an active WebSocket connection
+        from shared_state import is_client_connected
+        
+        if is_client_connected(client_name):
+            from shared_state import get_active_connections
+            connections = get_active_connections()
+            conn_info = connections.get(client_name, {})
+            last_seen = conn_info.get("timestamp", 0)
+            
+            # Format last_seen timestamp for display
+            last_activity = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_seen))
+            
+            print(f"[INFO] Found active WebSocket connection for {client_name}")
+            print(f"[INFO] Last activity: {last_activity}")
+            
+            # Run the virtual_shell_cli in the current event loop
+            # This is a synchronous function that runs an event loop internally
+            return run_async_shell(client_name)
+        else:
+            print(f"[INFO] No active WebSocket connection found for {client_name}")
+            print("[INFO] Client must establish a connection first")
+            return {"status": "error", "message": "Client not connected"}
+
+def run_async_shell(client_name):
+    """Run the asynchronous virtual shell in a synchronous context."""
+    import asyncio
+    from websocket_manager import virtual_shell_cli
+    
+    # Create a new event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        # Run the async function in the event loop
+        result = loop.run_until_complete(virtual_shell_cli(client_name))
+        return result
+    finally:
+        # Clean up
+        loop.close()
+            
+def run_interactive_shell(client_name):
     """
-    Initiate an interactive IR shell session with a client through the encrypted channel.
+    Run an interactive IR shell session using the direct command channel.
     
     Args:
         client_name (str): Client name
         
     Returns:
-        dict: Result of the shell initialization
+        dict: Result of the shell session
     """
-    # Initialize the shell session
-    result = send_command_to_client(client_name, "ir-shell-init")
-    
-    if result.get("status") != "success":
-        return result
-        
-    print(f"\n[INFO] IR Shell session established with {client_name}")
+    print(f"[INFO] IR Shell session established with {client_name}")
     print("[INFO] Type 'exit' to end the session")
     print("[INFO] All commands are executed within the client's security context")
     print("="*60)
@@ -587,15 +763,288 @@ def spawn_ir_shell(client_name):
                 print(output)
             else:
                 print(f"[ERROR] Command failed: {result.get('message', 'Unknown error')}")
-    
+        
+        return {"status": "success", "message": "IR Shell session completed"}
+        
     except KeyboardInterrupt:
         print("\n[INFO] IR Shell session terminated by user")
-        # Attempt to cleanly exit
         send_command_to_client(client_name, "ir-shell-exit")
+        return {"status": "success", "message": "IR Shell session terminated by user"}
     except Exception as e:
-        print(f"\n[ERROR] IR Shell error: {e}")
+        print(f"[ERROR] IR Shell error: {e}")
+        return {"status": "error", "message": str(e)}
+
+def original_spawn_ir_shell(client_name):
+    """Original IR shell implementation for direct connections."""
+    print(f"[INFO] IR Shell session established with {client_name}")
+    print("[INFO] Type 'exit' to end the session")
+    print("[INFO] All commands are executed within the client's security context")
+    print("="*60)
+    
+    try:
+        # Initialize the shell session
+        result = send_command_to_client(client_name, "ir-shell-init")
         
-    return {"status": "success", "message": "IR Shell session completed"}
+        if result.get("status") != "success":
+            print(f"[ERROR] Failed to initialize IR shell: {result.get('message')}")
+            return result
+        
+        # Interactive shell loop
+        while True:
+            command = input(f"{client_name}> ").strip()
+            
+            if command.lower() in ["exit", "quit"]:
+                # Cleanly terminate the shell session
+                send_command_to_client(client_name, "ir-shell-exit")
+                print(f"[INFO] IR Shell session with {client_name} terminated")
+                break
+                
+            if not command:
+                continue
+                
+            # Send the command through the encrypted channel
+            result = send_command_to_client(client_name, "ir-shell-command", {
+                "command": command
+            })
+            
+            if result.get("status") == "success":
+                # Display command output
+                output = result.get("output", "")
+                print(output)
+            else:
+                print(f"[ERROR] Command failed: {result.get('message', 'Unknown error')}")
+        
+        return {"status": "success", "message": "IR Shell session completed"}
+        
+    except KeyboardInterrupt:
+        print("\n[INFO] IR Shell session terminated by user")
+        send_command_to_client(client_name, "ir-shell-exit")
+        return {"status": "success", "message": "IR Shell session terminated by user"}
+    except Exception as e:
+        print(f"[ERROR] IR Shell error: {e}")
+        return {"status": "error", "message": str(e)}
+
+def direct_ir_shell(client_name):
+    """Run IR shell using direct TCP connection."""
+    print(f"[INFO] IR Shell session established with {client_name}")
+    print("[INFO] Type 'exit' to end the session")
+    print("[INFO] All commands are executed within the client's security context")
+    print("="*60)
+    
+    try:
+        # Initialize the shell session
+        result = send_command_to_client(client_name, "ir-shell-init")
+        
+        if result.get("status") != "success":
+            print(f"[ERROR] Failed to initialize IR shell: {result.get('message')}")
+            return result
+        
+        # Interactive shell loop
+        while True:
+            command = input(f"{client_name}> ").strip()
+            
+            if command.lower() in ["exit", "quit"]:
+                # Cleanly terminate the shell session
+                send_command_to_client(client_name, "ir-shell-exit")
+                print(f"[INFO] IR Shell session with {client_name} terminated")
+                break
+                
+            if not command:
+                continue
+                
+            # Send the command through the encrypted channel
+            result = send_command_to_client(client_name, "ir-shell-command", {
+                "command": command
+            })
+            
+            if result.get("status") == "success":
+                # Display command output
+                output = result.get("output", "")
+                print(output)
+            else:
+                print(f"[ERROR] Command failed: {result.get('message', 'Unknown error')}")
+        
+        return {"status": "success", "message": "IR Shell session completed"}
+        
+    except KeyboardInterrupt:
+        print("\n[INFO] IR Shell session terminated by user")
+        send_command_to_client(client_name, "ir-shell-exit")
+        return {"status": "success", "message": "IR Shell session terminated by user"}
+    except Exception as e:
+        print(f"[ERROR] IR Shell error: {e}")
+        return {"status": "error", "message": str(e)}
+
+def websocket_ir_shell(client_name):
+    """
+    Implement IR shell over WebSocket channel for NAT traversal.
+    This function uses the virtual shell approach.
+    """
+    from shared_state import is_client_connected
+    from websocket_manager import virtual_shell_cli
+    
+    # Check connection status first
+    if not is_client_connected(client_name):
+        print(f"[ERROR] Client {client_name} is not connected via active WebSocket")
+        logging.error(f"[IR-SHELL] Failed to start shell - no active connection for {client_name}")
+        return {"status": "error", "message": f"Client {client_name} is not connected via WebSocket"}
+    
+    # Launch the virtual shell CLI
+    print(f"[INFO] Starting virtual WebSocket IR shell for {client_name}")
+    logging.info(f"[IR-SHELL] Starting virtual WebSocket IR shell for {client_name}")
+    
+    # This will run the interactive shell
+    return virtual_shell_cli(client_name)
+
+def verify_websocket_connection(client_name):
+    """Verify that a WebSocket connection is truly active before proceeding with IR shell."""
+    logging.info(f"[CONN-CHECK] Verifying WebSocket connection to {client_name}...")
+    
+    # First check the connection file
+    from shared_state import is_client_connected, get_active_connections
+    
+    if not is_client_connected(client_name):
+        logging.error(f"[CONN-CHECK] No active connection record for {client_name}")
+        return False
+    
+    # Get connection details for logging/debugging
+    connections = get_active_connections()
+    if client_name in connections:
+        conn_info = connections[client_name]
+        last_seen = conn_info.get("timestamp", 0)
+        time_since = int(time.time() - last_seen)
+        socket_id = conn_info.get("socket_id", "unknown")
+        
+        logging.info(f"[CONN-CHECK] Connection info for {client_name}: last seen {time_since}s ago, socket_id: {socket_id}")
+        
+        # IMPORTANT: Just check if the connection is recent enough (within last 30 seconds)
+        # Don't try to get the actual WebSocket object since we're using a file-only approach
+        if time_since < 30:
+            logging.info(f"[CONN-CHECK] Connection to {client_name} verified (recent activity)")
+            return True
+        else:
+            logging.warning(f"[CONN-CHECK] Connection to {client_name} is stale ({time_since}s old)")
+            return False
+    
+    return False
+
+def simple_ir_shell_cli(client_name):
+    """Simple, direct IR shell CLI using file-based communication."""
+    from shared_state import save_ir_cmd_request, get_ir_cmd_response, is_client_connected
+    import os
+    import time
+    import uuid
+    
+    # Check if client is connected
+    if not is_client_connected(client_name):
+        print(f"[ERROR] Client {client_name} is not connected")
+        return {"status": "error", "message": "Client not connected"}
+        
+    print(f"=== IR Shell Session for {client_name} ===")
+    print("Commands will be sent to the client via WebSocket.")
+    print("Type 'exit' to close the session.")
+    print("="*50)
+    
+    # Initialize shell first
+    init_cmd_id = f"cmd_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    
+    # Save command request to file
+    save_ir_cmd_request(client_name, "ir-shell-init", init_cmd_id)
+    
+    print("Initializing IR shell...")
+    print(f"Command ID: {init_cmd_id}")
+    
+    # Wait for response
+    start_time = time.time()
+    init_success = False
+    
+    while time.time() - start_time < 30 and not init_success:
+        # Check for response
+        response = get_ir_cmd_response(init_cmd_id)
+        if response:
+            print(f"Response received: {response}")
+            
+            if response.get("status") == "success":
+                init_success = True
+                print("IR shell initialized successfully!")
+            else:
+                print(f"IR shell initialization failed: {response.get('message', 'Unknown error')}")
+                return {"status": "error", "message": response.get('message', 'Unknown error')}
+            break
+            
+        # Debug logging
+        print(".", end="", flush=True)
+        if (time.time() - start_time) % 5 < 0.2:  # Every ~5 seconds
+            print("\nWaiting for response...")
+            
+        time.sleep(0.5)
+    
+    if not init_success:
+        print("IR shell initialization timed out.")
+        return {"status": "error", "message": "Initialization timeout"}
+    
+    # Main command loop
+    shell_active = True
+    while shell_active:
+        try:
+            # Prompt for command
+            command = input(f"{client_name}> ").strip()
+            
+            if not command:
+                continue
+                
+            if command.lower() in ["exit", "quit"]:
+                print("Terminating IR shell session...")
+                exit_cmd_id = f"cmd_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+                save_ir_cmd_request(client_name, "ir-shell-exit", exit_cmd_id)
+                shell_active = False
+                break
+            
+            # Generate command ID and save request
+            cmd_id = f"cmd_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+            save_ir_cmd_request(client_name, command, cmd_id)
+            print(f"Command sent (ID: {cmd_id})")
+            
+            # Wait for response
+            start_time = time.time()
+            response_received = False
+            
+            while time.time() - start_time < 30 and not response_received:
+                # Check for response
+                response = get_ir_cmd_response(cmd_id)
+                if response:
+                    response_received = True
+                    
+                    # Display response
+                    if response.get("status") == "success":
+                        output = response.get("output", "")
+                        if output:
+                            print(output)
+                        else:
+                            print("[No output]")
+                    else:
+                        error = response.get("message", "Unknown error")
+                        print(f"[ERROR] {error}")
+                    
+                    break
+                
+                # Debug logging
+                print(".", end="", flush=True)
+                if (time.time() - start_time) % 5 < 0.2:  # Every ~5 seconds
+                    print("\nWaiting for response...")
+                
+                time.sleep(0.5)
+            
+            if not response_received:
+                print("Command timed out after 30 seconds")
+                
+        except KeyboardInterrupt:
+            print("\nSession interrupted.")
+            shell_active = False
+        except Exception as e:
+            print(f"[ERROR] {e}")
+    
+    print("IR shell session ended.")
+    return {"status": "success", "message": "IR shell session completed"}
 
 def update_client(client_name):
     """
