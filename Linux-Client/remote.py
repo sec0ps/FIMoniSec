@@ -28,6 +28,8 @@
 #
 # =============================================================================
 import socket
+import asyncio
+import websockets
 import threading
 import logging
 import sys
@@ -45,37 +47,93 @@ from monisec_client import start_process, stop_process, restart_process, is_proc
 # Global flag to track if an IR shell is currently active
 ir_shell_active = False
 
+# WebSocket connection state
+websocket_client = None
+websocket_connected = False
+websocket_reconnect_delay = 5
+websocket_max_reconnect_delay = 60
+websocket_shutdown_event = threading.Event()
+websocket_client_started = False
+websocket_client_lock = threading.Lock()
+
 def get_base_dir():
     """Get the base directory for the application based on script location"""
     return os.path.dirname(os.path.abspath(__file__))
 
-# Set BASE_DIR
-BASE_DIR = get_base_dir()
+# Define BASE_DIR statically
+BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+
+# Update LOG_FILES and LOG_FILE paths
+LOG_FILES = [os.path.join(BASE_DIR, "logs/file_monitor.json")]
+LOG_FILE = os.path.join(BASE_DIR, "logs/file_monitor.json")
+
+# Update AUTH_TOKEN_FILE path
+AUTH_TOKEN_FILE = os.path.join(BASE_DIR, "auth_token.json")
 
 CLIENT_HOST = "0.0.0.0"  # Listen on all interfaces
 CLIENT_PORT = 6000       # Port for receiving commands
-AUTH_TOKEN_FILE = "auth_token.json"
-LOG_FILES = ["./logs/file_monitor.json"]
-LOG_FILE = "./logs/file_monitor.json"
 
 def should_start_listener():
     """
     Checks if the auth_token.json file exists in BASE_DIR.
     Returns True if the file exists, False otherwise.
     """
-    token_path = Path(BASE_DIR) / AUTH_TOKEN_FILE
-    return token_path.exists()
-
+    token_path = AUTH_TOKEN_FILE
+    return os.path.exists(token_path)
+    
 def start_listener_if_authorized():
     """
-    Starts the listening service only if the auth_token.json file exists.
+    Start the client listener and WebSocket client if proper authorization exists,
+    using NAT detection to determine the connection method.
     """
-    if should_start_listener():
-        # Start the listening service
-        start_client_listener()  # Changed from start_listener to start_client_listener
-        logging.info(f"Listening service started on {CLIENT_HOST}:{CLIENT_PORT}")
-    else:
-        logging.info("Auth token file not found. Listening service not started.")
+    # Check if auth file exists
+    if not os.path.exists(AUTH_TOKEN_FILE):
+        logging.info("Authentication token file not found. Running in local-only mode.")
+        return False
+    
+    # Check if all values are populated
+    try:
+        with open(AUTH_TOKEN_FILE, 'r') as f:
+            auth_data = json.load(f)
+            
+        # Verify all required fields exist and are populated
+        if not all(key in auth_data and auth_data[key] for key in ["server_ip", "client_name", "psk"]):
+            logging.info("Authentication token file is missing required fields. Running in local-only mode.")
+            return False
+            
+        # Detect NAT status to decide on connection method
+        use_websocket = detect_nat_and_set_connection_mode()
+        
+        # If we get here, all conditions are met
+        logging.info(f"Authentication verified. Starting client connectivity to server {auth_data['server_ip']}...")
+        
+        if use_websocket:
+            logging.info("[CONN] NAT detected or connection issue - using WebSocket as primary connection")
+            
+            # Start the WebSocket client in a thread
+            websocket_thread = threading.Thread(target=start_websocket_client, daemon=True)
+            websocket_thread.start()
+            
+            # Also try direct connection as backup
+            listener_thread = threading.Thread(target=start_client_listener, daemon=True)
+            listener_thread.start()
+            
+        else:
+            logging.info("[CONN] Direct connectivity available - using TCP as primary connection")
+            
+            # Start the listener in a thread for direct commands
+            listener_thread = threading.Thread(target=start_client_listener, daemon=True)
+            listener_thread.start()
+            
+            # Also start WebSocket as a secondary channel
+            websocket_thread = threading.Thread(target=start_websocket_client, daemon=True)
+            websocket_thread.start()
+        
+        return True
+        
+    except (json.JSONDecodeError, IOError) as e:
+        logging.error(f"Error reading authentication token file: {e}")
+        return False
         
 def start_client_listener():
     """Starts a TCP server to receive and execute remote commands from monisec-server."""
@@ -116,20 +174,18 @@ def import_psk():
         "psk": psk_value
     }
 
-    with open("auth_token.json", "w") as f:
+    with open(AUTH_TOKEN_FILE, "w") as f:
         json.dump(token_data, f, indent=4)
-    os.chmod("auth_token.json", 0o600)
+    os.chmod(AUTH_TOKEN_FILE, 0o600)
 
     print("[INFO] PSK imported and stored securely.")
     
 def authenticate_with_server():
     """Authenticates with the MoniSec server using stored IP and PSK from auth_token.json."""
 
-    token_file = "auth_token.json"
-
     # Load stored authentication data
     try:
-        with open(token_file, "r") as f:
+        with open(AUTH_TOKEN_FILE, "r") as f:
             token_data = json.load(f)
             server_ip = token_data.get("server_ip")
             client_name = token_data.get("client_name")
@@ -223,17 +279,39 @@ def send_chunked_data(sock, data):
         return False
 
 def send_logs_to_server():
+    """Continuously monitor log files and send new entries to the server."""
     RETRIES = 5
-    DELAY = 3  # seconds between retries
-    # Threshold for using chunked transfer (bytes)
+    DELAY = 3
     CHUNKING_THRESHOLD = 4000
 
     try:
+        logging.info(f"[LOGS] Starting log transmission service with files: {LOG_FILES}")
+
+        # Log file diagnostics
+        for log_file in LOG_FILES:
+            exists = os.path.exists(log_file)
+            size = os.path.getsize(log_file) if exists else 0
+            permissions = oct(os.stat(log_file).st_mode & 0o777) if exists else "N/A"
+            logging.info(f"[LOGS] Log file: {log_file}, Exists: {exists}, Size: {size}, Permissions: {permissions}")
+
         with open(AUTH_TOKEN_FILE, "r") as f:
             token_data = json.load(f)
             server_ip = token_data["server_ip"]
             client_name = token_data["client_name"]
-            psk = token_data["psk"]  # Not used directly; client_crypt loads it
+            psk = token_data["psk"]
+
+        # NAT Detection
+        try:
+            logging.info("[NAT-DETECT] Connecting to server at {}:5555...".format(server_ip))
+            sock_nat = socket.create_connection((server_ip, 5555), timeout=5)
+            sock_nat.sendall(json.dumps({"command": "get_client_ip"}).encode("utf-8"))
+            response = sock_nat.recv(1024)
+            server_view = json.loads(response.decode("utf-8"))
+            if "client_ip" in server_view:
+                logging.info(f"[NAT-DETECT] Server sees us as: {server_view['client_ip']}")
+            sock_nat.close()
+        except Exception as e:
+            logging.warning(f"[NAT-DETECT] NAT detection failed: {e}")
 
         sock = None
         for attempt in range(RETRIES):
@@ -242,91 +320,153 @@ def send_logs_to_server():
                 sock.settimeout(10)
                 sock.connect((server_ip, 5555))
 
-                # Send cleartext client_name as JSON handshake
-                handshake = json.dumps({"client_name": client_name})
-                sock.sendall(handshake.encode("utf-8"))
+                # Use the same method that works in authenticate_with_server()
+                # Send a JSON handshake instead of an HMAC handshake
+                handshake_data = {
+                    "client_name": client_name,
+                    "timestamp": time.time()
+                }
+                handshake_json = json.dumps(handshake_data)
+                sock.sendall(handshake_json.encode("utf-8"))
 
-                logging.info(f"[INFO] Connected to server and sent handshake. Attempt {attempt + 1}")
+                sock.settimeout(5)
+                response = sock.recv(1024)
+                logging.info(f"[LOGS] Handshake response from server: {response}")
+
+                if not response or response != b"OK":
+                    logging.warning(f"[LOGS] Bad handshake response: {response}")
+                    if attempt < RETRIES - 1:  # Don't raise on the last attempt to allow the outer loop to handle it
+                        continue
+                    raise ConnectionError("Bad handshake response")
+
+                logging.info(f"[LOGS] Connected to server and authenticated. Attempt {attempt + 1}")
                 break
             except Exception as e:
-                logging.error(f"[ERROR] Connection attempt {attempt + 1} failed: {e}")
+                logging.error(f"[LOGS] Connection attempt {attempt + 1} failed: {e}")
+                if sock:
+                    sock.close()
+                    sock = None
                 time.sleep(DELAY)
         else:
-            logging.critical("[CRITICAL] Could not connect to server after multiple attempts.")
+            logging.critical("[LOGS] Could not connect to server after multiple attempts.")
             return
 
-        file_positions = {}
-        for log_file in LOG_FILES:
-            file_positions[log_file] = os.path.getsize(log_file) if os.path.exists(log_file) else 0
-            logging.info(f"Initial position for {log_file}: {file_positions[log_file]}")
+        file_positions = {
+            log_file: os.path.getsize(log_file) if os.path.exists(log_file) else 0
+            for log_file in LOG_FILES
+        }
+        for log_file, pos in file_positions.items():
+            logging.info(f"[LOGS] Initial position for {log_file}: {pos}")
 
         while True:
-            logs_to_send = []
-
+            logs_to_send = {}
             for log_file in LOG_FILES:
                 if os.path.exists(log_file):
                     try:
                         current_size = os.path.getsize(log_file)
-                        
+                        if current_size < file_positions[log_file]:
+                            logging.warning(f"[LOGS] Log file {log_file} rotated/truncated. Resetting position.")
+                            file_positions[log_file] = 0
+
                         if current_size <= file_positions[log_file]:
                             continue
-                            
+
                         with open(log_file, "r") as f:
                             f.seek(file_positions[log_file])
                             new_logs = f.read()
                             new_position = f.tell()
-                            
-                            if new_logs:
-                                file_positions[log_file] = new_position
-                                entries = extract_valid_json_objects(new_logs)
-                                logging.info(f"Extracted {len(entries)} valid entries from {log_file}")
-                                
-                                for entry in entries:
-                                    if isinstance(entry, dict):
-                                        # Clone the entry and add client_name
-                                        full_entry = entry.copy()
-                                        full_entry["client_name"] = client_name
-                                        logs_to_send.append(full_entry)
-                    except Exception as e:
-                        logging.error(f"Error reading log file {log_file}: {e}")
 
-            if logs_to_send:
+                            if new_logs:
+                                entries = extract_valid_json_objects(new_logs)
+                                logging.info(f"[LOGS] Extracted {len(entries)} entries from {log_file}")
+
+                                if entries:
+                                    sample = str(entries[0])[:100]
+                                    logging.info(f"[LOGS] Sample entry: {sample}...")
+
+                                    if log_file not in logs_to_send:
+                                        logs_to_send[log_file] = {
+                                            "entries": [],
+                                            "new_position": new_position
+                                        }
+
+                                    for entry in entries:
+                                        if isinstance(entry, dict):
+                                            entry["client_name"] = client_name
+                                            logs_to_send[log_file]["entries"].append(entry)
+                    except Exception as e:
+                        logging.error(f"[LOGS] Error reading {log_file}: {e}")
+
+            if any(data["entries"] for data in logs_to_send.values()):
                 try:
-                    message = json.dumps({"logs": logs_to_send})
-                    message_size = len(message)
-                    
+                    all_logs = []
+                    for data in logs_to_send.values():
+                        all_logs.extend(data["entries"])
+
+                    message = json.dumps({
+                        "logs": all_logs,
+                        "client_name": client_name
+                    })
+
+                    logging.info(f"[LOGS] Sending {len(all_logs)} logs to server...")
+                    # Import client_crypt here to avoid circular imports
+                    from client_crypt import encrypt_data
                     encrypted = encrypt_data(message)
-                    encrypted_size = len(encrypted)
                     
-                    # Use chunked transfer for large messages
-                    if encrypted_size > CHUNKING_THRESHOLD:
-                        logging.info(f"Using chunked transfer for large message ({encrypted_size} bytes)")
+                    if len(encrypted) > CHUNKING_THRESHOLD:
+                        logging.info(f"[LOGS] Sending chunked data ({len(encrypted)} bytes)")
                         success = send_chunked_data(sock, encrypted)
                         if not success:
-                            logging.error("Failed to send chunked data")
-                            break
+                            raise ConnectionError("Chunked data send failed")
                     else:
-                        # Use original method for smaller messages
                         sock.sendall(encrypted)
-                    
+
+                    sock.settimeout(5)
                     ack = sock.recv(1024)
-                    if ack != b"ACK":
-                        logging.warning(f"Unexpected server response: {ack}")
-                        break
+                    if ack == b"ACK":
+                        logging.info(f"[LOGS] Logs sent and ACK received.")
+                        for log_file, data in logs_to_send.items():
+                            file_positions[log_file] = data["new_position"]
                     else:
-                        logging.info(f"Successfully sent {len(logs_to_send)} logs to server")
+                        logging.warning(f"[LOGS] Unexpected server response: {ack}")
+                        if not ack:
+                            raise ConnectionError("No ACK, possible disconnect")
+
                 except Exception as e:
-                    logging.error(f"[SEND ERROR] {e}")
-                    break
+                    logging.error(f"[LOGS] Send error: {e}")
+                    try:
+                        sock.close()
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(10)
+                        sock.connect((server_ip, 5555))
+
+                        # Use the same JSON handshake method that works for reconnection
+                        handshake_data = {
+                            "client_name": client_name,
+                            "timestamp": time.time()
+                        }
+                        handshake_json = json.dumps(handshake_data)
+                        sock.sendall(handshake_json.encode("utf-8"))
+
+                        sock.settimeout(5)
+                        response = sock.recv(1024)
+                        logging.info(f"[LOGS] Reconnected. Handshake response: {response}")
+                        
+                        if not response or response != b"OK":
+                            logging.warning(f"[LOGS] Reconnection failed: {response}")
+                            raise ConnectionError("Failed to authenticate after reconnection")
+                    except Exception as reconnect_err:
+                        logging.error(f"[LOGS] Failed to reconnect: {reconnect_err}")
+                        break
 
             time.sleep(2)
 
     except Exception as e:
-        logging.error(f"[CLIENT ERROR] {e}")
+        logging.error(f"[LOGS] Fatal client error: {e}")
     finally:
         if sock:
             sock.close()
-            logging.info("Connection to server closed")
+            logging.info("[LOGS] Connection to server closed.")
 
 def extract_valid_json_objects(buffer):
     """Extract valid JSON objects from a buffer, handling complete JSON objects at the root level."""
@@ -378,7 +518,6 @@ def extract_valid_json_objects(buffer):
     logging.info(f"Successfully extracted {len(logs)} log entries")
     return logs
 
-# Add new functions for chunked transfers
 def send_chunked_data(sock, data):
     """Send data in manageable chunks with length prefixes."""
     try:
@@ -428,8 +567,13 @@ def check_auth_and_send_logs():
                 success = authenticate_with_server()
                 if success:
                     logging.info("[INFO] Authentication successful. Starting real-time log transmission...")
+                    
+                    # Start regular log transmission thread
                     log_thread = threading.Thread(target=send_logs_to_server, daemon=True)
                     log_thread.start()
+                    
+                    # Start WebSocket client for command channel
+                    start_websocket_client()
                 else:
                     logging.warning("[WARNING] Authentication failed. Logging locally only.")
             else:
@@ -716,6 +860,8 @@ def handle_update_command(params):
             "message": f"Update failed: {e}"
         }
 
+###### IR Shell code
+
 def start_ir_shell(port):
     """Start a limited shell for incident response purposes."""
     global ir_shell_active
@@ -904,3 +1050,562 @@ def execute_ir_command(command):
         return "Command timed out after 10 seconds"
     except Exception as e:
         return f"Error executing command: {e}"
+
+#### Start websocket IR shell code
+
+async def websocket_client_connect(server_ip, client_name, psk):
+    """Connect to WebSocket server, authenticate, and start command polling."""
+    global websocket_connected, websocket_client
+
+    uri = f"ws://{server_ip}:8765/ws"
+
+    while not websocket_shutdown_event.is_set():
+        try:
+            async with websockets.connect(uri, ping_interval=15, ping_timeout=10) as websocket:
+                websocket_client = websocket
+                websocket_connected = True
+
+                # Authentication handshake
+                await websocket.send(json.dumps({
+                    "client_name": client_name,
+                    "client_version": "1.0",
+                    "nat_status": "detected"
+                }))
+
+                challenge_msg = await websocket.recv()
+                challenge_data = json.loads(challenge_msg)
+                challenge = challenge_data.get("challenge")
+
+                response_hmac = hmac.new(psk.encode(), challenge.encode(), hashlib.sha256).hexdigest()
+                await websocket.send(json.dumps({"hmac": response_hmac}))
+
+                auth_result = json.loads(await websocket.recv())
+                if auth_result.get("status") != "success":
+                    logging.error("[WEBSOCKET] Auth failed")
+                    continue
+
+                logging.info(f"[WEBSOCKET] Auth success for {client_name}")
+                websocket_reconnect_delay = 5
+
+                # Launch command poller and heartbeat tasks
+                poll_task = asyncio.create_task(poll_for_commands(client_name, websocket))
+                heartbeat_task = asyncio.create_task(maintain_heartbeat(websocket))
+
+                # Send an immediate poll request after connection
+                await poll_for_commands_now(websocket)
+
+                try:
+                    while not websocket_shutdown_event.is_set():
+                        message = await websocket.recv()
+                        await process_websocket_message(websocket, message)
+                except websockets.exceptions.ConnectionClosed:
+                    logging.info("[WEBSOCKET] Connection closed")
+                finally:
+                    # Cancel the background tasks when connection is closed
+                    poll_task.cancel()
+                    heartbeat_task.cancel()
+                    try:
+                        # Wait for tasks to complete their cancellation
+                        await asyncio.gather(poll_task, heartbeat_task, return_exceptions=True)
+                    except asyncio.CancelledError:
+                        pass
+
+        except Exception as e:
+            logging.error(f"[WEBSOCKET] Connect error: {e}")
+            websocket_connected = False
+            await asyncio.sleep(websocket_reconnect_delay)
+            websocket_reconnect_delay = min(websocket_reconnect_delay * 2, websocket_max_reconnect_delay)
+
+async def websocket_heartbeat(websocket):
+    """Enhanced heartbeat function with better failure detection."""
+    heartbeat_interval = 30  # seconds
+    missed_heartbeats = 0
+    max_missed = 3  # Reconnect after 3 missed responses
+
+    while not websocket_shutdown_event.is_set():
+        try:
+            # Send heartbeat message
+            await websocket.send(json.dumps({
+                "type": "heartbeat",
+                "timestamp": time.time()
+            }))
+            # Removed DEBUG log
+
+            # Wait for response with timeout
+            try:
+                # Use a shorter timeout than the heartbeat interval
+                response_wait = asyncio.wait_for(websocket.recv(), timeout=10)
+                response = await response_wait
+                response_data = json.loads(response)
+                
+                if response_data.get("type") == "heartbeat_ack":
+                    # Reset counter on successful heartbeat
+                    missed_heartbeats = 0
+                    # Removed DEBUG log
+                # If it's not a heartbeat_ack, we still got a response, so connection is alive
+                
+            except asyncio.TimeoutError:
+                missed_heartbeats += 1
+                logging.warning(f"[WEBSOCKET] Missed heartbeat response: {missed_heartbeats}/{max_missed}")
+                
+                if missed_heartbeats >= max_missed:
+                    logging.error("[WEBSOCKET] Too many missed heartbeats, connection likely dead")
+                    return  # Exit the function to trigger reconnection
+            
+            # Wait for the next interval
+            await asyncio.sleep(heartbeat_interval)
+
+        except Exception as e:
+            logging.error(f"[WEBSOCKET] Heartbeat error: {e}")
+            break  # Exit loop to allow reconnection
+
+async def maintain_heartbeat(websocket):
+    """Send periodic heartbeats to keep the connection alive."""
+    try:
+        while True:
+            try:
+                # Send heartbeat message
+                await websocket.send(json.dumps({
+                    "type": "heartbeat",
+                    "timestamp": time.time()
+                }))
+                # Removed DEBUG log
+                
+                # Wait for the next interval
+                await asyncio.sleep(30)  # Send heartbeat every 30 seconds
+            except asyncio.CancelledError:
+                # Removed DEBUG log
+                return
+            except Exception as e:
+                logging.error(f"[WEBSOCKET] Heartbeat error: {e}")
+                return  # Exit heartbeat process to allow reconnection
+    except Exception as e:
+        logging.error(f"[WEBSOCKET] Heartbeat task error: {e}")
+
+async def process_shell_command(websocket, client_name, command, command_id):
+    """Process a single shell command and send the response."""
+    global ir_shell_active
+    
+    try:
+        # Execute different command types
+        if command == "ir-shell-init":
+            ir_shell_active = True
+            response = {
+                "status": "success",
+                "message": "IR shell initialized"
+            }
+            logging.info("[WEBSOCKET] IR shell initialized")
+            
+        elif command == "ir-shell-exit":
+            ir_shell_active = False
+            response = {
+                "status": "success",
+                "message": "IR shell terminated"
+            }
+            logging.info("[WEBSOCKET] IR shell terminated")
+            
+        else:
+            # Execute command if IR shell is active
+            if not ir_shell_active:
+                response = {
+                    "status": "error",
+                    "message": "No active IR shell session"
+                }
+                logging.warning("[WEBSOCKET] Command rejected - IR shell not active")
+            else:
+                # Execute the command
+                output = execute_ir_command(command)
+                response = {
+                    "status": "success",
+                    "output": output
+                }
+                logging.info(f"[WEBSOCKET] Executed command: {command}")
+        
+        # Send the response
+        await websocket.send(json.dumps({
+            "type": "ir_shell_response",
+            "command_id": command_id,
+            "response": response
+        }))
+        logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
+        
+    except Exception as e:
+        logging.error(f"[WEBSOCKET] Error processing command {command}: {e}")
+        try:
+            # Try to send error response
+            await websocket.send(json.dumps({
+                "type": "ir_shell_response",
+                "command_id": command_id,
+                "response": {
+                    "status": "error",
+                    "message": f"Error processing command: {str(e)}"
+                }
+            }))
+        except:
+            logging.error("[WEBSOCKET] Failed to send error response")
+
+async def process_websocket_command(websocket, message):
+    """Process commands received over WebSocket with proper handling of all message types."""
+    global ir_shell_active
+
+    try:
+        # Log incoming message but truncate if too long
+       # logging.info(f"[WEBSOCKET-DEBUG] Received message: {message[:100]}..." if len(message) > 100 else f"[WEBSOCKET-DEBUG] Received message: {message}")
+
+        # Parse the message as JSON
+        data = json.loads(message)
+        command_type = data.get("type")
+        
+        logging.info(f"[WEBSOCKET] Processing message type: {command_type}")
+        
+        # Handle different message types
+        if command_type == "ir_shell_command":
+            # Extract command details
+            command_id = data.get("command_id")
+            command = data.get("command")
+            
+            logging.info(f"[WEBSOCKET] Received IR shell command: {command} (ID: {command_id})")
+            
+            # Process different IR shell commands
+            if command == "ir-shell-init":
+                # Initialize IR shell
+                ir_shell_active = True
+                response = {
+                    "status": "success",
+                    "message": "IR shell initialized"
+                }
+                logging.info("[WEBSOCKET] IR shell initialized")
+                
+            elif command == "ir-shell-exit":
+                # Terminate IR shell
+                ir_shell_active = False
+                response = {
+                    "status": "success",
+                    "message": "IR shell terminated"
+                }
+                logging.info("[WEBSOCKET] IR shell terminated")
+                
+            else:
+                # Execute command if IR shell is active
+                if not ir_shell_active:
+                    response = {
+                        "status": "error",
+                        "message": "No active IR shell session"
+                    }
+                    logging.warning("[WEBSOCKET] IR shell command received but no session is active")
+                else:
+                    # Execute the command
+                    output = execute_ir_command(command)
+                    response = {
+                        "status": "success",
+                        "output": output
+                    }
+                    logging.info(f"[WEBSOCKET] Executed IR shell command: {command}")
+            
+            # Send the response
+            await websocket.send(json.dumps({
+                "type": "ir_shell_response",
+                "command_id": command_id,
+                "response": response
+            }))
+            logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
+            
+        elif command_type == "heartbeat":
+            # Simply respond to the heartbeat with our own
+            await websocket.send(json.dumps({
+                "type": "heartbeat",
+                "timestamp": time.time()
+            }))
+            logging.debug("[WEBSOCKET] Replied to heartbeat from server")
+            
+        elif command_type == "heartbeat_ack":
+            # Just acknowledge the receipt
+            logging.debug("[WEBSOCKET] Received heartbeat acknowledgment")
+            
+        else:
+            logging.warning(f"[WEBSOCKET] Unknown command type received: {command_type}")
+            
+    except json.JSONDecodeError:
+        logging.error(f"[WEBSOCKET] Invalid JSON message: {message[:100]}")
+    except Exception as e:
+        logging.error(f"[WEBSOCKET] Error processing message: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+
+async def process_websocket_message(websocket, message):
+    """Process incoming WebSocket messages with improved logging and error handling."""
+    global ir_shell_active
+    
+    try:
+        # Removed DEBUG log
+        
+        data = json.loads(message)
+        message_type = data.get("type")
+        
+        if message_type == "pending_commands":
+            commands = data.get("commands", [])
+            
+            if not commands:
+                # Removed DEBUG log
+                return
+                
+            logging.info(f"[WEBSOCKET] Received {len(commands)} pending commands")
+            
+            # Process each command
+            for cmd in commands:
+                # Get command details
+                command = cmd.get("shell_command")
+                command_id = cmd.get("command_id")
+                
+                if not command or not command_id:
+                    logging.warning(f"[WEBSOCKET] Incomplete command data: {cmd}")
+                    continue
+                    
+                logging.info(f"[WEBSOCKET] Processing command: {command} (ID: {command_id})")
+                
+                # Handle the command based on type
+                if command == "ir-shell-init":
+                    # Initialize IR shell
+                    ir_shell_active = True
+                    response = {
+                        "status": "success",
+                        "message": "IR shell initialized"
+                    }
+                    logging.info("[WEBSOCKET] Virtual IR shell initialized")
+                    
+                elif command == "ir-shell-exit":
+                    # Terminate IR shell
+                    ir_shell_active = False
+                    response = {
+                        "status": "success",
+                        "message": "IR shell terminated"
+                    }
+                    logging.info("[WEBSOCKET] Virtual IR shell terminated")
+                    
+                else:
+                    # Execute command if IR shell is active
+                    if not ir_shell_active:
+                        response = {
+                            "status": "error",
+                            "message": "No active IR shell session"
+                        }
+                        logging.warning("[WEBSOCKET] Command rejected - IR shell not active")
+                    else:
+                        # Execute the command
+                        try:
+                            output = execute_ir_command(command)
+                            response = {
+                                "status": "success",
+                                "output": output
+                            }
+                            logging.info(f"[WEBSOCKET] Executed command: {command}")
+                        except Exception as e:
+                            response = {
+                                "status": "error",
+                                "message": f"Command execution failed: {str(e)}"
+                            }
+                            logging.error(f"[WEBSOCKET] Command execution failed: {e}")
+                
+                # Send the response with the right format
+                try:
+                    response_msg = {
+                        "type": "ir_shell_response",
+                        "command_id": command_id,
+                        "response": response
+                    }
+                    await websocket.send(json.dumps(response_msg))
+                    logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
+                except Exception as e:
+                    logging.error(f"[WEBSOCKET] Failed to send response for command {command_id}: {e}")
+        
+        elif message_type == "heartbeat":
+            await websocket.send(json.dumps({
+                "type": "heartbeat_ack",
+                "timestamp": time.time()
+            }))
+            # Removed DEBUG log
+            
+        elif message_type == "heartbeat_ack":
+            # Just acknowledge the receipt
+            # Removed DEBUG log
+            pass
+            
+        else:
+            logging.warning(f"[WEBSOCKET] Unknown message type: {message_type}")
+            
+    except json.JSONDecodeError:
+        logging.error(f"[WEBSOCKET] Invalid JSON message: {message[:100]}")
+    except Exception as e:
+        logging.error(f"[WEBSOCKET] Error processing message: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+
+def maintain_websocket_connection():
+    """Maintain a persistent WebSocket connection with automatic reconnection."""
+    global websocket_client, websocket_connected, websocket_client_started
+    
+    while not websocket_shutdown_event.is_set():
+        try:
+            if not websocket_connected and not websocket_client_started:
+                logging.info("[WEBSOCKET] Connection not active, initiating new connection")
+                start_websocket_client()
+            
+            # Check connection health every 10 seconds
+            time.sleep(10)
+        except Exception as e:
+            logging.error(f"[WEBSOCKET] Connection monitor error: {e}")
+            time.sleep(5)  # Wait before retrying
+
+def start_websocket_client():
+    """Start the WebSocket client in a background thread with its own event loop."""
+    global websocket_client_started, websocket_client_lock, websocket_connected
+
+    with websocket_client_lock:
+        if websocket_client_started:
+            logging.info("[WEBSOCKET] Already running")
+            return
+
+        try:
+            if not os.path.exists(AUTH_TOKEN_FILE):
+                logging.warning("[WEBSOCKET] Auth token missing")
+                return
+
+            with open(AUTH_TOKEN_FILE, 'r') as f:
+                data = json.load(f)
+
+            server_ip = data.get("server_ip")
+            client_name = data.get("client_name")
+            psk = data.get("psk")
+
+            if not all([server_ip, client_name, psk]):
+                logging.warning("[WEBSOCKET] Incomplete credentials")
+                return
+
+            websocket_shutdown_event.clear()
+
+            def run():
+                global websocket_client_started  # ✅ Ensure this affects the actual global flag
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                websocket_client_started = True
+                try:
+                    loop.run_until_complete(websocket_client_connect(server_ip, client_name, psk))
+                finally:
+                    websocket_client_started = False
+                    loop.close()
+
+            threading.Thread(target=run, daemon=True).start()
+            logging.info("[WEBSOCKET] WebSocket client started")
+
+        except Exception as e:
+            logging.error(f"[WEBSOCKET] Launch error: {e}")
+            websocket_client_started = False
+
+def detect_nat_and_set_connection_mode():
+    """
+    Detect if the client is behind NAT and set the appropriate connection mode.
+    Returns True if WebSocket should be used, False if direct TCP is sufficient.
+    """
+    try:
+        logging.info("[NAT-DETECT] Checking for NAT situation...")
+        
+        # Load auth token to get server details
+        if not os.path.exists(AUTH_TOKEN_FILE):
+            logging.info("[NAT-DETECT] No auth token found. Cannot determine NAT status.")
+            return False
+            
+        with open(AUTH_TOKEN_FILE, "r") as f:
+            token_data = json.load(f)
+            server_ip = token_data.get("server_ip")
+            
+        if not server_ip:
+            logging.info("[NAT-DETECT] No server IP in auth token. Cannot determine NAT status.")
+            return False
+        
+        # Step 1: Try to establish a TCP connection to the server
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_socket.settimeout(5)
+        
+        try:
+            logging.info(f"[NAT-DETECT] Connecting to server at {server_ip}:5555...")
+            test_socket.connect((server_ip, 5555))
+            
+            # Step 2: Get our local IP address from this connection
+            local_ip, local_port = test_socket.getsockname()
+            logging.info(f"[NAT-DETECT] Local connection info: {local_ip}:{local_port}")
+            
+            # Step 3: Ask the server what IP it sees for us
+            handshake = json.dumps({"command": "get_client_ip"})
+            test_socket.sendall(handshake.encode("utf-8"))
+            
+            response = test_socket.recv(1024).decode("utf-8")
+            remote_view = json.loads(response)
+            remote_ip = remote_view.get("client_ip")
+            
+            logging.info(f"[NAT-DETECT] Server sees us as: {remote_ip}")
+            
+            # Compare the IPs - if different, we're likely behind NAT
+            is_natted = (local_ip != remote_ip)
+            
+            logging.info(f"[NAT-DETECT] NAT detected: {is_natted}")
+            return is_natted
+            
+        except Exception as e:
+            logging.warning(f"[NAT-DETECT] Connection error during NAT detection: {e}")
+            # If we can't connect, assume we need WebSocket for reliability
+            return True
+            
+    except Exception as e:
+        logging.error(f"[NAT-DETECT] Error detecting NAT: {e}")
+        return True  # Default to WebSocket on error for reliability
+    finally:
+        if 'test_socket' in locals():
+            test_socket.close()
+            
+async def poll_for_commands(client_name, websocket):
+    """Poll the server for pending commands on a regular interval."""
+    logging.info("[COMMAND-POLL] Starting WebSocket command poller")
+
+    try:
+        while True:
+            try:
+                # Send poll request
+                await websocket.send(json.dumps({
+                    "type": "poll_commands",
+                    "client_name": client_name,
+                    "timestamp": time.time()
+                }))
+                # Removed DEBUG log
+            except Exception as e:
+                logging.error(f"[COMMAND-POLL] Failed to send poll request: {e}")
+                
+            # Wait before next poll
+            await asyncio.sleep(5)  # Poll every 5 seconds
+    except asyncio.CancelledError:
+        logging.info("[COMMAND-POLL] Polling task cancelled")
+    except Exception as e:
+        logging.error(f"[COMMAND-POLL] Error in polling task: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+
+async def poll_for_commands_now(websocket):
+    """Send an immediate request to poll for pending commands."""
+    try:
+        # Get client_name from auth token file
+        with open(AUTH_TOKEN_FILE, "r") as f:
+            token_data = json.load(f)
+            client_name = token_data.get("client_name")
+            
+        if not client_name:
+            logging.error("[COMMAND-POLL] Cannot poll: client_name not found in auth token")
+            return
+
+        # Send poll request
+        await websocket.send(json.dumps({
+            "type": "poll_commands",
+            "client_name": client_name,
+            "timestamp": time.time()
+        }))
+        # Removed DEBUG log
+    except Exception as e:
+        logging.error(f"[COMMAND-POLL] Poll request error: {e}")
