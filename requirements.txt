@@ -6,3 +6,4 @@ pandas
 scikit-learn
 psutil
 websockets
+joblib
