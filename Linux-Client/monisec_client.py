@@ -176,12 +176,35 @@ def create_default_config():
             "siem_server": "",
             "siem_port": 0
         },
+        "enhanced_fim": {
+            "enabled": True,
+            "environment": "production",
+            "performance": {
+                "system_load_threshold": 75,
+                "io_threshold": 80,
+                "worker_threads": 4
+            },
+            "behavioral": {
+                "training_samples": 100,
+                "retraining_interval": 86400,
+                "max_baseline_samples": 10000
+            },
+            "content_analysis": {
+                "diff_threshold": 0.3,
+                "max_file_size": 10485760
+            },
+            "detection": {
+                "risk_multiplier": 1.5,
+                "alert_threshold": 70
+            }
+        },
         "instructions": {
             "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
             "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
             "exclusions": "Specify directories or files to be excluded from scanning and monitoring.",
             "performance": "Adjust performance settings based on system resources.",
-            "siem_settings": "Set 'enabled' to true, and provide 'siem_server' and 'siem_port' for SIEM logging."
+            "siem_settings": "Set 'enabled' to true, and provide 'siem_server' and 'siem_port' for SIEM logging.",
+            "enhanced_fim": "Configure enhanced file integrity monitoring capabilities including performance optimization, behavioral analysis, content analysis, and detection."
         }
     }
     
