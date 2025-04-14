@@ -341,7 +341,6 @@ class LogAnomalyDetector:
         """Get detector metrics"""
         return self.metrics
 
-
 class LogFeatureExtractor:
     """Feature extraction for log entries"""
     
@@ -364,7 +363,80 @@ class LogFeatureExtractor:
             "categorical_fields": {},
             "timestamp_patterns": Counter()
         }
+ 
+    def extract_advanced_features(self, log_entry):
+        """
+        Extract advanced behavioral features from log entry
+        
+        Args:
+            log_entry: Parsed log entry dictionary
+            
+        Returns:
+            dict: Advanced behavioral features
+        """
+        features = {}
+        
+        # Extract timestamp-based features
+        timestamp = log_entry.get("timestamp")
+        if timestamp:
+            try:
+                # Convert to datetime object
+                if isinstance(timestamp, str):
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    
+                    # Extract time features
+                    features["hour"] = dt.hour
+                    features["minute"] = dt.minute
+                    features["is_business_hours"] = 1 if 9 <= dt.hour <= 17 else 0
+                    features["is_weekend"] = 1 if dt.weekday() >= 5 else 0
+                    features["is_night"] = 1 if dt.hour < 6 or dt.hour >= 22 else 0
+            except (ValueError, TypeError):
+                pass
+        
+        # Extract source-based features
+        ip = log_entry.get("ip")
+        if ip:
+            # Check if internal or external IP
+            features["is_internal_ip"] = 1 if self._is_internal_ip(ip) else 0
+            
+            # Check if IP is in a suspicious geolocation (requires geoip lookup)
+            # features["is_suspicious_geo"] = self._check_suspicious_geo(ip)
+        
+        # Extract command-based features
+        message = log_entry.get("message", "")
+        if isinstance(message, str):
+            # Check for command length (unusually long commands are suspicious)
+            features["command_length"] = len(message)
+            
+            # Check for special characters ratio
+            special_chars = sum(1 for c in message if not c.isalnum() and not c.isspace())
+            if len(message) > 0:
+                features["special_char_ratio"] = special_chars / len(message)
+            
+            # Check for obfuscation indicators
+            features["has_base64"] = 1 if "base64" in message.lower() else 0
+            features["has_hex_chars"] = 1 if re.search(r'\\x[0-9a-f]{2}', message.lower()) else 0
+            features["has_encoded_chars"] = 1 if re.search(r'%[0-9a-f]{2}', message.lower()) else 0
+            
+            # Check for pipe usage (command chaining)
+            features["pipe_count"] = message.count("|")
+            features["semicolon_count"] = message.count(";")
+        
+        return features
     
+    def _is_internal_ip(self, ip):
+        """Check if IP is an internal address"""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            return (
+                ip_obj.is_private or
+                ip_obj.is_loopback or
+                ip_obj.is_link_local or
+                ip_obj.is_multicast
+            )
+        except ValueError:
+            return False
+       
     def extract(self, log_entry):
         """
         Extract features from a log entry
@@ -378,10 +450,22 @@ class LogFeatureExtractor:
         # Extract text features
         text_feature = self._extract_text_features(log_entry)
         
-        # Extract numerical features
+        # Extract basic numerical features
         numerical_features = self._extract_numerical_features(log_entry)
         
-        return text_feature, numerical_features
+        # Extract advanced features
+        advanced_features = self.extract_advanced_features(log_entry)
+        
+        # Convert advanced features to list for ML input
+        advanced_numerical = []
+        for key, value in advanced_features.items():
+            if isinstance(value, (int, float)):
+                advanced_numerical.append(value)
+        
+        # Combine numerical and advanced features
+        combined_numerical = numerical_features + advanced_numerical
+        
+        return text_feature, combined_numerical
     
     def _extract_text_features(self, log_entry):
         """Extract text features from log entry"""
