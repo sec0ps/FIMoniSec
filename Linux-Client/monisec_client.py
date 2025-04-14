@@ -38,7 +38,8 @@ import remote
 import threading
 import json
 import updater
-import yara
+#import yara
+from malscan_yara import ensure_rules_exist, update_rules, compile_rules, yara_scan_file
 from pathlib import Path
 
 # Define BASE_DIR as a static path
@@ -558,7 +559,7 @@ if __name__ == "__main__":
         # Update YARA rules command
         elif action == "update-yara":
             print("[INFO] Updating YARA rules from GitHub...")
-            success = yara.update_rules()
+            success = update_rules()
             if success:
                 print("[SUCCESS] YARA rules updated successfully.")
                 sys.exit(0)
@@ -573,12 +574,12 @@ if __name__ == "__main__":
                 print(f"[INFO] Scanning file {file_path} with YARA rules...")
                 
                 # Ensure rules are compiled
-                if not yara.compile_rules():
+                if not compile_rules():
                     print("[ERROR] Failed to compile YARA rules.")
                     sys.exit(1)
                 
                 # Scan the file
-                matches = yara.scan_file(file_path)
+                matches = yara_scan_file(file_path)
                 
                 if matches:
                     print(f"[ALERT] Found {len(matches)} YARA rule matches:")
@@ -612,9 +613,11 @@ if __name__ == "__main__":
             logging.info("MoniSec Endpoint Monitor started in daemon mode.")
         
             # Add this line to start log transmission in daemon mode
+            # Check authentication first
             remote.check_auth_and_send_logs()
             
             # Let start_listener_if_authorized handle the listener starting
+            # This function will check auth token validity internally
             remote.start_listener_if_authorized()
             
             monitor_processes()
@@ -658,13 +661,26 @@ if __name__ == "__main__":
 
         logging.info("MoniSec Endpoint Monitor started in foreground.")
 
+        # Check auth before attempting connections
         remote.check_auth_and_send_logs()
-        # Start the connection maintenance thread
-        connection_monitor = threading.Thread(target=remote.maintain_websocket_connection, daemon=True)
-        connection_monitor.start()
-        logging.info("[INIT] Started WebSocket connection monitoring")
+        
+        # Start connection monitoring only if authentication is valid
+        if remote.validate_auth_token()[0]:
+            # Start the connection maintenance thread
+            connection_monitor = threading.Thread(target=remote.maintain_websocket_connection, daemon=True)
+            connection_monitor.start()
+            logging.info("[INIT] Started WebSocket connection monitoring")
+        else:
+            logging.info("[INIT] WebSocket connection monitoring disabled - no valid authentication")
+            
         # Only use start_listener_if_authorized to handle listener starting
+        # This will internally check if auth token is valid
         remote.start_listener_if_authorized()
-        # Start WebSocket client (after authentication)
-        remote.start_websocket_client()
+        
+        # Only start WebSocket client if auth is valid - start_websocket_client 
+        # will now internally validate auth token
+        if remote.validate_auth_token()[0]:
+            # Start WebSocket client (after authentication)
+            remote.start_websocket_client()
+            
         monitor_processes()
