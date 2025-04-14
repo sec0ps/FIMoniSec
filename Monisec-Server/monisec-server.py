@@ -171,10 +171,10 @@ def run_server():
     # Setup proper logging
     os.makedirs(LOG_DIR, exist_ok=True)
     file_handler = logging.FileHandler(LOG_FILE)
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
     root_logger.addHandler(file_handler)
     
     # Now it's safe to log
@@ -373,9 +373,8 @@ async def close_websocket_gracefully(websocket):
     try:
         await asyncio.sleep(0.5)  # Short delay before closing
         await websocket.close(1000, "Replaced by newer connection")
-        logging.debug("[WEBSOCKET-DEBUG] Old connection closed gracefully")
     except Exception as e:
-        logging.debug(f"[WEBSOCKET-DEBUG] Error during graceful close: {e}")
+        pass
           
 def initialize_log_storage():
     """Ensures necessary log directories and files exist with proper permissions."""
@@ -411,15 +410,13 @@ def ensure_directories():
         print(f"[ERROR] Failed to create directories: {e}")
         sys.exit(1)
 
-# Add this to the beginning of monisec-server.py
-
 def setup_enhanced_logging():
     """Configure detailed logging to both file and console."""
     os.makedirs(LOG_DIR, exist_ok=True)
     
     # Configure root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
     
     # Clear existing handlers to avoid duplication
     for handler in root_logger.handlers[:]:
@@ -451,7 +448,6 @@ def setup_enhanced_logging():
 # Call this function before the server starts
 setup_enhanced_logging()
 
-# Add this new function to your code
 def verify_pid_file():
     """Verifies that PID file exists and contains the current process ID."""
     if not os.path.exists(PID_FILE):
@@ -744,7 +740,7 @@ if __name__ == "__main__":
                 print("\n[INFO] Resetting WebSocket connection tracking...")
                 from shared_state import reset_connection_tracking
                 reset_connection_tracking()
-                print(f"[INFO] Connection tracking reset complete.")
+                print("[INFO] Connection tracking reset complete.")
                 print("[INFO] Please restart client connections.")
             sys.exit(0)
 
