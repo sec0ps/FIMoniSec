@@ -70,7 +70,7 @@ def decrypt_data_with_psk(psk, encrypted_data):
         ciphertext = encrypted_data[12:]
         
         # Log what we're attempting to decrypt
-        logging.info(f"Attempting to decrypt {len(ciphertext)} bytes with nonce {nonce.hex()[:8]}...")
+        #logging.info(f"Attempting to decrypt {len(ciphertext)} bytes with nonce {nonce.hex()[:8]}...")
         
         try:
             # Perform the decryption
@@ -78,7 +78,7 @@ def decrypt_data_with_psk(psk, encrypted_data):
             decrypted_text = decrypted_bytes.decode("utf-8")
             
             # Log success
-            logging.info(f"Successfully decrypted {len(decrypted_text)} bytes of data")
+            #logging.info(f"Successfully decrypted {len(decrypted_text)} bytes of data")
             
             try:
                 # Parse as JSON
