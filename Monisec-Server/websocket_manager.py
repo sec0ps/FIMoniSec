@@ -78,13 +78,11 @@ async def authenticate_websocket_client(websocket):
             await websocket.send(json.dumps({"status": "error", "message": "Unknown client"}))
             from shared_state import remove_connection
             remove_connection(client_name)
-            logging.info(f"[WEBSOCKET-DEBUG] Removed {client_name} from connections - unknown client")
             return None
 
         # Step 3: Send challenge
         challenge = os.urandom(16).hex()
         await websocket.send(json.dumps({"status": "challenge", "challenge": challenge}))
-        logging.info(f"[WEBSOCKET-DEBUG] Sent auth challenge to {client_name}")
 
         # Step 4: Wait for HMAC response
         try:
@@ -95,7 +93,6 @@ async def authenticate_websocket_client(websocket):
             await websocket.send(json.dumps({"status": "error", "message": "Invalid HMAC response or timeout"}))
             from shared_state import remove_connection
             remove_connection(client_name)
-            logging.info(f"[WEBSOCKET-DEBUG] Removed {client_name} from connections - no/invalid HMAC")
             return None
 
         # Step 5: Validate HMAC
@@ -104,15 +101,12 @@ async def authenticate_websocket_client(websocket):
             await websocket.send(json.dumps({"status": "error", "message": "Authentication failed"}))
             from shared_state import remove_connection
             remove_connection(client_name)
-            logging.warning(f"[WEBSOCKET-DEBUG] Authentication failed for {client_name} - HMAC mismatch")
             return None
 
         await websocket.send(json.dumps({"status": "success", "message": "Authentication successful"}))
-        logging.info(f"[WEBSOCKET-DEBUG] Authentication successful for client: {client_name}")
         return client_name
 
     except Exception as e:
-        logging.error(f"[WEBSOCKET-DEBUG] Unexpected error during WebSocket authentication: {e}")
         try:
             from shared_state import remove_connection
             remove_connection(client_name)
@@ -127,12 +121,10 @@ async def maintain_connection(websocket, client_name):
             await asyncio.sleep(30)  # Send heartbeat every 30 seconds
             try:
                 await websocket.send(json.dumps({"type": "heartbeat"}))
-                logging.debug(f"[WEBSOCKET] Sent heartbeat to {client_name}")
                 
                 # Update the timestamp in the connections file
                 from shared_state import update_connection_timestamp
                 update_connection_timestamp(client_name)
-                logging.debug(f"[WEBSOCKET] Updated timestamp for {client_name}")
             except Exception as e:
                 logging.error(f"[WEBSOCKET] Heartbeat to {client_name} failed: {e}")
                 break
@@ -161,12 +153,10 @@ async def process_websocket_message(websocket, client_name, message):
         if message_type == "heartbeat":
             # Respond to heartbeat
             await websocket.send(json.dumps({"type": "heartbeat_ack", "timestamp": time.time()}))
-            logging.debug(f"[WEBSOCKET] Sent heartbeat_ack to {client_name}")
             
             # Verify connection is registered by updating timestamp
             from shared_state import update_connection_timestamp
             update_connection_timestamp(client_name)
-            logging.debug(f"[WEBSOCKET] Updated timestamp for {client_name} after heartbeat")
                     
         elif message_type == "ir_shell_response":
             # Handle IR shell response with file-based approach
@@ -186,7 +176,6 @@ async def process_websocket_message(websocket, client_name, message):
                 
         elif message_type == "poll_commands":
             # Handle command polling - log that a poll was received
-            logging.debug(f"[WEBSOCKET] Received poll request from {client_name}")
             await handle_command_poll(websocket, client_name)
             
         else:
@@ -210,12 +199,10 @@ async def process_websocket_message(websocket, client_name, message):
         if message_type == "heartbeat":
             # Respond to heartbeat
             await websocket.send(json.dumps({"type": "heartbeat_ack", "timestamp": time.time()}))
-            logging.debug(f"[WEBSOCKET] Sent heartbeat_ack to {client_name}")
             
             # Verify connection is registered by updating timestamp
             from shared_state import update_connection_timestamp
             update_connection_timestamp(client_name)
-            logging.debug(f"[WEBSOCKET] Updated timestamp for {client_name} after heartbeat")
                     
         elif message_type == "ir_shell_response":
             # Handle IR shell response with file-based approach
@@ -234,7 +221,6 @@ async def process_websocket_message(websocket, client_name, message):
                 
         elif message_type == "poll_commands":
             # Handle command polling - log that a poll was received
-            logging.debug(f"[WEBSOCKET] Received poll request from {client_name}")
             await handle_command_poll(websocket, client_name)
             
         else:
@@ -266,7 +252,6 @@ async def ir_shell_init(client_name):
     try:
         # Save command to the file for the websocket handler to pick up
         save_ir_cmd_request(client_name, "ir-shell-init", command_id)
-        logging.info(f"[IR-SHELL] Saved initialization command for {client_name}")
         
         # Wait for response with timeout
         start_time = time.time()
@@ -319,7 +304,6 @@ async def send_via_ipc(client_name, command, command_id=None):
         
         # Send request
         ipc_socket.sendall(json.dumps(request).encode('utf-8'))
-        logging.info(f"[IPC] Sent {command} command for {client_name}")
         
         # We don't need to wait for a response here, as we'll check
         # ir_shell_pending_responses asynchronously
@@ -361,7 +345,6 @@ async def ir_shell_execute(client_name, command):
     try:
         # Save command to the file
         save_ir_cmd_request(client_name, command, command_id)
-        logging.info(f"[IR-SHELL] Saved command for {client_name}: {command}")
         
         # Wait for response with timeout
         start_time = time.time()
@@ -412,7 +395,6 @@ async def ir_shell_exit(client_name):
     try:
         # Send the exit command via IPC
         result = await send_via_ipc(client_name, "ir-shell-exit", command_id)
-        logging.info(f"[IR-SHELL] Sent exit command to {client_name}")
         
         # We don't need to wait for a response for exit commands
         return {
@@ -433,7 +415,6 @@ def debug_websocket_connections():
     connections = get_active_connections()
     connection_list = list(connections.keys())
     
-    logging.info(f"[WEBSOCKET-DEBUG] Active connections: {connection_list}")
     print(f"[WEBSOCKET-DEBUG] Active connections: {connection_list}")
     return connection_list
 
@@ -567,8 +548,6 @@ async def handle_command_poll(websocket, client_name):
                 "commands": all_pending_commands
             }))
             logging.info(f"[WEBSOCKET] Sent {len(all_pending_commands)} pending commands to {client_name}")
-        else:
-            logging.debug(f"[WEBSOCKET] No pending commands for {client_name}")
             
     except Exception as e:
         logging.error(f"[WEBSOCKET] Error handling command poll: {e}")
@@ -598,15 +577,11 @@ async def process_websocket_command(client_name, payload):
             from shared_state import ir_shell_pending_responses
             ir_shell_pending_responses[command_id] = payload
 
-            logging.info(f"[WEBSOCKET-CMD] IR shell response stored from {client_name} (ID: {command_id})")
-
         elif command_type == "status":
             status_msg = payload.get("message", "")
-            logging.info(f"[WEBSOCKET-CMD] Status from {client_name}: {status_msg}")
 
         elif command_type == "log":
             log_entry = payload.get("entry", "")
-            logging.debug(f"[WEBSOCKET-CMD] Log from {client_name}: {log_entry}")
 
         else:
             logging.warning(f"[WEBSOCKET-CMD] Unknown command type from {client_name}: {command_type}")
@@ -620,13 +595,11 @@ async def process_websocket_command(client_name, payload):
 
 def handle_client_reconnection(client_name, websocket):
     """Handle client reconnection with state recovery using file-based tracking."""
-    logging.info(f"[RECONNECT] Client {client_name} reconnected")
     
     try:
         # Update connection timestamp to ensure freshness
         from shared_state import update_connection_timestamp
         update_connection_timestamp(client_name)
-        logging.info(f"[RECONNECT] Updated connection timestamp for {client_name}")
         
         # Optionally send a notification to the client about reconnection
         asyncio.create_task(send_reconnection_notification(websocket, client_name))
@@ -641,7 +614,6 @@ async def send_reconnection_notification(websocket, client_name):
             "message": "Connection recovered",
             "reconnect": True
         }))
-        logging.info(f"[RECONNECT] Sent reconnection notification to {client_name}")
     except Exception as e:
         logging.error(f"[RECONNECT] Failed to send reconnection notification: {e}")
 
@@ -650,9 +622,8 @@ async def close_websocket_gracefully(websocket):
     try:
         await asyncio.sleep(0.5)  # Short delay before closing
         await websocket.close(1000, "Replaced by newer connection")
-        logging.debug("[WEBSOCKET-DEBUG] Old connection closed gracefully")
     except Exception as e:
-        logging.debug(f"[WEBSOCKET-DEBUG] Error during graceful close: {e}")
+        pass
 
 async def handler_adaptor(websocket):
     # In newer websockets versions, use request_headers and path info
