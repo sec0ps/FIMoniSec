@@ -222,11 +222,11 @@ def receive_chunked_data(client_socket):
             
             # Convert size bytes to integer
             chunk_size = int.from_bytes(size_bytes, byteorder='big')
-            logging.debug(f"[CHUNK] Received size header: {chunk_size} bytes")
+            #logging.debug(f"[CHUNK] Received size header: {chunk_size} bytes")
             
             # End of message marker
             if chunk_size == 0:
-                logging.debug(f"[CHUNK] End of chunked message marker received")
+                #logging.debug(f"[CHUNK] End of chunked message marker received")
                 break
             
             # Sanity check on chunk size
@@ -353,13 +353,13 @@ def handle_client(client_socket, client_address):
                                 if len(peek_bytes) == 4:
                                     potential_size = int.from_bytes(peek_bytes, byteorder='big')
                                     if 0 < potential_size < 8192:
-                                        #logging.info(f"[RECV] Preparing to receive chunked data of size ~{potential_size}")
+                                        logging.info(f"[RECV] Preparing to receive chunked data of size ~{potential_size}")
                                         encrypted_data = receive_chunked_data(client_socket)
                                         if not encrypted_data:
                                             logging.info(f"[DISCONNECT] Client {client_name} disconnected during chunk receive")
                                             break
                                     else:
-                                        #logging.info(f"[RECV] Receiving standard block (non-chunked)")
+                                        logging.info(f"[RECV] Receiving standard block (non-chunked)")
                                         encrypted_data = client_socket.recv(4096)
                                         if not encrypted_data:
                                             logging.info(f"[DISCONNECT] Client {client_name} disconnected (standard receive)")
@@ -382,12 +382,12 @@ def handle_client(client_socket, client_address):
                                     logging.error(f"[RECV] PSK not available for {client_name}")
                                     try:
                                         psk = server_crypt.load_psks(client_name)
-                                        #logging.info(f"[RECV] Reloaded PSK for {client_name}")
+                                        logging.info(f"[RECV] Reloaded PSK for {client_name}")
                                     except Exception as e:
                                         logging.error(f"[RECV] Failed to reload PSK: {e}")
                                         continue
 
-                                #logging.info(f"[RECV] Attempting decryption of {len(encrypted_data)} bytes from {client_name}")
+                                logging.info(f"[RECV] Attempting decryption of {len(encrypted_data)} bytes from {client_name}")
                                 log_data = server_crypt.decrypt_data_with_psk(psk, encrypted_data)
 
                                 if not log_data:
@@ -400,7 +400,7 @@ def handle_client(client_socket, client_address):
                                     logs = [logs]
 
                                 log_count = len(logs)
-                                #logging.info(f"[RECV] Successfully decrypted {log_count} logs from {client_name}")
+                                logging.info(f"[RECV] Successfully decrypted {log_count} logs from {client_name}")
 
                                 for log_entry in logs:
                                     log_entry["client_name"] = client_name
