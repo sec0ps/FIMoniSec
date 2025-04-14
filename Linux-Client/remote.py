@@ -1355,15 +1355,23 @@ def get_basic_security_info():
 
 async def websocket_client_connect(server_ip, client_name, psk):
     """Connect to WebSocket server, authenticate, and start command polling."""
-    global websocket_connected, websocket_client
+    global websocket_connected, websocket_client, websocket_reconnect_delay
 
     uri = f"ws://{server_ip}:8765/ws"
+    connection_error_logged = False
+    local_reconnect_delay = 15  # Fixed 15 second delay as requested
 
     while not websocket_shutdown_event.is_set():
         try:
             async with websockets.connect(uri, ping_interval=15, ping_timeout=10) as websocket:
+                # Connection successful
+                if connection_error_logged:
+                    logging.info("[WEBSOCKET] Connection successfully established")
+                    connection_error_logged = False
+                
                 websocket_client = websocket
                 websocket_connected = True
+                websocket_reconnect_delay = 5  # Reset global delay on success
 
                 # Authentication handshake
                 await websocket.send(json.dumps({
@@ -1381,11 +1389,14 @@ async def websocket_client_connect(server_ip, client_name, psk):
 
                 auth_result = json.loads(await websocket.recv())
                 if auth_result.get("status") != "success":
-                    logging.error("[WEBSOCKET] Auth failed")
+                    if not connection_error_logged:
+                        logging.error("[WEBSOCKET] Auth failed")
+                        connection_error_logged = True
+                    websocket_connected = False
+                    await asyncio.sleep(local_reconnect_delay)
                     continue
 
                 logging.info(f"[WEBSOCKET] Auth success for {client_name}")
-                websocket_reconnect_delay = 5
 
                 # Launch command poller and heartbeat tasks
                 poll_task = asyncio.create_task(poll_for_commands(client_name, websocket))
@@ -1399,7 +1410,10 @@ async def websocket_client_connect(server_ip, client_name, psk):
                         message = await websocket.recv()
                         await process_websocket_message(websocket, message)
                 except websockets.exceptions.ConnectionClosed:
-                    logging.info("[WEBSOCKET] Connection closed")
+                    websocket_connected = False
+                    if not connection_error_logged:
+                        logging.info("[WEBSOCKET] Connection closed")
+                        connection_error_logged = True
                 finally:
                     # Cancel the background tasks when connection is closed
                     poll_task.cancel()
@@ -1411,10 +1425,15 @@ async def websocket_client_connect(server_ip, client_name, psk):
                         pass
 
         except Exception as e:
-            logging.error(f"[WEBSOCKET] Connect error: {e}")
             websocket_connected = False
-            await asyncio.sleep(websocket_reconnect_delay)
-            websocket_reconnect_delay = min(websocket_reconnect_delay * 2, websocket_max_reconnect_delay)
+            
+            # Only log the first error in a series of failures
+            if not connection_error_logged:
+                logging.warning("[WEBSOCKET] Connection error. Will retry every 15 seconds...")
+                connection_error_logged = True
+            
+            # Use fixed delay as requested
+            await asyncio.sleep(local_reconnect_delay)
 
 async def websocket_heartbeat(websocket):
     """Enhanced heartbeat function with better failure detection."""
@@ -1750,17 +1769,36 @@ def maintain_websocket_connection():
         logging.info("[WEBSOCKET] No valid authentication token. WebSocket connection monitor will not run.")
         return
     
+    # Track state to minimize logging
+    connection_error_shown = False
+    last_connection_state = websocket_connected
+    
     while not websocket_shutdown_event.is_set():
         try:
+            # Check if we need to reconnect
             if not websocket_connected and not websocket_client_started:
-                logging.info("[WEBSOCKET] Connection not active, initiating new connection")
+                # Only log the initial disconnection, not every retry
+                if last_connection_state or not connection_error_shown:
+                    logging.info("[WEBSOCKET] Connection not active, will retry every 15 seconds...")
+                    connection_error_shown = True
+                
+                # Start connection attempt
                 start_websocket_client()
+            elif websocket_connected and connection_error_shown:
+                # We've reconnected, reset the error flag
+                logging.info("[WEBSOCKET] Connection restored successfully")
+                connection_error_shown = False
             
-            # Check connection health every 10 seconds
-            time.sleep(10)
+            # Store current state for next comparison
+            last_connection_state = websocket_connected
+            
+            # Check connection every 15 seconds
+            time.sleep(15)
         except Exception as e:
-            logging.error(f"[WEBSOCKET] Connection monitor error: {e}")
-            time.sleep(5)  # Wait before retrying
+            if not connection_error_shown:
+                logging.error("[WEBSOCKET] Connection monitor error. Will continue retrying silently.")
+                connection_error_shown = True
+            time.sleep(15)
 
 def start_websocket_client():
     """Start the WebSocket client in a background thread with its own event loop."""
