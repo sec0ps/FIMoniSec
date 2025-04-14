@@ -86,25 +86,21 @@ def start_listener_if_authorized():
     Start the client listener and WebSocket client if proper authorization exists,
     using NAT detection to determine the connection method.
     """
-    # Check if auth file exists
-    if not os.path.exists(AUTH_TOKEN_FILE):
-        logging.info("Authentication token file not found. Running in local-only mode.")
+    # Validate authentication token
+    is_valid, error_message = validate_auth_token()
+    if not is_valid:
+        logging.info(f"{error_message}. Running in local-only mode.")
         return False
-    
-    # Check if all values are populated
+        
+    # Authentication token is valid, proceed with connection setup
     try:
         with open(AUTH_TOKEN_FILE, 'r') as f:
             auth_data = json.load(f)
             
-        # Verify all required fields exist and are populated
-        if not all(key in auth_data and auth_data[key] for key in ["server_ip", "client_name", "psk"]):
-            logging.info("Authentication token file is missing required fields. Running in local-only mode.")
-            return False
-            
         # Detect NAT status to decide on connection method
         use_websocket = detect_nat_and_set_connection_mode()
         
-        # If we get here, all conditions are met
+        # Log connection information
         logging.info(f"Authentication verified. Starting client connectivity to server {auth_data['server_ip']}...")
         
         if use_websocket:
@@ -131,8 +127,8 @@ def start_listener_if_authorized():
         
         return True
         
-    except (json.JSONDecodeError, IOError) as e:
-        logging.error(f"Error reading authentication token file: {e}")
+    except Exception as e:
+        logging.error(f"Error starting authorized listener: {e}")
         return False
         
 def start_client_listener():
@@ -179,6 +175,30 @@ def import_psk():
     os.chmod(AUTH_TOKEN_FILE, 0o600)
 
     print("[INFO] PSK imported and stored securely.")
+    
+def validate_auth_token():
+    """
+    Validates the auth_token.json file exists and contains all required fields.
+    Returns a tuple of (is_valid, error_message)
+    """
+    if not os.path.exists(AUTH_TOKEN_FILE):
+        return False, "Authentication token file not found"
+    
+    try:
+        with open(AUTH_TOKEN_FILE, 'r') as f:
+            auth_data = json.load(f)
+            
+        # Check if all required fields exist and are populated
+        required_fields = ["server_ip", "client_name", "psk"]
+        for field in required_fields:
+            if field not in auth_data or not auth_data[field]:
+                return False, f"Authentication token missing or empty '{field}' field"
+        
+        return True, "Authentication token is valid"
+    except json.JSONDecodeError:
+        return False, "Authentication token file contains invalid JSON"
+    except Exception as e:
+        return False, f"Error validating authentication token: {str(e)}"
     
 def authenticate_with_server():
     """Authenticates with the MoniSec server using stored IP and PSK from auth_token.json."""
@@ -552,36 +572,30 @@ def send_chunked_data(sock, data):
 
 def check_auth_and_send_logs():
     """Checks if auth_token.json exists and starts log transmission if valid."""
-    if os.path.exists(AUTH_TOKEN_FILE):
-        try:
-            with open(AUTH_TOKEN_FILE, "r") as f:
-                token_data = json.load(f)
-                server_ip = token_data.get("server_ip")
-                client_name = token_data.get("client_name")
-                psk = token_data.get("psk")
+    # Validate authentication token
+    is_valid, error_message = validate_auth_token()
+    if not is_valid:
+        logging.info(f"{error_message}. Logging locally only.")
+        return False
 
-            if server_ip and client_name and psk:
-                logging.info("[INFO] Authentication token found. Connecting to server...")
-
-                # Authenticate with server and proceed if successful
-                success = authenticate_with_server()
-                if success:
-                    logging.info("[INFO] Authentication successful. Starting real-time log transmission...")
-                    
-                    # Start regular log transmission thread
-                    log_thread = threading.Thread(target=send_logs_to_server, daemon=True)
-                    log_thread.start()
-                    
-                    # Start WebSocket client for command channel
-                    start_websocket_client()
-                else:
-                    logging.warning("[WARNING] Authentication failed. Logging locally only.")
-            else:
-                logging.warning("[WARNING] Incomplete authentication token. Logging locally only.")
-        except Exception as e:
-            logging.error(f"[ERROR] Failed to read authentication token: {e}")
-    else:
-        logging.info("[INFO] No authentication token found. Logging locally only.")
+    try:
+        # Authenticate with server and proceed if successful
+        success = authenticate_with_server()
+        if success:
+            logging.info("Authentication successful. Starting real-time log transmission...")
+            
+            # Start regular log transmission thread
+            log_thread = threading.Thread(target=send_logs_to_server, daemon=True)
+            log_thread.start()
+            
+            # Start WebSocket client for command channel
+            start_websocket_client()
+            return True
+        else:
+            logging.warning("Authentication failed. Logging locally only.")
+            return False
+    except Exception as e:
+        logging.error(f"Failed to initialize log transmission: {e}")
         
 def handle_server_commands(client_socket):
     """Handles incoming commands from monisec-server and executes only allowed actions."""
@@ -1051,6 +1065,292 @@ def execute_ir_command(command):
     except Exception as e:
         return f"Error executing command: {e}"
 
+def get_basic_system_info():
+    """Return basic system information."""
+    try:
+        info = []
+        info.append("--- System Information ---\n")
+        
+        # Basic OS info
+        try:
+            uname = subprocess.check_output("uname -a", shell=True).decode("utf-8")
+            info.append(f"System: {uname}")
+        except Exception as e:
+            info.append(f"System information unavailable: {e}")
+            
+        # Hostname
+        try:
+            hostname = subprocess.check_output("hostname", shell=True).decode("utf-8").strip()
+            info.append(f"Hostname: {hostname}")
+        except Exception as e:
+            info.append(f"Hostname unavailable: {e}")
+            
+        # Uptime
+        try:
+            uptime = subprocess.check_output("uptime", shell=True).decode("utf-8").strip()
+            info.append(f"Uptime: {uptime}")
+        except Exception as e:
+            info.append(f"Uptime unavailable: {e}")
+            
+        # Kernel version
+        try:
+            kernel = subprocess.check_output("uname -r", shell=True).decode("utf-8").strip()
+            info.append(f"Kernel version: {kernel}")
+        except Exception as e:
+            info.append(f"Kernel version unavailable: {e}")
+        
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error retrieving system information: {e}"
+
+def get_basic_memory_info():
+    """Return basic memory information."""
+    try:
+        info = []
+        info.append("--- Memory Information ---\n")
+        
+        # Memory usage with free
+        try:
+            memory = subprocess.check_output("free -h", shell=True).decode("utf-8")
+            info.append(memory)
+        except Exception as e:
+            info.append(f"Memory usage unavailable: {e}")
+            
+        # Top memory consumers
+        try:
+            top_processes = subprocess.check_output(
+                "ps aux --sort=-%mem | head -11", shell=True
+            ).decode("utf-8")
+            info.append("\nTop Memory Consumers:")
+            info.append(top_processes)
+        except Exception as e:
+            info.append(f"Top memory consumers unavailable: {e}")
+        
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error retrieving memory information: {e}"
+
+def get_basic_process_info():
+    """Return basic process information."""
+    try:
+        info = []
+        info.append("--- Process Information ---\n")
+        
+        # Running processes count
+        try:
+            process_count = subprocess.check_output(
+                "ps aux | wc -l", shell=True
+            ).decode("utf-8").strip()
+            info.append(f"Total processes: {int(process_count) - 1}")  # Subtract header
+        except Exception as e:
+            info.append(f"Process count unavailable: {e}")
+            
+        # Top CPU consumers
+        try:
+            top_cpu = subprocess.check_output(
+                "ps aux --sort=-%cpu | head -11", shell=True
+            ).decode("utf-8")
+            info.append("\nTop CPU Consumers:")
+            info.append(top_cpu)
+        except Exception as e:
+            info.append(f"Top CPU consumers unavailable: {e}")
+            
+        # Recently started processes
+        try:
+            recent = subprocess.check_output(
+                "ps -eo pid,lstart,args --sort=-start_time | head -11", shell=True
+            ).decode("utf-8")
+            info.append("\nRecently Started Processes:")
+            info.append(recent)
+        except Exception as e:
+            info.append(f"Recent processes unavailable: {e}")
+        
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error retrieving process information: {e}"
+
+def get_basic_network_info():
+    """Return basic network information."""
+    try:
+        info = []
+        info.append("--- Network Information ---\n")
+        
+        # Network interfaces
+        try:
+            interfaces = subprocess.check_output("ip a", shell=True).decode("utf-8")
+            info.append("Network Interfaces:")
+            info.append(interfaces)
+        except Exception as e:
+            try:
+                # Fallback to ifconfig if ip command not available
+                interfaces = subprocess.check_output("ifconfig", shell=True).decode("utf-8")
+                info.append("Network Interfaces:")
+                info.append(interfaces)
+            except Exception as e2:
+                info.append(f"Network interfaces unavailable: {e}, {e2}")
+                
+        # Listening ports
+        try:
+            listening = subprocess.check_output(
+                "netstat -tuln | grep LISTEN", shell=True
+            ).decode("utf-8")
+            info.append("\nListening Ports:")
+            info.append(listening)
+        except Exception as e:
+            try:
+                # Fallback to ss if netstat not available
+                listening = subprocess.check_output(
+                    "ss -tuln | grep LISTEN", shell=True
+                ).decode("utf-8")
+                info.append("\nListening Ports:")
+                info.append(listening)
+            except Exception as e2:
+                info.append(f"Listening ports unavailable: {e}, {e2}")
+                
+        # Established connections
+        try:
+            established = subprocess.check_output(
+                "netstat -tn | grep ESTABLISHED | head -10", shell=True
+            ).decode("utf-8")
+            info.append("\nEstablished Connections (top 10):")
+            info.append(established)
+        except Exception as e:
+            info.append(f"Established connections unavailable: {e}")
+        
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error retrieving network information: {e}"
+
+def get_basic_log_info():
+    """Return basic log information."""
+    try:
+        info = []
+        info.append("--- Log Information ---\n")
+        
+        # Recent system logs
+        try:
+            if os.path.exists("/var/log/syslog"):
+                log_file = "/var/log/syslog"
+            elif os.path.exists("/var/log/messages"):
+                log_file = "/var/log/messages"
+            else:
+                log_file = None
+                
+            if log_file:
+                recent_logs = subprocess.check_output(
+                    f"tail -n 20 {log_file}", shell=True
+                ).decode("utf-8")
+                info.append(f"Recent System Logs ({log_file}):")
+                info.append(recent_logs)
+            else:
+                info.append("No standard system log file found")
+        except Exception as e:
+            info.append(f"Recent system logs unavailable: {e}")
+            
+        # Recent auth logs
+        try:
+            if os.path.exists("/var/log/auth.log"):
+                auth_file = "/var/log/auth.log"
+            elif os.path.exists("/var/log/secure"):
+                auth_file = "/var/log/secure"
+            else:
+                auth_file = None
+                
+            if auth_file:
+                auth_logs = subprocess.check_output(
+                    f"tail -n 10 {auth_file}", shell=True
+                ).decode("utf-8")
+                info.append(f"\nRecent Authentication Logs ({auth_file}):")
+                info.append(auth_logs)
+            else:
+                info.append("\nNo standard authentication log file found")
+        except Exception as e:
+            info.append(f"Recent authentication logs unavailable: {e}")
+            
+        # FIMonsec logs
+        try:
+            fimsec_log = LOG_FILE  # Using the global LOG_FILE from the script
+            if os.path.exists(fimsec_log):
+                fimsec_logs = subprocess.check_output(
+                    f"tail -n 10 {fimsec_log}", shell=True
+                ).decode("utf-8")
+                info.append(f"\nRecent FIMonsec Logs ({fimsec_log}):")
+                info.append(fimsec_logs)
+            else:
+                info.append("\nFIMonsec log file not found or not accessible")
+        except Exception as e:
+            info.append(f"\nRecent FIMonsec logs unavailable: {e}")
+        
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error retrieving log information: {e}"
+
+def get_basic_security_info():
+    """Return basic security information about the system."""
+    try:
+        info = []
+        info.append("--- Security Information ---\n")
+        
+        # Check for active users
+        try:
+            who_output = subprocess.check_output("who", shell=True).decode("utf-8")
+            info.append("Active Users:")
+            info.append(who_output)
+        except Exception as e:
+            info.append(f"Active users unavailable: {e}")
+        
+        # Check for failed login attempts
+        try:
+            if os.path.exists("/var/log/auth.log"):
+                grep_cmd = "grep 'Failed password' /var/log/auth.log | tail -5"
+            elif os.path.exists("/var/log/secure"):
+                grep_cmd = "grep 'Failed password' /var/log/secure | tail -5"
+            else:
+                grep_cmd = None
+                
+            if grep_cmd:
+                failed_logins = subprocess.check_output(grep_cmd, shell=True).decode("utf-8")
+                info.append("\nRecent Failed Login Attempts:")
+                info.append(failed_logins)
+            else:
+                info.append("\nCould not locate authentication log files")
+        except Exception as e:
+            info.append(f"\nFailed login attempts unavailable: {e}")
+        
+        # Check for listening ports
+        try:
+            netstat_output = subprocess.check_output(
+                "netstat -tuln | grep LISTEN", shell=True
+            ).decode("utf-8")
+            info.append("\nListening Ports:")
+            info.append(netstat_output)
+        except Exception as e:
+            try:
+                # Fallback to ss if netstat not available
+                ss_output = subprocess.check_output(
+                    "ss -tuln | grep LISTEN", shell=True
+                ).decode("utf-8")
+                info.append("\nListening Ports:")
+                info.append(ss_output)
+            except Exception as e2:
+                info.append(f"\nListening ports unavailable: {e}, {e2}")
+        
+        # Check for SUID files
+        try:
+            # Safely limit the scope of SUID search to avoid performance issues
+            suid_output = subprocess.check_output(
+                "find /usr/bin -perm -4000 -ls 2>/dev/null | head -10", 
+                shell=True, timeout=5
+            ).decode("utf-8")
+            info.append("\nSUID Files (limited to first 10 in /usr/bin):")
+            info.append(suid_output if suid_output else "No SUID files found in /usr/bin")
+        except Exception as e:
+            info.append(f"\nSUID files search unavailable: {e}")
+        
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error retrieving security information: {e}"
+
 #### Start websocket IR shell code
 
 async def websocket_client_connect(server_ip, client_name, psk):
@@ -1444,6 +1744,12 @@ def maintain_websocket_connection():
     """Maintain a persistent WebSocket connection with automatic reconnection."""
     global websocket_client, websocket_connected, websocket_client_started
     
+    # First check if authentication is valid before attempting to maintain connection
+    is_valid, _ = validate_auth_token()
+    if not is_valid:
+        logging.info("[WEBSOCKET] No valid authentication token. WebSocket connection monitor will not run.")
+        return
+    
     while not websocket_shutdown_event.is_set():
         try:
             if not websocket_connected and not websocket_client_started:
@@ -1465,11 +1771,13 @@ def start_websocket_client():
             logging.info("[WEBSOCKET] Already running")
             return
 
-        try:
-            if not os.path.exists(AUTH_TOKEN_FILE):
-                logging.warning("[WEBSOCKET] Auth token missing")
-                return
+        # Validate authentication token before starting WebSocket client
+        is_valid, error_message = validate_auth_token()
+        if not is_valid:
+            logging.warning(f"[WEBSOCKET] {error_message}. WebSocket client will not start.")
+            return
 
+        try:
             with open(AUTH_TOKEN_FILE, 'r') as f:
                 data = json.load(f)
 
@@ -1477,14 +1785,10 @@ def start_websocket_client():
             client_name = data.get("client_name")
             psk = data.get("psk")
 
-            if not all([server_ip, client_name, psk]):
-                logging.warning("[WEBSOCKET] Incomplete credentials")
-                return
-
             websocket_shutdown_event.clear()
 
             def run():
-                global websocket_client_started  # ✅ Ensure this affects the actual global flag
+                global websocket_client_started
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 websocket_client_started = True
