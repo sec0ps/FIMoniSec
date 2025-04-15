@@ -939,7 +939,7 @@ def start_ir_shell(port):
         logging.info("[IR-SHELL] Shell terminated")
 
 def execute_ir_command(command):
-    """Execute a command in the IR shell with limited privileges."""
+    """Execute a command in the IR shell with improved permissions while maintaining security."""
     # List of allowed commands for IR purposes
     allowed_commands = {
         "help": "Show this help message",
@@ -975,6 +975,17 @@ def execute_ir_command(command):
         "df -h": "Show disk space usage",
         "du -sh": "Show directory size",
         "free -h": "Show memory usage",
+        "last": "Show login history",
+        "lastlog": "Show last login of all users",
+        "history": "Show command history",
+        "pstree": "Show process tree",
+        "strings": "Extract text from binary files",
+        "stat": "Display file or filesystem status",
+        "which": "Show location of commands",
+        "crontab -l": "List scheduled tasks",
+        "systemctl list-timers": "Show systemd timers",
+        "iptables -L": "List firewall rules",
+        "journalctl -n 50": "Show recent system logs",
         # Custom built-in commands
         "sysinfo": "Show basic system information",
         "meminfo": "Show memory information",
@@ -1019,49 +1030,38 @@ def execute_ir_command(command):
     if full_cmd in allowed_commands:
         try:
             # Execute the full command with a reasonable timeout
-            result = subprocess.check_output(full_cmd, stderr=subprocess.STDOUT, shell=True, timeout=10)
+            result = subprocess.check_output(full_cmd, stderr=subprocess.STDOUT, shell=True, timeout=30)
             return result.decode("utf-8", errors="replace")
         except subprocess.CalledProcessError as e:
             return f"Command failed with code {e.returncode}:\n{e.output.decode('utf-8', errors='replace')}"
         except subprocess.TimeoutExpired:
-            return "Command timed out after 10 seconds"
+            return "Command timed out after 30 seconds"
         except Exception as e:
             return f"Error executing command: {e}"
     
+    # Extract base command for complex commands
+    base_commands = [c.split()[0] for c in allowed_commands.keys()]
+    
     # Check if the base command is allowed
-    if cmd not in allowed_commands and not any(cmd_alias.startswith(cmd + " ") for cmd_alias in allowed_commands):
+    if cmd not in base_commands:
         return f"Command '{cmd}' not allowed in IR shell"
     
-    # Handle command with arguments (checking for path traversal and other security issues)
+    # Handle command with arguments
     args = cmd_parts[1] if len(cmd_parts) > 1 else ""
     
-    # Security check for arguments
-    if ".." in args or args.startswith("/") or ";" in args or "|" in args or "&" in args or "`" in args or "$" in args:
+    # Security check for arguments to prevent command injection
+    if ";" in args or "|" in args or "&" in args or "`" in args or "$(" in args:
         return f"Invalid argument (security restriction): {args}"
     
-    # Whitelist approach for commands with arguments
-    if cmd == "ls":
-        # Allow only specific options for ls
-        if args.startswith("-"):
-            allowed_options = ["-l", "-a", "-la", "-al", "-lh", "-lah", "-alh"]
-            option_part = args.split()[0] if args.split() else ""
-            if option_part not in allowed_options:
-                return f"Unsupported options for ls: {option_part}"
-    elif cmd in ["cat", "head", "tail"]:
-        # Only allow reading files from safe locations
-        safe_paths = ["/proc", "/var/log", "/etc", "./logs", "~/"]
-        if not any(args.startswith(path) for path in safe_paths) and not args.startswith("."):
-            return f"Access to {args} is restricted. You can only access files in: {', '.join(safe_paths)}"
-        
-    # Execute the command with proper arguments
+    # Execute the command with arguments
     try:
-        # Use shell=True for commands like "ps aux" that use shell features
-        result = subprocess.check_output(f"{cmd} {args}", stderr=subprocess.STDOUT, shell=True, timeout=10)
+        full_cmd = f"{cmd} {args}"
+        result = subprocess.check_output(full_cmd, stderr=subprocess.STDOUT, shell=True, timeout=30)
         return result.decode("utf-8", errors="replace")
     except subprocess.CalledProcessError as e:
         return f"Command failed with code {e.returncode}:\n{e.output.decode('utf-8', errors='replace')}"
     except subprocess.TimeoutExpired:
-        return "Command timed out after 10 seconds"
+        return "Command timed out after 30 seconds"
     except Exception as e:
         return f"Error executing command: {e}"
 
@@ -1225,9 +1225,9 @@ def get_basic_log_info():
     """Return basic log information."""
     try:
         info = []
-        info.append("--- Log Information ---\n")
+        info.append("--- Log Information ---")
         
-        # Recent system logs
+        # Recent system logs with sudo using full path
         try:
             if os.path.exists("/var/log/syslog"):
                 log_file = "/var/log/syslog"
@@ -1238,7 +1238,7 @@ def get_basic_log_info():
                 
             if log_file:
                 recent_logs = subprocess.check_output(
-                    f"tail -n 20 {log_file}", shell=True
+                    f"sudo /bin/cat {log_file} | sudo /usr/bin/tail -n 20", shell=True
                 ).decode("utf-8")
                 info.append(f"Recent System Logs ({log_file}):")
                 info.append(recent_logs)
@@ -1247,7 +1247,7 @@ def get_basic_log_info():
         except Exception as e:
             info.append(f"Recent system logs unavailable: {e}")
             
-        # Recent auth logs
+        # Recent auth logs with sudo using full path
         try:
             if os.path.exists("/var/log/auth.log"):
                 auth_file = "/var/log/auth.log"
@@ -1258,21 +1258,21 @@ def get_basic_log_info():
                 
             if auth_file:
                 auth_logs = subprocess.check_output(
-                    f"tail -n 10 {auth_file}", shell=True
+                    f"sudo /bin/cat {auth_file} | sudo /usr/bin/tail -n 10", shell=True
                 ).decode("utf-8")
                 info.append(f"\nRecent Authentication Logs ({auth_file}):")
                 info.append(auth_logs)
             else:
                 info.append("\nNo standard authentication log file found")
         except Exception as e:
-            info.append(f"Recent authentication logs unavailable: {e}")
+            info.append(f"\nRecent authentication logs unavailable: {e}")
             
         # FIMonsec logs
         try:
             fimsec_log = LOG_FILE  # Using the global LOG_FILE from the script
             if os.path.exists(fimsec_log):
                 fimsec_logs = subprocess.check_output(
-                    f"tail -n 10 {fimsec_log}", shell=True
+                    f"/usr/bin/tail -n 10 {fimsec_log}", shell=True
                 ).decode("utf-8")
                 info.append(f"\nRecent FIMonsec Logs ({fimsec_log}):")
                 info.append(fimsec_logs)
@@ -1289,7 +1289,7 @@ def get_basic_security_info():
     """Return basic security information about the system."""
     try:
         info = []
-        info.append("--- Security Information ---\n")
+        info.append("--- Security Information ---")
         
         # Check for active users
         try:
@@ -1299,30 +1299,31 @@ def get_basic_security_info():
         except Exception as e:
             info.append(f"Active users unavailable: {e}")
         
-        # Check for failed login attempts
+        # Check for failed login attempts - UPDATED to use sudo with full path
         try:
             if os.path.exists("/var/log/auth.log"):
-                grep_cmd = "grep 'Failed password' /var/log/auth.log | tail -5"
+                grep_cmd = "sudo /bin/cat /var/log/auth.log | sudo /usr/bin/grep 'Failed password' | sudo /usr/bin/tail -5"
             elif os.path.exists("/var/log/secure"):
-                grep_cmd = "grep 'Failed password' /var/log/secure | tail -5"
+                grep_cmd = "sudo /bin/cat /var/log/secure | sudo /usr/bin/grep 'Failed password' | sudo /usr/bin/tail -5"
             else:
                 grep_cmd = None
                 
             if grep_cmd:
                 failed_logins = subprocess.check_output(grep_cmd, shell=True).decode("utf-8")
-                info.append("\nRecent Failed Login Attempts:")
-                info.append(failed_logins)
+                info.append("Recent Failed Login Attempts:")
+                info.append(failed_logins if failed_logins.strip() else "No failed login attempts found")
             else:
-                info.append("\nCould not locate authentication log files")
+                info.append("Could not locate authentication log files")
         except Exception as e:
-            info.append(f"\nFailed login attempts unavailable: {e}")
+            info.append("Recent Failed Login Attempts:")
+            info.append(f"Could not access auth logs: {e}")
         
         # Check for listening ports
         try:
             netstat_output = subprocess.check_output(
                 "netstat -tuln | grep LISTEN", shell=True
             ).decode("utf-8")
-            info.append("\nListening Ports:")
+            info.append("Listening Ports:")
             info.append(netstat_output)
         except Exception as e:
             try:
@@ -1330,22 +1331,22 @@ def get_basic_security_info():
                 ss_output = subprocess.check_output(
                     "ss -tuln | grep LISTEN", shell=True
                 ).decode("utf-8")
-                info.append("\nListening Ports:")
+                info.append("Listening Ports:")
                 info.append(ss_output)
             except Exception as e2:
-                info.append(f"\nListening ports unavailable: {e}, {e2}")
+                info.append(f"Listening ports unavailable: {e}, {e2}")
         
-        # Check for SUID files
+        # Check for SUID files - UPDATED to use sudo with full path
         try:
             # Safely limit the scope of SUID search to avoid performance issues
             suid_output = subprocess.check_output(
-                "find /usr/bin -perm -4000 -ls 2>/dev/null | head -10", 
+                "sudo /usr/bin/find /usr/bin -perm -4000 -ls 2>/dev/null | sudo /usr/bin/head -10", 
                 shell=True, timeout=5
             ).decode("utf-8")
-            info.append("\nSUID Files (limited to first 10 in /usr/bin):")
+            info.append("SUID Files (limited to first 10 in /usr/bin):")
             info.append(suid_output if suid_output else "No SUID files found in /usr/bin")
         except Exception as e:
-            info.append(f"\nSUID files search unavailable: {e}")
+            info.append(f"SUID files search unavailable: {e}")
         
         return "\n".join(info)
     except Exception as e:
