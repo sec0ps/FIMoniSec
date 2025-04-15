@@ -123,39 +123,6 @@ MAX_CLIENTS = config["MAX_CLIENTS"]
 SIEM_CONFIG = config.get("siem_settings", {})
 PID_FILE = os.path.join(LOG_DIR, "monisec-server.pid")
 
-def handle_shutdown(signum, frame):
-    logging.info("[INFO] Shutting down MoniSec Server...")
-    shutdown_event.set()
-
-    # Stop IPC server
-    from shared_state import stop_ipc_server, IPC_SOCKET_PATH
-    stop_ipc_server()
-
-    # Double-check IPC socket is removed
-    if os.path.exists(IPC_SOCKET_PATH):
-        try:
-            os.unlink(IPC_SOCKET_PATH)
-            logging.info(f"[INFO] Removed IPC socket: {IPC_SOCKET_PATH}")
-        except Exception as e:
-            logging.warning(f"[WARNING] Failed to remove IPC socket: {e}")
-
-    if server_socket:
-        server_socket.close()
-
-    try:
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-            logging.info(f"[INFO] Removed PID file: {PID_FILE}")
-    except Exception as e:
-        logging.warning(f"[WARNING] Failed to remove PID file: {e}")
-
-    logging.info("[INFO] MoniSec Server stopped.")
-    sys.exit(0)
-
-# Register SIGINT (CTRL+C) and SIGTERM (kill command) for graceful shutdown
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
-
 def run_server():
     # First, reset all logging handlers to ensure we're not using closed file descriptors
     root_logger = logging.getLogger()
@@ -266,6 +233,67 @@ def start_server():
     finally:
         logging.info("[INFO] Cleaning up server resources...")
         server.close()
+
+def handle_shutdown(signum, frame):
+    """Enhanced shutdown handler to properly terminate all connections and release ports."""
+    logging.info("[INFO] Shutting down MoniSec Server...")
+    shutdown_event.set()
+    
+    # First, close the WebSocket server if it's running
+    logging.info("[INFO] Closing WebSocket connections...")
+    try:
+        # Get active WebSocket connections
+        from shared_state import get_active_connections, reset_connection_tracking
+        connections = get_active_connections()
+        if connections:
+            # Log the connections that will be force-closed
+            connection_list = list(connections.keys())
+            logging.info(f"[INFO] Force-closing {len(connection_list)} WebSocket connections: {connection_list}")
+            
+        # Reset connection tracking
+        reset_connection_tracking()
+        logging.info("[INFO] Connection tracking reset")
+    except Exception as e:
+        logging.error(f"[ERROR] Error closing WebSocket connections: {e}")
+    
+    # Stop IPC server and ensure socket is removed
+    logging.info("[INFO] Stopping IPC server...")
+    from shared_state import stop_ipc_server, IPC_SOCKET_PATH
+    stop_ipc_server()
+
+    # Double-check IPC socket is removed
+    if os.path.exists(IPC_SOCKET_PATH):
+        try:
+            os.unlink(IPC_SOCKET_PATH)
+            logging.info(f"[INFO] Removed IPC socket: {IPC_SOCKET_PATH}")
+        except Exception as e:
+            logging.warning(f"[WARNING] Failed to remove IPC socket: {e}")
+
+    # Close the main server socket
+    if 'server_socket' in globals() and server_socket:
+        logging.info("[INFO] Closing main server socket...")
+        try:
+            # Set socket to non-blocking before closing
+            server_socket.setblocking(False)
+            server_socket.close()
+            logging.info("[INFO] Main server socket closed")
+        except Exception as e:
+            logging.error(f"[ERROR] Error closing server socket: {e}")
+    
+    # Remove PID file
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+            logging.info(f"[INFO] Removed PID file: {PID_FILE}")
+    except Exception as e:
+        logging.warning(f"[WARNING] Failed to remove PID file: {e}")
+
+    logging.info("[INFO] MoniSec Server stopped.")
+    sys.exit(0)
+
+# Register SIGINT (CTRL+C) and SIGTERM (kill command) for graceful shutdown
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
 def ensure_ipc_socket_exists():
     """Emergency function to ensure IPC socket exists."""
@@ -505,40 +533,82 @@ async def websocket_server(host="0.0.0.0", port=8765):
     logging.info(f"[WEBSOCKET] Server started on {host}:{port}")
     return server
 
-def print_help():
-    """Prints the available command-line options for monisec-server.py"""
-    print("""
-Usage: python monisec-server.py [command] [options]
-
-Management Commands:
-  add-agent <agent_name>         Add a new client and generate a unique PSK.
-  remove-agent <agent_name>      Remove an existing client.
-  list-agents                    List all registered clients.
-  configure-siem                 Configure SIEM settings for log forwarding.
-
-Remote Commands:
-  <module> [client_name]         Directly restart a module on all clients or a specific client.
-                                 Example: python monisec-server.py fim_client server1
-  restart <module> [client_name] Alternative syntax for restarting modules.
-                                 Example: python monisec-server.py restart fim_client server1
-  
-  Valid modules: monisec_client, fim_client, pim, lim
-  
-  yara-scan <client> <path>      Run a YARA scan on a client.
-  ir-shell <client>              Spawn an incident response shell on a client.
-  update <client>                Trigger a client update.
-
-Diagnostic Commands:
-  debug-websocket [reset]        Debug WebSocket connections (with optional reset).
-  websocket-status               Show detailed WebSocket and IPC connection status.
-
-Server Control:
-  -d                             Launch the MoniSec Server as a daemon.
-  stop                           Stop the running MoniSec Server daemon.
-  -h, --help                     Show this help message.
-
-If no command is provided, the server will start normally.
-""")
+def show_connected_clients():
+    """
+    Display all clients connected to the server (both direct and WebSocket).
+    This consolidates functionality from the previous debug-websocket and websocket-status commands.
+    """
+    print("[INFO] Listing all connected clients...")
+    
+    # Get WebSocket connected clients
+    from shared_state import get_active_connections, CONNECTIONS_FILE, IPC_SOCKET_PATH
+    ws_connections = get_active_connections()
+    ws_clients = list(ws_connections.keys())
+    
+    # Check IPC socket status
+    ipc_status = "Available"
+    if os.path.exists(IPC_SOCKET_PATH):
+        import stat
+        socket_stat = os.stat(IPC_SOCKET_PATH)
+        socket_perms = stat.filemode(socket_stat.st_mode)
+        ipc_details = f"at {IPC_SOCKET_PATH} with permissions {socket_perms}"
+    else:
+        ipc_status = "Unavailable"
+        ipc_details = f"(socket not found at {IPC_SOCKET_PATH})"
+    
+    # Load all registered clients
+    all_clients = []
+    try:
+        from clients import load_psks
+        psks = load_psks()
+        all_clients = [agent_data["AgentName"] for agent_data in psks.values()]
+    except Exception as e:
+        print(f"[ERROR] Failed to load registered clients: {e}")
+    
+    # Print the results in a formatted way
+    print("\n===== CONNECTED CLIENTS REPORT =====")
+    print(f"Server process PID: {os.getpid()}")
+    print(f"Total registered clients: {len(all_clients)}")
+    print(f"WebSocket connected clients: {len(ws_clients)}")
+    print(f"IPC socket status: {ipc_status} {ipc_details}")
+    print(f"Connections file: {CONNECTIONS_FILE}")
+    
+    # Print connections table
+    print("\nCLIENTS STATUS:")
+    print("----------------------------------------------------------")
+    print(f"{'Client Name':<30} {'WebSocket':<15} {'Last Activity':<20}")
+    print("----------------------------------------------------------")
+    
+    for client in sorted(all_clients):
+        ws_status = "Connected" if client in ws_clients else "Disconnected"
+        
+        # Get last activity time if connected via WebSocket
+        last_activity = "-"
+        if client in ws_connections:
+            last_seen = ws_connections[client].get("timestamp", 0)
+            if last_seen > 0:
+                last_activity = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_seen))
+        
+        print(f"{client:<30} {ws_status:<15} {last_activity:<20}")
+    
+    print("----------------------------------------------------------")
+    
+    # Option to reset connection tracking
+    if len(sys.argv) > 2 and sys.argv[2] == "reset":
+        print("\n[INFO] Resetting WebSocket connection tracking...")
+        from shared_state import reset_connection_tracking
+        reset_connection_tracking()
+        print("[INFO] Connection tracking reset complete.")
+        print("[INFO] Please restart client connections.")
+    
+    print("\nNOTES:")
+    print("- WebSocket connections provide NAT traversal and IR shell capability")
+    print("- Clients may connect directly for log forwarding even when WebSocket is disconnected")
+    print("- Use 'list-connected-clients reset' to reset connection tracking if needed")
+    print("=================================\n")
+    
+    # Return success
+    return True
 
 def restart_service(module, client_name=None):
     """Restart a service module on a client or all clients."""
@@ -577,6 +647,39 @@ def restart_service(module, client_name=None):
         print(f"[INFO] Restart complete. Successful on {success_count}/{len(all_clients)} clients.")
         return success_count > 0
 
+def print_help():
+    """Prints the available command-line options for monisec-server.py"""
+    print("""
+Usage: python monisec-server.py [command] [options]
+
+Management Commands:
+  add-agent <agent_name>         Add a new client and generate a unique PSK.
+  remove-agent <agent_name>      Remove an existing client.
+  list-agents                    List all registered clients.
+  list-connected-clients         Show all currently connected clients and connection status.
+                                 Use with 'reset' to reset connection tracking if needed.
+  configure-siem                 Configure SIEM settings for log forwarding.
+
+Remote Commands:
+  <module> [client_name]         Directly restart a module on all clients or a specific client.
+                                 Example: python monisec-server.py fim_client server1
+  restart <module> [client_name] Alternative syntax for restarting modules.
+                                 Example: python monisec-server.py restart fim_client server1
+  
+  Valid modules: monisec_client, fim_client, pim, lim
+  
+  yara-scan <client> <path>      Run a YARA scan on a client.
+  ir-shell <client>              Spawn an incident response shell on a client.
+  update <client>                Trigger a client update.
+
+Server Control:
+  -d                             Launch the MoniSec Server as a daemon.
+  stop                           Stop the running MoniSec Server daemon.
+  -h, --help                     Show this help message.
+
+If no command is provided, the server will start normally.
+""")
+
 if __name__ == "__main__":
     should_run_updater = (len(sys.argv) == 1) or (len(sys.argv) > 1 and sys.argv[1] == "-d")
 
@@ -609,6 +712,10 @@ if __name__ == "__main__":
         elif action == "add-agent":
             clients.add_client()
             sys.exit(0)
+            
+        elif action == "list-connected-clients":
+            show_connected_clients()
+            sys.exit(0) 
 
         elif action == "remove-agent":
             if len(sys.argv) < 3:
@@ -712,60 +819,80 @@ if __name__ == "__main__":
                 with open(PID_FILE, "r") as f:
                     pid = int(f.read().strip())
                 print(f"[INFO] Stopping MoniSec Server (PID: {pid})...")
+                
+                # Send SIGTERM to process
                 os.kill(pid, signal.SIGTERM)
                 print("[INFO] SIGTERM signal sent.")
+                
+                # Wait for up to 10 seconds for the process to exit gracefully
+                max_wait = 10
+                waited = 0
+                while waited < max_wait:
+                    try:
+                        # Check if process still exists
+                        os.kill(pid, 0)
+                        time.sleep(1)
+                        waited += 1
+                        sys.stdout.write(".")
+                        sys.stdout.flush()
+                    except ProcessLookupError:
+                        # Process is gone
+                        print("\n[INFO] Process terminated successfully.")
+                        break
+                
+                # If process is still running after timeout, send SIGKILL
+                if waited >= max_wait:
+                    print("\n[WARNING] Process did not terminate gracefully. Sending SIGKILL...")
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        print("[INFO] SIGKILL signal sent.")
+                    except ProcessLookupError:
+                        pass
+                
+                # Force clean up ports if still in use
+                try:
+                    import socket
+                    import psutil
+                    
+                    # Load config to get the ports
+                    config = load_config()
+                    main_port = config["PORT"]
+                    ws_port = config["WEBSOCKET_PORT"]
+                    
+                    # Check for processes using these ports
+                    for process in psutil.process_iter(['pid', 'name', 'connections']):
+                        try:
+                            connections = process.connections()
+                            for conn in connections:
+                                if conn.status == psutil.CONN_LISTEN and conn.laddr.port in [main_port, ws_port]:
+                                    print(f"[WARNING] Port {conn.laddr.port} still in use by PID {process.pid}. Attempting to force close...")
+                                    
+                                    # Try to force the port to close by binding to it
+                                    try:
+                                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                                        sock.bind(('0.0.0.0', conn.laddr.port))
+                                        sock.close()
+                                        print(f"[INFO] Successfully freed port {conn.laddr.port}")
+                                    except Exception as e:
+                                        print(f"[ERROR] Failed to free port {conn.laddr.port}: {e}")
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                            pass
+                except Exception as e:
+                    print(f"[ERROR] Error while cleaning up ports: {e}")
+                
+                # Check if PID file still exists and remove it
+                if os.path.exists(PID_FILE):
+                    os.remove(PID_FILE)
+                    print(f"[INFO] Removed PID file: {PID_FILE}")
+                    
             except ProcessLookupError:
                 print("[WARNING] Process not found. Removing stale PID file.")
-                os.remove(PID_FILE)
+                if os.path.exists(PID_FILE):
+                    os.remove(PID_FILE)
             except Exception as e:
                 print(f"[ERROR] Failed to stop daemon: {e}")
                 sys.exit(1)
-            sys.exit(0)
-
-        elif action == "debug-websocket":
-            print("[INFO] Debugging WebSocket connections...")
-            from shared_state import get_active_connections, CONNECTIONS_FILE
-            connections = get_active_connections()
-            print("\n===== WEBSOCKET CONNECTION DIAGNOSTIC =====")
-            print(f"Connections file: {CONNECTIONS_FILE}")
-            print(f"Active connections: {list(connections.keys())}")
-            print(f"Connection count: {len(connections)}")
-            print("==========================================\n")
-            if connections:
-                print("Connection details:")
-                for name, details in connections.items():
-                    last_seen = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(details.get('timestamp', 0)))
-                    print(f"  - {name}: Last seen at {last_seen}")
-            if len(sys.argv) > 2 and sys.argv[2] == "reset":
-                print("\n[INFO] Resetting WebSocket connection tracking...")
-                from shared_state import reset_connection_tracking
-                reset_connection_tracking()
-                print("[INFO] Connection tracking reset complete.")
-                print("[INFO] Please restart client connections.")
-            sys.exit(0)
-
-        elif action == "websocket-status":
-            print("[INFO] Checking WebSocket connection status...")
-            from shared_state import get_active_connections, CONNECTIONS_FILE, IPC_SOCKET_PATH
-            connections = get_active_connections()
-            print(f"[INFO] Server process PID: {os.getpid()}")
-            print(f"[INFO] Connected clients: {list(connections.keys())}")
-            if os.path.exists(CONNECTIONS_FILE):
-                try:
-                    for client, details in connections.items():
-                        last_seen = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(details.get('timestamp', 0)))
-                        print(f"  - {client}: Last seen at {last_seen}")
-                except Exception as e:
-                    print(f"[ERROR] Failed to read connections: {e}")
-            else:
-                print("[INFO] No connection store found")
-            if os.path.exists(IPC_SOCKET_PATH):
-                import stat
-                socket_stat = os.stat(IPC_SOCKET_PATH)
-                socket_perms = stat.filemode(socket_stat.st_mode)
-                print(f"[INFO] IPC socket exists at {IPC_SOCKET_PATH} with permissions {socket_perms}")
-            else:
-                print(f"[WARNING] IPC socket not found at {IPC_SOCKET_PATH}")
             sys.exit(0)
 
     # Default path: start MoniSec server if no valid command was passed
