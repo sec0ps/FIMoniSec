@@ -332,12 +332,6 @@ def handle_client(client_socket, client_address):
                         psk = server_crypt.load_psks(client_name)
                         logging.info(f"[DEBUG] → 3. Sent OK to client {client_address}, entering log receive loop")
 
-                        #websocket_status = "Not connected"
-                        #with websocket_lock:
-                        #    if client_name in active_websocket_connections:
-                        #        websocket_status = "Connected"
-                        #logging.info(f"[CONN-DEBUG] Client '{client_name}' WebSocket status: {websocket_status}")
-                        # ✅ Log reception loop
                         while True:
                             logging.info(f"[DEBUG] → 4. Inside log receive loop for {client_address}")
                             readable, _, _ = select.select([client_socket], [], [], 0.5)
