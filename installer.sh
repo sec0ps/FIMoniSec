@@ -241,7 +241,7 @@ Type=simple
 User=fimonisec
 Group=fimonisec
 WorkingDirectory=/opt/FIMoniSec
-ExecStart=/usr/bin/python3 /opt/FIMoniSec/monisec_client.py -d
+ExecStart=/usr/bin/python3 /opt/FIMoniSec/Linux-Client/monisec_client.py -d
 Restart=on-failure
 RestartSec=5s
 
@@ -266,7 +266,7 @@ EOF
 # Description:       File Integrity Monitoring Client Service
 ### END INIT INFO
 
-DAEMON_PATH="/opt/FIMoniSec"
+DAEMON_PATH="/opt/FIMoniSec/Linux-Client"
 DAEMON="/usr/bin/python3"
 DAEMONOPTS="monisec_client.py -d"
 NAME="fimonisec-client"
@@ -438,7 +438,7 @@ Type=simple
 User=fimonisec
 Group=fimonisec
 WorkingDirectory=/opt/FIMoniSec
-ExecStart=/usr/bin/python3 /opt/FIMoniSec/monisec-server.py -d
+ExecStart=/usr/bin/python3 /opt/FIMoniSec/Monisec-Server/monisec-server.py -d
 Restart=on-failure
 RestartSec=5s
 
@@ -463,7 +463,7 @@ EOF
 # Description:       File Integrity Monitoring Server Service
 ### END INIT INFO
 
-DAEMON_PATH="/opt/FIMoniSec"
+DAEMON_PATH="/opt/FIMoniSec/Monisec-Server"
 DAEMON="/usr/bin/python3"
 DAEMONOPTS="monisec-server.py -d"
 NAME="fimonisec-server"
@@ -629,7 +629,7 @@ if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
     status_message "Do you want to start the FIMoniSec client service now? (y/n): "
     read REPLY
     if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-        cd /opt/FIMoniSec && python3 monisec_client.py -d
+        cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d
         status_message "FIMoniSec client service started"
     fi
 fi
@@ -641,7 +641,7 @@ if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
     status_message "Do you want to start the FIMoniSec server service now? (y/n): "
     read REPLY
     if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-        cd /opt/FIMoniSec && python3 monisec-server.py -d
+        cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py -d
         status_message "FIMoniSec server service started"
     fi
 fi
@@ -653,14 +653,14 @@ status_message "----------------------------------------------"
 
 status_message "Direct command execution (recommended):"
 if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "  Start client:   cd /opt/FIMoniSec && python3 monisec_client.py -d"
-    status_message "  Stop client:    cd /opt/FIMoniSec && python3 monisec_client.py stop"
-    status_message "  Restart client: cd /opt/FIMoniSec && python3 monisec_client.py stop && python3 monisec_client.py -d"
+    status_message "  Start client:   cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d"
+    status_message "  Stop client:    cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py stop"
+    status_message "  Restart client: cd /opt/FIMoniSec/Linux-Client&& python3 monisec_client.py stop && python3 monisec_client.py -d"
 fi
 if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "  Start server:   cd /opt/FIMoniSec && python3 monisec-server.py -d"
-    status_message "  Stop server:    cd /opt/FIMoniSec && python3 monisec-server.py stop"
-    status_message "  Restart server: cd /opt/FIMoniSec && python3 monisec-server.py stop && python3 monisec-server.py -d"
+    status_message "  Start server:   cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py -d"
+    status_message "  Stop server:    cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py stop"
+    status_message "  Restart server: cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py stop && python3 monisec-server.py -d"
 fi
 
 if [ "$INIT_SYSTEM" = "systemd" ]; then
