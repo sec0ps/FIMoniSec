@@ -1,0 +1,13 @@
+psutil
+cryptography
+pywin32
+wmi
+requests
+websockets
+asyncio
+pypiwin32
+pyyaml
+chardet
+pandas
+numpy
+scikit-learn
