@@ -38,16 +38,27 @@ import threading
 import atexit
 from datetime import datetime
 
+BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+log_dir = os.path.join(BASE_DIR, "logs")
+os.makedirs(log_dir, exist_ok=True)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/opt/FIMoniSec/logs/process_guardian.log"),
+        logging.FileHandler(os.path.join(BASE_DIR, "logs", "process_guardian.log")),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger("ProcessGuardian")
+
+def stop_process_guardian_monitoring():
+    """Signal to ProcessGuardian to stop monitoring processes."""
+    control_file = os.path.join(BASE_DIR, "output", "guardian_stop_monitoring")
+    with open(control_file, 'w') as f:
+        f.write(str(os.getpid()))
+    logging.info("Signal sent to stop ProcessGuardian monitoring")
 
 class ProcessGuardian:
     """
@@ -55,7 +66,8 @@ class ProcessGuardian:
     Monitors processes, intercepts termination signals, and ensures persistence.
     """
     
-    def __init__(self, process_names=None, pid_file=None):
+    def __init__(self, process_names=None, pid_file=None, foreground_mode=False, install_signals=True):
+
         """
         Initialize the process guardian.
         
@@ -63,6 +75,10 @@ class ProcessGuardian:
             process_names (list): List of process names to protect (e.g., ["monisec_client.py"])
             pid_file (str): Path to PID file for this process
         """
+        self.install_signals = install_signals
+        if self.install_signals:
+            self._setup_signal_handlers()
+            
         self.process_names = process_names or []
         self.pid_file = pid_file
         self.watched_processes = {}
@@ -70,6 +86,7 @@ class ProcessGuardian:
         self.running = True
         self.watch_thread = None
         self.main_pid = os.getpid()
+        self.foreground_mode = foreground_mode
         
         # Ensure logs directory exists
         os.makedirs("/opt/FIMoniSec/logs", exist_ok=True)
@@ -131,6 +148,17 @@ class ProcessGuardian:
         # Write to tamper evidence log
         self._log_tamper_attempt(signal_name, sender_info)
         
+        # For foreground mode, we need to propagate the signal to the parent process
+        # to ensure it can properly terminate child processes
+        if self.foreground_mode and signum in [signal.SIGINT, signal.SIGTERM]:
+            logger.info(f"Foreground mode: allowing {signal_name} to terminate process.")
+            
+            # Terminate all monitored processes
+            self.terminate_monitored_processes()
+            
+            self.running = False
+            sys.exit(0)
+        
         # By default, we'll ignore most termination signals to keep the process alive
         # But we'll make an exception for repeated SIGTERM signals which might indicate
         # a legitimate shutdown request
@@ -149,9 +177,8 @@ class ProcessGuardian:
                     self.watch_thread.join(timeout=3)
                 sys.exit(0)
         
-        # Otherwise, ignore the signal and keep running
         logger.info(f"Ignored {signal_name} signal, continuing execution")
-    
+
     def _get_signal_sender(self):
         """
         Attempt to identify the process that sent the termination signal.
@@ -179,7 +206,7 @@ class ProcessGuardian:
             signal_name (str): Name of the signal received
             sender_info (dict): Information about the sender
         """
-        tamper_log_path = "/opt/FIMoniSec/logs/tamper_evidence.log"
+        tamper_log_path = os.path.join(BASE_DIR, "logs", "tamper_evidence.log")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         try:
@@ -216,25 +243,63 @@ class ProcessGuardian:
     def _monitor_processes(self):
         """
         Monitor the protected processes and restart them if they're terminated.
+        Maintains a health check loop to ensure continuous operation.
+        Added a 30-second sleep on startup to avoid thrashing during system initialization.
         """
+        # Add initial sleep to avoid thrashing during system startup
+        logger.info("ProcessGuardian starting with 30-second stabilization delay...")
+        time.sleep(30)
+        logger.info("ProcessGuardian monitoring activated")
+        
+        # Track last restart time for each process to prevent thrashing
+        last_restart_times = {}
+        
         while self.running:
             try:
+                # Check for shutdown signal
+                control_file = os.path.join(BASE_DIR, "output", "guardian_stop_monitoring")
+                if os.path.exists(control_file):
+                    logger.info("Shutdown signal detected. Stopping process monitoring.")
+                    self.running = False
+                    break
+                
+                # Check if monisec_client is managing processes
+                monisec_manages_file = os.path.join(BASE_DIR, "output", "monisec_manages_processes")
+                monisec_manages = os.path.exists(monisec_manages_file)
+                
                 # First, update our list of processes to watch
                 self._update_watched_processes()
                 
                 # Check each watched process
                 for proc_name, proc_info in list(self.watched_processes.items()):
+                    # Skip monisec-managed processes if flag is set
+                    if monisec_manages and proc_name in ["fim.py", "lim.py", "pim.py"]:
+                        continue
+                        
                     # If we have a PID, check if it's still running
                     if proc_info["pid"]:
+                        # Check if this process was restarted recently (within the last 60 seconds)
+                        current_time = time.time()
+                        if proc_name in last_restart_times and current_time - last_restart_times[proc_name] < 60:
+                            logger.info(f"Skipping check for {proc_name} - recently restarted")
+                            continue
+                            
                         try:
                             proc = psutil.Process(proc_info["pid"])
                             # If process is not running or zombie, restart it
                             if proc.status() == psutil.STATUS_ZOMBIE:
                                 logger.warning(f"Process {proc_name} (PID: {proc_info['pid']}) is zombie. Restarting...")
                                 self._restart_process(proc_name, proc_info)
+                                last_restart_times[proc_name] = current_time
                         except psutil.NoSuchProcess:
+                            # Check for shutdown signal again before restarting
+                            if os.path.exists(control_file):
+                                logger.info("Shutdown signal detected. Skipping process restart.")
+                                continue
+                                
                             logger.warning(f"Process {proc_name} (PID: {proc_info['pid']}) was terminated. Restarting...")
                             self._restart_process(proc_name, proc_info)
+                            last_restart_times[proc_name] = current_time
                 
                 # Sleep for a bit before checking again
                 time.sleep(5)
@@ -242,7 +307,7 @@ class ProcessGuardian:
             except Exception as e:
                 logger.error(f"Error in process monitoring: {e}")
                 time.sleep(10)  # Longer sleep on error
-    
+                            
     def _update_watched_processes(self):
         """Update the list of processes to watch."""
         for proc_name in self.process_names:
@@ -287,12 +352,25 @@ class ProcessGuardian:
     
     def _restart_process(self, proc_name, proc_info):
         """
-        Restart a terminated process.
+        Restart a terminated process, but check if another instance
+        is already running first.
         
         Args:
             proc_name (str): Process name
             proc_info (dict): Process information
         """
+        # Check if another instance is already running
+        existing_pids = self._find_process_pids(proc_name)
+        
+        # Filter out the old PID that might still be in the zombie state
+        existing_pids = [pid for pid in existing_pids if pid != proc_info["pid"]]
+        
+        if existing_pids:
+            logger.info(f"Found another instance of {proc_name} already running (PID: {existing_pids[0]})")
+            # Update our tracking to use the existing process instead
+            proc_info["pid"] = existing_pids[0]
+            return
+        
         # Log the restart attempt
         logger.warning(f"Attempting to restart {proc_name}")
         
@@ -301,17 +379,17 @@ class ProcessGuardian:
         cwd = None
         
         if "monisec_client.py" in proc_name:
-            cmd = ["python3", "/opt/FIMoniSec/Linux-Client/monisec_client.py", "-d"]
-            cwd = "/opt/FIMoniSec/Linux-Client"
+            cmd = ["python3", os.path.join(BASE_DIR, "monisec_client.py"), "-d"]
+            cwd = BASE_DIR
         elif "fim.py" in proc_name:
-            cmd = ["python3", "/opt/FIMoniSec/Linux-Client/fim.py"]
-            cwd = "/opt/FIMoniSec/Linux-Client"
+            cmd = ["python3", os.path.join(BASE_DIR, "fim.py"), "-d"]  # Fixed syntax
+            cwd = BASE_DIR
         elif "lim.py" in proc_name:
-            cmd = ["python3", "/opt/FIMoniSec/Linux-Client/lim.py"]
-            cwd = "/opt/FIMoniSec/Linux-Client"
+            cmd = ["python3", os.path.join(BASE_DIR, "lim.py"), "-d"]  # Fixed syntax
+            cwd = BASE_DIR
         elif "pim.py" in proc_name:
-            cmd = ["python3", "/opt/FIMoniSec/Linux-Client/pim.py"]
-            cwd = "/opt/FIMoniSec/Linux-Client"
+            cmd = ["python3", os.path.join(BASE_DIR, "pim.py"), "-d"]  # Fixed syntax
+            cwd = BASE_DIR
         
         if cmd and cwd:
             try:
@@ -321,7 +399,7 @@ class ProcessGuardian:
                     cwd=cwd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    start_new_session=True  # Detach from the parent process
+                    start_new_session=True
                 )
                 
                 # Update the process info
@@ -338,7 +416,7 @@ class ProcessGuardian:
                 logger.error(f"Failed to restart {proc_name}: {e}")
         else:
             logger.error(f"No restart command defined for {proc_name}")
-    
+        
     def _log_process_restart(self, proc_name, new_pid):
         """
         Log process restart as a security event.
@@ -347,7 +425,7 @@ class ProcessGuardian:
             proc_name (str): Process name
             new_pid (int): New process PID
         """
-        security_log_path = "/opt/FIMoniSec/logs/security_events.log"
+        security_log_path = os.path.join(BASE_DIR, "logs", "security_events.log")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         try:
@@ -357,7 +435,7 @@ class ProcessGuardian:
         except Exception as e:
             logger.error(f"Failed to write to security events log: {e}")
 
-    def set_process_priority(self, priority=10):
+    def set_process_priority(self, priority=-10):
         """
         Set the process priority (nice value) to make it harder to terminate.
         Lower values have higher priority.
@@ -368,9 +446,12 @@ class ProcessGuardian:
         try:
             # Set the nice value
             os.nice(priority)
-            logger.info(f"Set process priority to {priority}")
+            logging.info(f"Set process priority to {priority}")
+            return True
         except Exception as e:
-            logger.error(f"Failed to set process priority: {e}")
+            logging.warning(f"Failed to set process priority: {e}")
+            logging.info("Continuing without priority adjustment")
+            return False
 
     def prevent_core_dumps(self):
         """Prevent core dumps to avoid leaking sensitive information."""
@@ -380,3 +461,32 @@ class ProcessGuardian:
             logger.info("Prevented core dumps")
         except Exception as e:
             logger.error(f"Failed to prevent core dumps: {e}")
+
+    def terminate_monitored_processes(self):
+        """
+        Terminate all monitored processes when shutting down in foreground mode.
+        """
+        logger.info("Terminating all monitored processes...")
+        
+        # Find and terminate all monitored processes
+        for proc_name in ["fim_client.py", "pim.py", "lim.py"]:
+            pids = self._find_process_pids(proc_name)
+            for pid in pids:
+                try:
+                    logger.info(f"Sending SIGTERM to {proc_name} (PID: {pid})...")
+                    os.kill(pid, signal.SIGTERM)
+                except OSError as e:
+                    logger.error(f"Error sending SIGTERM to {proc_name} (PID: {pid}): {e}")
+        
+        # Wait for processes to terminate gracefully
+        time.sleep(2)
+        
+        # Force kill any remaining processes
+        for proc_name in ["fim_client.py", "pim.py", "lim.py"]:
+            pids = self._find_process_pids(proc_name)
+            for pid in pids:
+                try:
+                    logger.warning(f"Process {proc_name} (PID: {pid}) did not terminate gracefully. Forcing...")
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass  # Process might already be gone
