@@ -125,7 +125,7 @@ LOG_PATTERNS = {
 
 def discover_and_classify_logs(base_dirs=None, include_all=False):
     """
-    Discover and classify log files across the system
+    Discover and classify log files across the system using allowed sudo commands
     
     Args:
         base_dirs: List of directories to scan (defaults to common log directories)
@@ -152,6 +152,9 @@ def discover_and_classify_logs(base_dirs=None, include_all=False):
     # Track files already classified
     classified_files = set()
     
+    # Import here to avoid unnecessary imports if not used
+    import subprocess
+    
     # Scan all directories
     for base_dir in base_dirs:
         logging.info(f"Scanning {base_dir} for log files")
@@ -164,33 +167,42 @@ def discover_and_classify_logs(base_dirs=None, include_all=False):
                         
                     full_path = os.path.join(root, filename)
                     
-                    # Skip if not readable
-                    if not os.access(full_path, os.R_OK):
-                        logging.warning(f"Skipping {full_path} - not readable")
-                        continue
-                        
-                    # Skip if too large (>100MB)
+                    # Attempt to read the file
                     try:
+                        # Skip if too large (>100MB)
                         if os.path.getsize(full_path) > 100 * 1024 * 1024:
                             logging.warning(f"Skipping {full_path} - file too large")
                             continue
-                    except OSError:
-                        logging.warning(f"Could not get size for {full_path}")
-                        continue
-                        
-                    # Categorize the log file
-                    categorized = False
-                    for category, patterns in compiled_patterns.items():
-                        if any(pattern.search(full_path) for pattern in patterns):
-                            log_categories[category].append(full_path)
-                            classified_files.add(full_path)
-                            categorized = True
-                            break
                             
-                    # Add to "other" if not categorized but include_all is True
-                    if not categorized and include_all:
-                        log_categories["other"].append(full_path)
-                        classified_files.add(full_path)
+                        # If we can't access the file directly, try using sudo with head
+                        if not os.access(full_path, os.R_OK):
+                            logging.info(f"Using elevated privileges to access {full_path}")
+                            try:
+                                # Use head with 0 lines to check if file is readable with sudo
+                                # This is equivalent to "test -r" but uses an allowed command
+                                subprocess.run(["sudo", "head", "-n", "0", full_path], 
+                                              check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                # If we get here, sudo access worked
+                            except subprocess.CalledProcessError:
+                                logging.warning(f"Cannot access {full_path} even with elevated privileges")
+                                continue
+                        
+                        # Categorize the log file
+                        categorized = False
+                        for category, patterns in compiled_patterns.items():
+                            if any(pattern.search(full_path) for pattern in patterns):
+                                log_categories[category].append(full_path)
+                                classified_files.add(full_path)
+                                categorized = True
+                                break
+                                
+                        # Add to "other" if not categorized but include_all is True
+                        if not categorized and include_all:
+                            log_categories["other"].append(full_path)
+                            classified_files.add(full_path)
+                    
+                    except OSError as e:
+                        logging.warning(f"Error accessing {full_path}: {str(e)}")
         except PermissionError:
             logging.warning(f"Permission denied when scanning {base_dir}")
         except Exception as e:
@@ -332,17 +344,38 @@ def estimate_log_importance(log_file):
     
     # Sample the file content
     try:
-        # Read at most 100 lines or 50KB
-        sample_size = 0
+        # First try regular access
         sample_lines = []
+        has_permission = os.access(log_file, os.R_OK)
         
-        with open(log_file, 'r', errors='ignore') as f:
-            for i, line in enumerate(f):
-                if i >= 100 or sample_size > 50 * 1024:
-                    break
-                sample_lines.append(line)
-                sample_size += len(line)
-        
+        if has_permission:
+            # Normal file access
+            sample_size = 0
+            with open(log_file, 'r', errors='ignore') as f:
+                for i, line in enumerate(f):
+                    if i >= 100 or sample_size > 50 * 1024:
+                        break
+                    sample_lines.append(line)
+                    sample_size += len(line)
+        else:
+            # Use sudo to read file with a command that's in sudoers
+            import subprocess
+            try:
+                logging.info(f"Using elevated privileges to read {log_file}")
+                # Get first 100 lines with sudo head (which is in your allowed list)
+                cmd = ["sudo", "head", "-n", "100", log_file]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                sample_lines = result.stdout.splitlines()
+                # Trim to ~50KB if needed
+                sample_size = 0
+                for i in range(len(sample_lines)):
+                    sample_size += len(sample_lines[i])
+                    if sample_size > 50 * 1024:
+                        sample_lines = sample_lines[:i+1]
+                        break
+            except subprocess.CalledProcessError as e:
+                logging.warning(f"Failed to read {log_file} with sudo: {e}")
+                
         # Check content
         for line in sample_lines:
             line_lower = line.lower()
