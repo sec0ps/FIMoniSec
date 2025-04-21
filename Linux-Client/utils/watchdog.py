@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 # =============================================================================
-# FIMonsec Tool - Enhanced Watchdog with Process Protection
+# FIMonsec Tool - File Integrity Monitoring Security Solution
 # =============================================================================
 #
 # Author: Keith Pachulski
@@ -11,13 +10,23 @@
 # Copyright (c) 2025 Keith Pachulski. All rights reserved.
 #
 # License: This software is licensed under the MIT License.
+#          You are free to use, modify, and distribute this software
+#          in accordance with the terms of the license.
 #
-# Purpose: Combined watchdog and process protection for FIMoniSec Tool.
-#          Provides process monitoring, auto-restart capabilities, and
-#          protection against termination attempts.
+# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
+#          system integrity monitoring with real-time alerting capabilities. It monitors
+#          critical system and application files for unauthorized modifications,
+#          supports baseline comparisons, and integrates with SIEM solutions.
+#
+# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
+#             express or implied, including but not limited to the warranties
+#             of merchantability, fitness for a particular purpose, and non-infringement.
+#             In no event shall the authors or copyright holders be liable for any claim,
+#             damages, or other liability, whether in an action of contract, tort, or otherwise,
+#             arising from, out of, or in connection with the software or the use or other dealings
+#             in the software.
 #
 # =============================================================================
-
 import os
 import sys
 import time
@@ -30,18 +39,15 @@ import hashlib
 import atexit
 from datetime import datetime
 
-# Add client utils directory to path if needed
-utils_dir = "/opt/FIMoniSec/Linux-Client/utils"
+BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+log_dir = os.path.join(BASE_DIR, "logs")
+output_dir = os.path.join(BASE_DIR, "output")
+utils_dir = os.path.join(BASE_DIR, "utils")
+os.makedirs(log_dir, exist_ok=True)
+os.makedirs(output_dir, exist_ok=True)
+
 if os.path.exists(utils_dir) and utils_dir not in sys.path:
     sys.path.append(utils_dir)
-
-# Configure logging
-log_dir = "/opt/FIMoniSec/logs"
-os.makedirs(log_dir, exist_ok=True)
-
-# Ensure output directory exists for PID files
-output_dir = "/opt/FIMoniSec/Linux-Client/output"
-os.makedirs(output_dir, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,30 +71,37 @@ class EnhancedWatchdog:
         # Define the processes to monitor and protect
         self.processes = {
             "monisec_client": {
-                "script": "/opt/FIMoniSec/Linux-Client/monisec_client.py",
+                "script": os.path.join(BASE_DIR, "monisec_client.py"),
                 "args": ["-d"],
-                "cwd": "/opt/FIMoniSec/Linux-Client",
+                "cwd": BASE_DIR,
                 "expected_count": 1,
                 "protected": True
             },
             "fim": {
-                "script": "/opt/FIMoniSec/Linux-Client/fim.py",
+                "script": os.path.join(BASE_DIR, "fim.py"),
                 "args": ["-d"],
-                "cwd": "/opt/FIMoniSec/Linux-Client",
+                "cwd": BASE_DIR,
                 "expected_count": 1,
                 "protected": True
             },
             "lim": {
-                "script": "/opt/FIMoniSec/Linux-Client/lim.py",
+                "script": os.path.join(BASE_DIR, "lim.py"),
                 "args": ["-d"],
-                "cwd": "/opt/FIMoniSec/Linux-Client",
+                "cwd": BASE_DIR,
                 "expected_count": 1,
                 "protected": True
             },
             "pim": {
-                "script": "/opt/FIMoniSec/Linux-Client/pim.py",
+                "script": os.path.join(BASE_DIR, "pim.py"),
                 "args": ["-d"],
-                "cwd": "/opt/FIMoniSec/Linux-Client",
+                "cwd": BASE_DIR,
+                "expected_count": 1,
+                "protected": True
+            },
+            "watchdog": {
+                "script": os.path.join(BASE_DIR, "utils/watchdog.py"),
+                "args": ["-d"],
+                "cwd": BASE_DIR,
                 "expected_count": 1,
                 "protected": True
             }
@@ -250,7 +263,7 @@ class EnhancedWatchdog:
     
     def _initialize_process_hashes(self):
         """Initialize the known good hashes for monitored processes."""
-        base_path = "/opt/FIMoniSec/Linux-Client"
+        # Using BASE_DIR instead of hardcoded path
         
         # Define the main script files to monitor
         files_to_monitor = [
@@ -262,7 +275,7 @@ class EnhancedWatchdog:
         
         # Calculate hashes for each file
         for filename in files_to_monitor:
-            file_path = os.path.join(base_path, filename)
+            file_path = os.path.join(BASE_DIR, filename)
             hash_value = self._calculate_file_hash(file_path)
             if hash_value:
                 self.process_hashes[filename] = hash_value
@@ -297,7 +310,7 @@ class EnhancedWatchdog:
         while self.running:
             try:
                 for filename, original_hash in self.process_hashes.items():
-                    file_path = os.path.join("/opt/FIMoniSec/Linux-Client", filename)
+                    file_path = os.path.join(BASE_DIR, filename)
                     current_hash = self._calculate_file_hash(file_path)
                     
                     if not current_hash:
@@ -367,6 +380,8 @@ class EnhancedWatchdog:
             int: Number of instances running
         """
         count = 0
+        current_pid = os.getpid()
+        
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
                 # Check if process name matches
@@ -374,8 +389,14 @@ class EnhancedWatchdog:
                     count += 1
                     continue
                 
+                # Special handling for watchdog.py
+                if proc_name == "watchdog":
+                    if proc.info['cmdline'] and any("watchdog.py" in cmd for cmd in proc.info['cmdline']):
+                        count += 1
+                    continue
+                    
                 # Check if process script name matches in cmdline
-                if proc.cmdline() and any(proc_name in cmd for cmd in proc.cmdline()):
+                if proc.info['cmdline'] and any(f"{proc_name}.py" in cmd for cmd in proc.info['cmdline']):
                     count += 1
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
@@ -466,7 +487,7 @@ class EnhancedWatchdog:
         except Exception as e:
             logger.error(f"Failed to write to security events log: {e}")
     
-    def set_process_priority(self, priority=-10):
+    def set_process_priority(self, priority=10):
         """
         Set the process priority (nice value) to make it harder to terminate.
         Lower values have higher priority.
@@ -477,9 +498,12 @@ class EnhancedWatchdog:
         try:
             # Set the nice value
             os.nice(priority)
-            logger.info(f"Set watchdog process priority to {priority}")
+            logger.info(f"Set process priority to {priority}")
+            return True
         except Exception as e:
-            logger.error(f"Failed to set process priority: {e}")
+            logger.warning(f"Failed to set process priority: {e}")
+            logger.info("Continuing without priority adjustment")
+            return False
     
     def prevent_core_dumps(self):
         """Prevent core dumps to avoid leaking sensitive information."""
@@ -495,7 +519,11 @@ class EnhancedWatchdog:
         Main monitoring thread that continuously checks processes
         and restarts any that are missing.
         """
-        logger.info("Process monitoring thread started")
+        logger.info("Process monitoring thread starting with initial stabilization delay...")
+        # Add additional stabilization delay to ensure all processes have fully started
+        time.sleep(15)  # 15 second additional delay
+        
+        logger.info("Process monitoring thread now active")
         
         while self.running:
             try:
@@ -505,7 +533,7 @@ class EnhancedWatchdog:
                 # Restart any missing processes
                 for proc_name in missing_processes:
                     self.restart_process(proc_name)
-                
+                    
                 # Adaptive sleep: shorter interval if there were issues, longer if stable
                 sleep_time = 60 if not missing_processes else 10
                 
@@ -514,11 +542,11 @@ class EnhancedWatchdog:
                     if not self.running:
                         break
                     time.sleep(1)
-                
+                    
             except Exception as e:
                 logger.error(f"Error in monitoring thread: {e}")
                 time.sleep(30)  # Sleep on error
-    
+                    
     def start(self):
         """Start the enhanced watchdog with all monitoring threads."""
         # Set process hardening measures
@@ -591,10 +619,23 @@ def start_daemon_mode():
 
 
 if __name__ == "__main__":
+    # Create a temporary instance to check processes
+    temp_watchdog = EnhancedWatchdog(daemon_mode=False)
+    
+    # Check if watchdog is already running
+    watchdog_count = temp_watchdog._count_process_instances("watchdog")
+    
+    # Subtract 1 for current process
+    if watchdog_count > 1:  # More than just the current instance
+        print(f"Watchdog is already running. Found {watchdog_count-1} other instances. Exiting.")
+        sys.exit(0)
+    
     # Process command line arguments
     if len(sys.argv) > 1 and sys.argv[1] == "-d":
         # Start in daemon mode
-        print("Starting Enhanced Watchdog in daemon mode...")
+        logger.info("Starting Enhanced Watchdog in daemon mode...")
+        
+        # Now start the actual daemon
         start_daemon_mode()
     else:
         # Run a single check
