@@ -39,11 +39,13 @@ import daemon
 import daemon.pidfile
 import threading
 import traceback
+import atexit
+
 # New imports for ML and analysis
 import numpy as np  # For numerical operations
 import pandas as pd  # For data manipulation
 from sklearn.ensemble import IsolationForest  # For anomaly detection
-# Optional: for better error handling with ML libraries
+
 try:
     import numpy as np
     import pandas as pd
@@ -53,15 +55,18 @@ except ImportError:
     print("[WARNING] Machine learning libraries (numpy, pandas, scikit-learn) not found. ML-based detection will be disabled.")
     ML_LIBRARIES_AVAILABLE = False
 
-OUTPUT_DIR = os.path.abspath("./output")
-LOG_DIR = os.path.abspath("./logs")  # Change from absolute path
+BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+
 LOG_FILE = os.path.join(LOG_DIR, "process_monitor.log")
 PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
 INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
 PID_FILE = os.path.join(OUTPUT_DIR, "pim.pid")
-FILE_MONITOR_JSON = os.path.abspath(os.path.join("logs", "file_monitor.json"))
+FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
 KNOWN_PORTS_FILE = os.path.join(OUTPUT_DIR, "known_ports.json")
 KNOWN_LINEAGES_FILE = os.path.join(OUTPUT_DIR, "known_lineages.json")
+
 
 # Preserve environment variables for sudo and command execution
 daemon_env = os.environ.copy()
@@ -158,7 +163,7 @@ def get_process_hash(exe_path, cmdline=None):
         with open(exe_path, "rb") as f:
             hash_obj.update(f.read())
 
-        # Optionally include command-line arguments in hashing
+        # include command-line arguments in hashing
         if cmdline:
             hash_obj.update(cmdline.encode("utf-8"))
 
@@ -1414,12 +1419,17 @@ def run_monitor():
 
         ensure_output_dir()
 
+        # Register cleanup on normal and signal-based exits
+        atexit.register(cleanup_and_exit)
+        signal.signal(signal.SIGINT, cleanup_and_exit)
+        signal.signal(signal.SIGTERM, cleanup_and_exit)
+
         if "--daemon" in sys.argv:
             sys.stdout = open(LOG_FILE, "a", buffering=1)
             sys.stderr = sys.stdout
 
-        signal.signal(signal.SIGINT, lambda signum, frame: sys.exit(0))
-        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+#        signal.signal(signal.SIGINT, cleanup_and_exit)
+#        signal.signal(signal.SIGTERM, cleanup_and_exit)
 
         print("[INFO] Logging all listening processes on startup...")
         initial_processes = get_listening_processes()
@@ -1446,6 +1456,19 @@ def run_monitor():
     except Exception as e:
         print(f"[ERROR] PIM encountered an error: {e}")
         traceback.print_exc()
+
+def cleanup_and_exit(signum=None, frame=None):
+    """Cleanup tasks before exiting."""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+            print(f"[INFO] Cleaned up PID file: {PID_FILE}")
+    except Exception as e:
+        print(f"[ERROR] Failed to remove PID file during cleanup: {e}")
+
+    # Only call sys.exit if triggered by a signal (i.e., not atexit)
+    if signum is not None:
+        sys.exit(0)
 
 def print_help():
     help_text = """
@@ -1526,4 +1549,3 @@ if __name__ == "__main__":
     else:
         print("[INFO] Running PIM in foreground mode...")
         run_monitor()
-
