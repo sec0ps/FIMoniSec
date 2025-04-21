@@ -42,6 +42,8 @@ from lim_utils.log_discovery import discover_and_classify_logs, identify_critica
 from lim_utils.log_detection_engine import LogDetectionEngine
 from lim_utils.lim_ml import LogAnomalyDetector
 
+BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+
 PID_FILE = "lim.pid"
 
 def print_banner():
@@ -54,10 +56,18 @@ def print_banner():
 
 def start_monitor(foreground=True):
     """Start the LIM monitoring service"""
-    if os.path.exists(PID_FILE):
-        print("LIM is already running or PID file exists.")
-        print(f"To force start, delete the PID file: {PID_FILE}")
-        return
+    # Ensure paths for PID and logs are correct
+    pid_file = os.path.join(BASE_DIR, "output", PID_FILE)
+    log_dir = os.path.join(BASE_DIR, "logs")
+    
+    # Create directories if they don't exist
+    os.makedirs(os.path.join(BASE_DIR, "output"), exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Simply remove the PID file if it exists
+    if os.path.exists(pid_file):
+        print(f"Found existing PID file. Removing {pid_file} before starting.")
+        os.remove(pid_file)
 
     if not foreground:
         # Proper daemonization using double-fork
@@ -65,7 +75,7 @@ def start_monitor(foreground=True):
         if pid > 0:
             # Exit parent
             print(f"LIM started in daemon mode with PID {pid}")
-            with open(PID_FILE, 'w') as f:
+            with open(pid_file, 'w') as f:
                 f.write(str(pid))
             sys.exit(0)
 
@@ -76,14 +86,15 @@ def start_monitor(foreground=True):
         # Second fork to prevent reacquisition of terminal
         pid2 = os.fork()
         if pid2 > 0:
-            with open(PID_FILE, 'w') as f:
+            with open(pid_file, 'w') as f:
                 f.write(str(pid2))
             sys.exit(0)
 
         # Redirect standard file descriptors
         sys.stdout.flush()
         sys.stderr.flush()
-        with open("lim_output.log", 'a+') as out, open("lim_error.log", 'a+') as err:
+        with open(os.path.join(log_dir, "lim_output.log"), 'a+') as out, \
+             open(os.path.join(log_dir, "lim_error.log"), 'a+') as err:
             os.dup2(out.fileno(), sys.stdout.fileno())
             os.dup2(err.fileno(), sys.stderr.fileno())
 
@@ -99,14 +110,17 @@ def start_monitor(foreground=True):
 
 def run_monitor():
     """Run the actual monitoring process"""
+    # Ensure we use the correct PID file path
+    pid_file = os.path.join(BASE_DIR, "output", PID_FILE)
+    
     config_manager = ConfigManager()
     monitor = EnhancedLogMonitor(config_manager)
     
-    # Register signal handlers
+    # Register signal handlers with correct PID file path
     def handle_signal(signum, frame):
         print("\nReceived signal to terminate. Shutting down LIM...")
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+        if os.path.exists(pid_file):
+            os.remove(pid_file)
         sys.exit(0)
         
     signal.signal(signal.SIGTERM, handle_signal)
@@ -117,16 +131,18 @@ def run_monitor():
 
 def stop_monitor():
     """Stop the LIM monitoring service"""
-    if not os.path.exists(PID_FILE):
+    pid_file = os.path.join(BASE_DIR, "output", PID_FILE)
+    
+    if not os.path.exists(pid_file):
         print("No LIM daemon is running.")
         return
         
-    with open(PID_FILE, 'r') as f:
+    with open(pid_file, 'r') as f:
         try:
             pid = int(f.read().strip())
         except ValueError:
-            print(f"Invalid PID in {PID_FILE}. Removing stale PID file.")
-            os.remove(PID_FILE)
+            print(f"Invalid PID in {pid_file}. Removing stale PID file.")
+            os.remove(pid_file)
             return
             
     try:
@@ -141,12 +157,12 @@ def stop_monitor():
             except OSError:
                 break
                 
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+        if os.path.exists(pid_file):
+            os.remove(pid_file)
             
     except ProcessLookupError:
         print(f"Process {pid} not found. Removing stale PID file.")
-        os.remove(PID_FILE)
+        os.remove(pid_file)
     except PermissionError:
         print(f"Permission denied when attempting to terminate process {pid}.")
 
@@ -171,17 +187,36 @@ def scan_logs():
         
     print(f"\nTotal log files found: {total_logs}")
     
-    return logs
+    # Identify critical logs
+    critical_logs = identify_critical_logs(logs)
+    print("\nCritical security logs:")
+    for log_file in critical_logs[:10]:  # Show first 10
+        print(f"  - {log_file}")
+    if len(critical_logs) > 10:
+        print(f"  ... and {len(critical_logs) - 10} more")
+    
+    return logs, critical_logs
 
 def update_config():
     """Update the LIM configuration with the latest log files"""
     print("Updating LIM configuration...")
-    logs = scan_logs()
+    
+    # Get both regular and critical logs
+    logs, critical_logs = scan_logs()
     
     config_manager = ConfigManager()
+    
+    # Update with regular logs
     config_manager.update_log_files(logs)
     
+    # Add critical logs to the configuration separately
+    lim_config = config_manager.get_lim_config()
+    lim_config["critical_logs"] = critical_logs
+    config_manager.update_config_value("log_integrity_monitor", lim_config)
+    
     print("\nConfiguration updated successfully.")
+    print(f"Regular logs updated: {sum(len(logs[category]) for category in logs)}")
+    print(f"Critical logs identified: {len(critical_logs)}")
 
 def main():
     """Main entry point with command-line argument parsing"""
