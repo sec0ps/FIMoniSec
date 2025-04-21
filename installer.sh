@@ -29,10 +29,6 @@
 # =============================================================================
 #!/bin/bash
 
-# Enterprise-Grade Intrusion Detection and Response Framework Installer
-# This script installs FIMoniSec and configures the necessary environment
-# Supports client, server, or both installation types
-
 # Function to display error messages
 error_exit() {
     echo "[ERROR] $1" >&2
@@ -57,33 +53,124 @@ fi
 
 status_message "Starting installation as user: $CURRENT_USER"
 
-# Step 0: Determine installation type
-INSTALL_TYPE=""
-while [ "$INSTALL_TYPE" != "client" ] && [ "$INSTALL_TYPE" != "server" ] && [ "$INSTALL_TYPE" != "both" ]; do
-    echo "What type of installation would you like to perform?"
-    echo "1) Client installation"
-    echo "2) Server installation"
-    echo "3) Both client and server installation"
-    read -p "Enter your choice (1-3): " choice
+# Step 0: Determine installation or removal action
+ACTION=""
+while [ "$ACTION" != "install" ] && [ "$ACTION" != "remove" ]; do
+    echo "What would you like to do?"
+    echo "1) Install FIMoniSec"
+    echo "2) Remove FIMoniSec"
+    read -p "Enter your choice (1-2): " action_choice
     
-    case $choice in
-        1) INSTALL_TYPE="client" ;;
-        2) INSTALL_TYPE="server" ;;
-        3) INSTALL_TYPE="both" ;;
-        *) echo "Invalid choice. Please select 1, 2, or 3." ;;
+    case $action_choice in
+        1) ACTION="install" ;;
+        2) ACTION="remove" ;;
+        *) echo "Invalid choice. Please select 1 or 2." ;;
     esac
 done
 
-status_message "Performing $INSTALL_TYPE installation"
-
-# Step 1: Verify we're in the FIMoniSec directory
-if [ ! -f "$(pwd)/README.md" ] || [ ! -d "$(pwd)/.git" ]; then
-    status_message "This script should be run from within the FIMoniSec repository."
-    status_message "Please navigate to the FIMoniSec directory and try again."
-    exit 1
+# If installing, determine installation type
+INSTALL_TYPE=""
+if [ "$ACTION" = "install" ]; then
+    while [ "$INSTALL_TYPE" != "client" ] && [ "$INSTALL_TYPE" != "server" ]; do
+        echo "What type of installation would you like to perform?"
+        echo "1) Client installation"
+        echo "2) Server installation (Will install all modules server and client)"
+        read -p "Enter your choice (1-2): " choice
+        
+        case $choice in
+            1) INSTALL_TYPE="client" ;;
+            2) INSTALL_TYPE="server" ;;
+            *) echo "Invalid choice. Please select 1 or 2." ;;
+        esac
+    done
+    
+    status_message "Performing $INSTALL_TYPE installation"
 fi
 
-status_message "FIMoniSec repository detected in current directory."
+# If removing, proceed with uninstallation
+if [ "$ACTION" = "remove" ]; then
+    status_message "Preparing to remove FIMoniSec..."
+    
+    # Function to perform uninstallation
+    uninstall_fimonisec() {
+        # Step 1: Stop services
+        status_message "Stopping FIMoniSec services..."
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop fimonisec-client 2>/dev/null
+            systemctl stop fimonisec-server 2>/dev/null
+            systemctl disable fimonisec-client 2>/dev/null
+            systemctl disable fimonisec-server 2>/dev/null
+            rm -f /etc/systemd/system/fimonisec-client.service 2>/dev/null
+            rm -f /etc/systemd/system/fimonisec-server.service 2>/dev/null
+            systemctl daemon-reload
+        elif command -v service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
+            service fimonisec-client stop 2>/dev/null
+            service fimonisec-server stop 2>/dev/null
+            update-rc.d fimonisec-client remove 2>/dev/null
+            update-rc.d fimonisec-server remove 2>/dev/null
+            rm -f /etc/init.d/fimonisec-client 2>/dev/null
+            rm -f /etc/init.d/fimonisec-server 2>/dev/null
+        elif command -v initctl >/dev/null 2>&1; then
+            initctl stop fimonisec-client 2>/dev/null
+            initctl stop fimonisec-server 2>/dev/null
+            rm -f /etc/init/fimonisec-client.conf 2>/dev/null
+            rm -f /etc/init/fimonisec-server.conf 2>/dev/null
+        fi
+        
+        # Step 2: Remove FIMoniSec directory
+        status_message "Removing FIMoniSec files..."
+        rm -rf /opt/FIMoniSec 2>/dev/null
+        
+        # Step 3: Remove system-wide profile script
+        status_message "Removing system profile script..."
+        rm -f /etc/profile.d/fimonisec_path.sh 2>/dev/null
+        
+        # Step 4: Remove from sudoers file
+        status_message "Cleaning up sudoers file..."
+        # Create a temporary file
+        TEMP_SUDOERS=$(mktemp)
+        # Copy the sudoers file to the temporary file, excluding FIMoniSec lines
+        grep -v "fimonisec.*NOPASSWD" /etc/sudoers > "$TEMP_SUDOERS"
+        # Copy the temporary file back to sudoers
+        cp "$TEMP_SUDOERS" /etc/sudoers
+        # Validate the sudoers file
+        visudo -c || error_exit "Failed to validate sudoers file after removal"
+        # Remove the temporary file
+        rm -f "$TEMP_SUDOERS"
+        
+        # Step 5: Remove fimonisec user and group
+        status_message "Removing fimonisec user and group..."
+        if id -u fimonisec > /dev/null 2>&1; then
+            userdel -r fimonisec 2>/dev/null
+        fi
+        if getent group fimonisec > /dev/null; then
+            groupdel fimonisec 2>/dev/null
+        fi
+        
+        status_message "FIMoniSec has been successfully removed from your system."
+        exit 0
+    }
+    
+    # Ask for confirmation before uninstalling
+    read -p "Are you sure you want to remove FIMoniSec from your system? (y/n): " confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        uninstall_fimonisec
+    else
+        status_message "Uninstallation cancelled."
+        exit 0
+    fi
+fi
+
+# Step 1: Verify we're in the FIMoniSec directory (skip this check for removal)
+if [ "$ACTION" = "install" ]; then
+    if [ ! -f "$(pwd)/README.md" ] || [ ! -d "$(pwd)/.git" ]; then
+        status_message "This script should be run from within the FIMoniSec repository."
+        status_message "Please navigate to the FIMoniSec directory and try again."
+        exit 1
+    fi
+    
+    status_message "FIMoniSec repository detected in current directory."
+fi
 
 # Step 2: Create fimonisec user and group
 status_message "Creating fimonisec user and group..."
@@ -124,7 +211,7 @@ cd /opt/FIMoniSec || error_exit "Failed to change directory to /opt/FIMoniSec"
 
 # Step 4: Modify sudoers file for required commands
 status_message "Updating sudoers file..."
-CMDS="/usr/bin/lsof, /bin/cat, /bin/ps, /bin/netstat, /bin/ss, /usr/bin/readlink, /usr/bin/head, /usr/bin/tail, /usr/bin/find, /usr/bin/grep"
+CMDS="/usr/bin/lsof, /bin/cat, /bin/ps, /bin/netstat, /bin/ss, /usr/bin/readlink, /usr/bin/head, /usr/bin/tail, /usr/bin/find, /usr/bin/grep, /usr/bin/nice, /usr/bin/renice, /usr/bin/kill, /usr/bin/pkill, /usr/bin/pgrep, /bin/mkdir, /usr/bin/touch, /usr/bin/ulimit, /bin/systemctl, /usr/bin/python3"
 
 # Check if the entries already exist
 if grep -q "^$CURRENT_USER.*NOPASSWD:.*lsof" /etc/sudoers; then
@@ -225,13 +312,12 @@ fi
 
 status_message "Detected init system: $INIT_SYSTEM"
 
-# Step 10: Create client service if needed
-if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "Creating FIMoniSec client service..."
-    
-    if [ "$INIT_SYSTEM" = "systemd" ]; then
-        # Create systemd service for client
-        cat > /etc/systemd/system/fimonisec-client.service << 'EOF'
+# Step 10: Create client service
+status_message "Creating FIMoniSec client service..."
+
+if [ "$INIT_SYSTEM" = "systemd" ]; then
+    # Create systemd service for client
+    cat > /etc/systemd/system/fimonisec-client.service << 'EOF'
 [Unit]
 Description=FIMoniSec Client - File Integrity Monitoring Service
 After=network.target
@@ -248,13 +334,13 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable fimonisec-client.service
-        status_message "Client systemd service created and enabled"
-        
-    elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
-        # Create SysV init script for client
-        cat > /etc/init.d/fimonisec-client << 'EOF'
+    systemctl daemon-reload
+    systemctl enable fimonisec-client.service
+    status_message "Client systemd service created and enabled"
+    
+elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
+    # Create SysV init script for client
+    cat > /etc/init.d/fimonisec-client << 'EOF'
 #!/bin/bash
 ### BEGIN INIT INFO
 # Provides:          fimonisec-client
@@ -327,13 +413,13 @@ esac
 
 exit 0
 EOF
-        chmod +x /etc/init.d/fimonisec-client
-        update-rc.d fimonisec-client defaults
-        status_message "Client SysV init service created and enabled"
-        
-    elif [ "$INIT_SYSTEM" = "upstart" ]; then
-        # Create Upstart conf for client
-        cat > /etc/init/fimonisec-client.conf << 'EOF'
+    chmod +x /etc/init.d/fimonisec-client
+    update-rc.d fimonisec-client defaults
+    status_message "Client SysV init service created and enabled"
+    
+elif [ "$INIT_SYSTEM" = "upstart" ]; then
+    # Create Upstart conf for client
+    cat > /etc/init/fimonisec-client.conf << 'EOF'
 description "FIMoniSec Client Service"
 author "FIMoniSec"
 
@@ -350,11 +436,11 @@ chdir /opt/FIMoniSec
 
 exec /usr/bin/python3 monisec_client.py -d
 EOF
-        status_message "Client Upstart service created"
-    fi
-    
-    # Create client control script
-    cat > /opt/FIMoniSec/control-client.sh << 'EOF'
+    status_message "Client Upstart service created"
+fi
+
+# Create client control script
+cat > /opt/FIMoniSec/control-client.sh << 'EOF'
 #!/bin/bash
 # FIMoniSec Client Control Script
 
@@ -418,12 +504,11 @@ esac
 
 exit 0
 EOF
-    chmod +x /opt/FIMoniSec/control-client.sh
-    status_message "Client control script created at /opt/FIMoniSec/control-client.sh"
-fi
+chmod +x /opt/FIMoniSec/control-client.sh
+status_message "Client control script created at /opt/FIMoniSec/control-client.sh"
 
-# Step 11: Create server service if needed
-if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
+# Step 11: Create server service if server installation was selected
+if [ "$INSTALL_TYPE" = "server" ]; then
     status_message "Creating FIMoniSec server service..."
     
     if [ "$INIT_SYSTEM" = "systemd" ]; then
@@ -622,22 +707,16 @@ fi
 # Final steps
 status_message "Installation completed successfully!"
 
-if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "Client components installed in /opt/FIMoniSec"
-    
-    # Ask if user wants to start the client service now
-    status_message "Do you want to start the FIMoniSec client service now? (y/n): "
-    read REPLY
-    if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-        cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d
-        status_message "FIMoniSec client service started"
-    fi
+# Ask if user wants to start the client service now
+status_message "Do you want to start the FIMoniSec client service now? (y/n): "
+read REPLY
+if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
+    cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d
+    status_message "FIMoniSec client service started"
 fi
 
-if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "Server components installed in /opt/FIMoniSec"
-    
-    # Ask if user wants to start the server service now
+# Ask if user wants to start the server service now if server installation was selected
+if [ "$INSTALL_TYPE" = "server" ]; then
     status_message "Do you want to start the FIMoniSec server service now? (y/n): "
     read REPLY
     if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
@@ -652,12 +731,11 @@ status_message "FIMoniSec Service Management Instructions:"
 status_message "----------------------------------------------"
 
 status_message "Direct command execution (recommended):"
-if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-    status_message "  Start client:   cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d"
-    status_message "  Stop client:    cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py stop"
-    status_message "  Restart client: cd /opt/FIMoniSec/Linux-Client&& python3 monisec_client.py stop && python3 monisec_client.py -d"
-fi
-if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
+status_message "  Start client:   cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d"
+status_message "  Stop client:    cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py stop"
+status_message "  Restart client: cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py stop && python3 monisec_client.py -d"
+
+if [ "$INSTALL_TYPE" = "server" ]; then
     status_message "  Start server:   cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py -d"
     status_message "  Stop server:    cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py stop"
     status_message "  Restart server: cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py stop && python3 monisec-server.py -d"
@@ -665,13 +743,12 @@ fi
 
 if [ "$INIT_SYSTEM" = "systemd" ]; then
     status_message "Using systemd commands (alternative):"
-    if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-        status_message "  Start client:   sudo systemctl start fimonisec-client"
-        status_message "  Stop client:    sudo systemctl stop fimonisec-client"
-        status_message "  Restart client: sudo systemctl restart fimonisec-client"
-        status_message "  Status client:  sudo systemctl status fimonisec-client"
-    fi
-    if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
+    status_message "  Start client:   sudo systemctl start fimonisec-client"
+    status_message "  Stop client:    sudo systemctl stop fimonisec-client"
+    status_message "  Restart client: sudo systemctl restart fimonisec-client"
+    status_message "  Status client:  sudo systemctl status fimonisec-client"
+    
+    if [ "$INSTALL_TYPE" = "server" ]; then
         status_message "  Start server:   sudo systemctl start fimonisec-server"
         status_message "  Stop server:    sudo systemctl stop fimonisec-server"
         status_message "  Restart server: sudo systemctl restart fimonisec-server"
@@ -679,13 +756,12 @@ if [ "$INIT_SYSTEM" = "systemd" ]; then
     fi
 elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
     status_message "Using service commands (alternative):"
-    if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-        status_message "  Start client:   sudo service fimonisec-client start"
-        status_message "  Stop client:    sudo service fimonisec-client stop"
-        status_message "  Restart client: sudo service fimonisec-client restart"
-        status_message "  Status client:  sudo service fimonisec-client status"
-    fi
-    if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
+    status_message "  Start client:   sudo service fimonisec-client start"
+    status_message "  Stop client:    sudo service fimonisec-client stop"
+    status_message "  Restart client: sudo service fimonisec-client restart"
+    status_message "  Status client:  sudo service fimonisec-client status"
+    
+    if [ "$INSTALL_TYPE" = "server" ]; then
         status_message "  Start server:   sudo service fimonisec-server start"
         status_message "  Stop server:    sudo service fimonisec-server stop"
         status_message "  Restart server: sudo service fimonisec-server restart"
@@ -693,13 +769,12 @@ elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
     fi
 elif [ "$INIT_SYSTEM" = "upstart" ]; then
     status_message "Using upstart commands (alternative):"
-    if [ "$INSTALL_TYPE" = "client" ] || [ "$INSTALL_TYPE" = "both" ]; then
-        status_message "  Start client:   sudo start fimonisec-client"
-        status_message "  Stop client:    sudo stop fimonisec-client"
-        status_message "  Restart client: sudo restart fimonisec-client"
-        status_message "  Status client:  sudo status fimonisec-client"
-    fi
-    if [ "$INSTALL_TYPE" = "server" ] || [ "$INSTALL_TYPE" = "both" ]; then
+    status_message "  Start client:   sudo start fimonisec-client"
+    status_message "  Stop client:    sudo stop fimonisec-client"
+    status_message "  Restart client: sudo restart fimonisec-client"
+    status_message "  Status client:  sudo status fimonisec-client"
+    
+    if [ "$INSTALL_TYPE" = "server" ]; then
         status_message "  Start server:   sudo start fimonisec-server"
         status_message "  Stop server:    sudo stop fimonisec-server"
         status_message "  Restart server: sudo restart fimonisec-server"
