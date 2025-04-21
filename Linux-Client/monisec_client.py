@@ -496,8 +496,9 @@ def monitor_processes():
             time.sleep(300)
 
 def stop_monisec_client_daemon():
-    """Stop the MoniSec client running in daemon mode."""
+    """Stop the MoniSec client running in daemon mode and its watchdog."""
     pidfile = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+    watchdog_pidfile = os.path.join(BASE_DIR, "output", "enhanced_watchdog.pid")
     
     # Create control file to stop ProcessGuardian monitoring
     control_file = os.path.join(BASE_DIR, "output", "guardian_stop_monitoring")
@@ -511,7 +512,34 @@ def stop_monisec_client_daemon():
     # Allow a moment for ProcessGuardian to notice
     time.sleep(1)
     
-    # Find and stop all child processes first
+    # Find and stop watchdog process first
+    watchdog_processes = []
+    for proc in psutil.process_iter(['pid', 'cmdline']):
+        try:
+            cmdline = " ".join(proc.info['cmdline'] or [])
+            if "watchdog.py" in cmdline and "-d" in cmdline:
+                watchdog_processes.append(proc.info['pid'])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    for pid in watchdog_processes:
+        logging.info(f"Stopping watchdog process with PID {pid}...")
+        try:
+            os.kill(pid, signal.SIGTERM)
+            # Wait briefly to see if it terminates
+            for _ in range(3):
+                if not psutil.pid_exists(pid):
+                    break
+                time.sleep(0.5)
+            
+            # Force kill if still running
+            if psutil.pid_exists(pid):
+                logging.info(f"Forcing termination of watchdog process with PID {pid}")
+                os.kill(pid, signal.SIGKILL)
+        except OSError as e:
+            logging.error(f"Error stopping watchdog: {e}")
+    
+    # Find and stop all child processes
     for name in ["fim_client", "pim", "lim"]:
         pid = is_process_running(name)
         if pid:
@@ -524,6 +552,7 @@ def stop_monisec_client_daemon():
     # Wait briefly for children to exit         
     time.sleep(1)
     
+    # Rest of the function remains the same...
     try:
         if os.path.exists(pidfile):
             with open(pidfile, 'r') as f:
@@ -547,12 +576,16 @@ def stop_monisec_client_daemon():
                             os.remove(control_file)
                         if os.path.exists(pidfile):
                             os.remove(pidfile)
+                        if os.path.exists(watchdog_pidfile):
+                            os.remove(watchdog_pidfile)
                         return True
                 
                 # Force kill if not terminated
                 os.kill(pid, signal.SIGKILL)
                 if os.path.exists(pidfile):
                     os.remove(pidfile)
+                if os.path.exists(watchdog_pidfile):
+                    os.remove(watchdog_pidfile)
                 if os.path.exists(control_file):
                     os.remove(control_file)
                 logging.warning("MoniSec client daemon forcefully terminated.")
@@ -562,6 +595,8 @@ def stop_monisec_client_daemon():
                 logging.warning("No running MoniSec client daemon found.")
                 if os.path.exists(pidfile):
                     os.remove(pidfile)
+                if os.path.exists(watchdog_pidfile):
+                    os.remove(watchdog_pidfile)
                 if os.path.exists(control_file):
                     os.remove(control_file)
                 return False
