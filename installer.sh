@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # =============================================================================
 # FIMonsec Tool - File Integrity Monitoring Security Solution
 # =============================================================================
@@ -27,7 +29,6 @@
 #             in the software.
 #
 # =============================================================================
-#!/bin/bash
 
 # Function to display error messages
 error_exit() {
@@ -71,16 +72,22 @@ done
 # If installing, determine installation type
 INSTALL_TYPE=""
 if [ "$ACTION" = "install" ]; then
-    while [ "$INSTALL_TYPE" != "client" ] && [ "$INSTALL_TYPE" != "server" ]; do
-        echo "What type of installation would you like to perform?"
-        echo "1) Client installation"
-        echo "2) Server installation (Will install all modules server and client)"
-        read -p "Enter your choice (1-2): " choice
+    while [ "$INSTALL_TYPE" != "linux_client" ] && [ "$INSTALL_TYPE" != "windows_client" ] && [ "$INSTALL_TYPE" != "server" ]; do
+        echo "What would you like to do?"
+        echo "1) Install FIMoniSec Linux Client"
+        echo "2) Install FIMoniSec Windows Client (Not Currently Available)"
+        echo "3) Install FIMoniSec Server"
+        read -p "Enter your choice (1-3): " choice
         
         case $choice in
-            1) INSTALL_TYPE="client" ;;
-            2) INSTALL_TYPE="server" ;;
-            *) echo "Invalid choice. Please select 1 or 2." ;;
+            1) INSTALL_TYPE="linux_client" ;;
+            2) 
+                echo "Windows Client installation is not currently available."
+                echo "Please choose another option."
+                continue
+                ;;
+            3) INSTALL_TYPE="server" ;;
+            *) echo "Invalid choice. Please select 1, 2 or 3." ;;
         esac
     done
     
@@ -191,23 +198,72 @@ status_message "Adding current user to fimonisec group..."
 usermod -a -G fimonisec $CURRENT_USER || error_exit "Failed to add current user to fimonisec group"
 status_message "User $CURRENT_USER added to fimonisec group"
 
-# Step 3: Move current directory to /opt
-status_message "Moving FIMoniSec to /opt..."
-if [ -d "/opt/FIMoniSec" ]; then
-    status_message "Backing up existing /opt/FIMoniSec directory"
-    mv /opt/FIMoniSec /opt/FIMoniSec.backup.$(date +%Y%m%d%H%M%S)
-fi
+# Step 3: Move files to /opt based on installation type
+move_files_to_opt() {
+    local install_type=$1
+    
+    status_message "Setting up FIMoniSec in /opt..."
+    
+    # Create backup of existing installation if present
+    if [ -d "/opt/FIMoniSec" ]; then
+        status_message "Backing up existing /opt/FIMoniSec directory"
+        mv /opt/FIMoniSec /opt/FIMoniSec.backup.$(date +%Y%m%d%H%M%S)
+    fi
+    
+    # Create the main directory
+    mkdir -p /opt/FIMoniSec
+    
+    # Copy files based on installation type
+    case "$install_type" in
+        "linux_client")
+            status_message "Installing Linux Client only..."
+            if [ -d "Linux-Client" ]; then
+                cp -r Linux-Client /opt/FIMoniSec/
+            else
+                error_message "Linux-Client directory not found!"
+                exit 1
+            fi
+            ;;
+            
+        "server")
+            status_message "Installing Server components (includes Linux Client)..."
+            if [ -d "Linux-Client" ]; then
+                cp -r Linux-Client /opt/FIMoniSec/
+            else
+                error_message "Linux-Client directory not found!"
+                exit 1
+            fi
+            
+            if [ -d "Monisec-Server" ]; then
+                cp -r Monisec-Server /opt/FIMoniSec/
+            else
+                error_message "Monisec-Server directory not found!"
+                exit 1
+            fi
+            ;;
+            
+        *)
+            error_exit "Unknown installation type: $install_type"
+            exit 1
+            ;;
+    esac
+    
+    # Copy common files
+    cp README.md /opt/FIMoniSec/ 2>/dev/null
+    cp requirements.txt /opt/FIMoniSec/ 2>/dev/null
+    cp control-client.sh /opt/FIMoniSec/ 2>/dev/null
+    
+    # Create logs directory
+    mkdir -p /opt/FIMoniSec/logs
+    
+    # Set permissions
+    chown -R fimonisec:fimonisec /opt/FIMoniSec || error_exit "Failed to set ownership on /opt/FIMoniSec"
+    
+    status_message "FIMoniSec has been installed to /opt/FIMoniSec"
+}
 
-# Get the current directory name
-CURRENT_DIR=$(basename "$(pwd)")
-cd ..
-
-# Move the directory to /opt
-cp -r "$CURRENT_DIR" /opt/FIMoniSec || error_exit "Failed to copy FIMoniSec to /opt"
-chown -R fimonisec:fimonisec /opt/FIMoniSec || error_exit "Failed to set ownership on /opt/FIMoniSec"
-
-# Change to the new directory
-cd /opt/FIMoniSec || error_exit "Failed to change directory to /opt/FIMoniSec"
+# Call the move function with the installation type
+move_files_to_opt "$INSTALL_TYPE"
 
 # Step 4: Modify sudoers file for required commands
 status_message "Updating sudoers file..."
@@ -439,74 +495,6 @@ EOF
     status_message "Client Upstart service created"
 fi
 
-# Create client control script
-cat > /opt/FIMoniSec/control-client.sh << 'EOF'
-#!/bin/bash
-# FIMoniSec Client Control Script
-
-case "$1" in
-    start)
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl start fimonisec-client
-        elif [ -f /etc/init.d/fimonisec-client ]; then
-            /etc/init.d/fimonisec-client start
-        elif command -v initctl >/dev/null 2>&1; then
-            initctl start fimonisec-client
-        else
-            echo "Could not determine how to start the service"
-            exit 1
-        fi
-        echo "FIMoniSec client started"
-        ;;
-    stop)
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl stop fimonisec-client
-        elif [ -f /etc/init.d/fimonisec-client ]; then
-            /etc/init.d/fimonisec-client stop
-        elif command -v initctl >/dev/null 2>&1; then
-            initctl stop fimonisec-client
-        else
-            echo "Could not determine how to stop the service"
-            exit 1
-        fi
-        echo "FIMoniSec client stopped"
-        ;;
-    restart)
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl restart fimonisec-client
-        elif [ -f /etc/init.d/fimonisec-client ]; then
-            /etc/init.d/fimonisec-client restart
-        elif command -v initctl >/dev/null 2>&1; then
-            initctl restart fimonisec-client
-        else
-            echo "Could not determine how to restart the service"
-            exit 1
-        fi
-        echo "FIMoniSec client restarted"
-        ;;
-    status)
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl status fimonisec-client
-        elif [ -f /etc/init.d/fimonisec-client ]; then
-            /etc/init.d/fimonisec-client status
-        elif command -v initctl >/dev/null 2>&1; then
-            initctl status fimonisec-client
-        else
-            echo "Could not determine how to check service status"
-            exit 1
-        fi
-        ;;
-    *)
-        echo "Usage: $0 {start|stop|restart|status}"
-        exit 1
-        ;;
-esac
-
-exit 0
-EOF
-chmod +x /opt/FIMoniSec/control-client.sh
-status_message "Client control script created at /opt/FIMoniSec/control-client.sh"
-
 # Step 11: Create server service if server installation was selected
 if [ "$INSTALL_TYPE" = "server" ]; then
     status_message "Creating FIMoniSec server service..."
@@ -708,8 +696,7 @@ fi
 status_message "Installation completed successfully!"
 
 # Ask if user wants to start the client service now
-status_message "Do you want to start the FIMoniSec client service now? (y/n): "
-read REPLY
+read -p "Do you want to start the FIMoniSec client service now? (y/n): " REPLY
 if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
     cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d
     status_message "FIMoniSec client service started"
@@ -717,8 +704,7 @@ fi
 
 # Ask if user wants to start the server service now if server installation was selected
 if [ "$INSTALL_TYPE" = "server" ]; then
-    status_message "Do you want to start the FIMoniSec server service now? (y/n): "
-    read REPLY
+    read -p "Do you want to start the FIMoniSec server service now? (y/n): " REPLY
     if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
         cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py -d
         status_message "FIMoniSec server service started"
