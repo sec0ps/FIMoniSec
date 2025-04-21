@@ -729,9 +729,151 @@ def handle_exit(signum, frame):
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
+# Add these functions to your existing monisec_client.py file
+
+def manage_exclusions(command, exclusion_type, value=None):
+    """
+    Add or remove exclusions from the configuration.
+    
+    Args:
+        command (str): 'add' or 'remove'
+        exclusion_type (str): 'ip', 'user', 'file', 'directory', 'pattern', or 'extension'
+        value (str): The value to add or remove
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    global config
+    
+    # Validate command
+    if command not in ['add', 'remove']:
+        print(f"[ERROR] Invalid command: {command}. Use 'add' or 'remove'.")
+        return False
+        
+    # Validate exclusion type
+    valid_types = ['ip', 'user', 'file', 'directory', 'pattern', 'extension']
+    if exclusion_type not in valid_types:
+        print(f"[ERROR] Invalid exclusion type: {exclusion_type}. Valid types: {', '.join(valid_types)}")
+        return False
+        
+    # Validate value
+    if not value:
+        print(f"[ERROR] No value provided to {command}.")
+        return False
+    
+    # Define mapping for exclusion types to their locations in the config
+    config_paths = {
+        'ip': ['log_integrity_monitor', 'excluded_ips'],
+        'user': ['log_integrity_monitor', 'excluded_users'],
+        'file': ['exclusions', 'files'],
+        'directory': ['exclusions', 'directories'],
+        'pattern': ['exclusions', 'patterns'],
+        'extension': ['exclusions', 'extensions']
+    }
+    
+    # Get the path to the exclusion list
+    path = config_paths[exclusion_type]
+    
+    # Ensure all required sections exist in the config
+    current = config
+    for i, section in enumerate(path[:-1]):
+        if section not in current:
+            current[section] = {}
+        current = current[section]
+    
+    # Ensure the final list exists
+    final_key = path[-1]
+    if final_key not in current:
+        current[final_key] = []
+    
+    # Get the current list of exclusions
+    exclusions = current[final_key]
+    
+    # Add or remove the value
+    if command == 'add':
+        if value in exclusions:
+            print(f"[INFO] {value} is already in {exclusion_type} exclusions.")
+            return True
+        exclusions.append(value)
+        print(f"[INFO] Added {value} to {exclusion_type} exclusions.")
+    else:  # remove
+        if value not in exclusions:
+            print(f"[WARNING] {value} not found in {exclusion_type} exclusions.")
+            return False
+        exclusions.remove(value)
+        print(f"[INFO] Removed {value} from {exclusion_type} exclusions.")
+    
+    # Save the updated configuration
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+        print(f"[INFO] Configuration saved to {CONFIG_FILE}")
+        
+        # If we're working with file/directory exclusions, we may need to restart the FIM service
+        if exclusion_type in ['file', 'directory', 'pattern', 'extension']:
+            print("[INFO] File exclusions changed. Consider restarting the FIM service with: monisec_client fim restart")
+        
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to save configuration: {e}")
+        return False
+
+def list_exclusions(exclusion_type=None):
+    """
+    List all exclusions of the specified type.
+    
+    Args:
+        exclusion_type (str, optional): 'ip', 'user', 'file', 'directory', 'pattern', or 'extension'.
+                                         If None, list all exclusions.
+    """
+    global config
+    
+    # Define mapping for exclusion types to their locations in the config
+    config_paths = {
+        'ip': ['log_integrity_monitor', 'excluded_ips'],
+        'user': ['log_integrity_monitor', 'excluded_users'],
+        'file': ['exclusions', 'files'],
+        'directory': ['exclusions', 'directories'],
+        'pattern': ['exclusions', 'patterns'],
+        'extension': ['exclusions', 'extensions']
+    }
+    
+    # If no specific type is provided, list all exclusions
+    types_to_list = [exclusion_type] if exclusion_type else config_paths.keys()
+    
+    for current_type in types_to_list:
+        if current_type not in config_paths:
+            print(f"[ERROR] Invalid exclusion type: {current_type}")
+            continue
+            
+        path = config_paths[current_type]
+        
+        # Navigate to the exclusion list in the config
+        current = config
+        found = True
+        for section in path:
+            if section not in current:
+                found = False
+                break
+            current = current[section]
+        
+        # Print the exclusions
+        if found:
+            print(f"\n{current_type.upper()} EXCLUSIONS:")
+            if isinstance(current, list) and current:
+                for item in current:
+                    print(f"  - {item}")
+            elif isinstance(current, list):
+                print("  None")
+            else:
+                print(f"  [ERROR] Expected a list but found {type(current)}")
+        else:
+            print(f"\n{current_type.upper()} EXCLUSIONS:")
+            print("  None (section not found in configuration)")
+
 if __name__ == "__main__":
     # Define flag to skip guardian initialization for stop/restart commands
-    no_guardian = len(sys.argv) > 1 and sys.argv[1] in ["stop", "restart"]
+    no_guardian = len(sys.argv) <= 1 or sys.argv[1] != "start"
     
     # Only initialize guardian if not stopping or restarting
     if not no_guardian:
@@ -874,18 +1016,54 @@ if __name__ == "__main__":
             # This is an infinite loop that never returns
             monitor_processes()
     
-        # Invalid command
+        elif action == "exclusion":
+            if len(sys.argv) < 3:
+                print("[ERROR] Invalid command. Usage: monisec_client exclusion add|remove|list [type] [value]")
+                sys.exit(1)
+                
+            excl_action = sys.argv[2]
+            
+            if excl_action == "list":
+                # List exclusions of a specific type or all if not specified
+                exclusion_type = sys.argv[3] if len(sys.argv) > 3 else None
+                if exclusion_type and exclusion_type not in ['ip', 'user', 'file', 'directory', 'pattern', 'extension']:
+                    print(f"[ERROR] Invalid exclusion type: {exclusion_type}")
+                    print("Valid types: ip, user, file, directory, pattern, extension")
+                    sys.exit(1)
+                list_exclusions(exclusion_type)
+                sys.exit(0)
+                
+            elif excl_action in ["add", "remove"]:
+                if len(sys.argv) < 5:
+                    print(f"[ERROR] Invalid command. Usage: monisec_client exclusion {excl_action} <type> <value>")
+                    print("Valid types: ip, user, file, directory, pattern, extension")
+                    sys.exit(1)
+                    
+                exclusion_type = sys.argv[3]
+                value = sys.argv[4]
+                
+                success = manage_exclusions(excl_action, exclusion_type, value)
+                sys.exit(0 if success else 1)
+            else:
+                print("[ERROR] Invalid exclusion action. Use add, remove, or list")
+                sys.exit(1)
+
         else:
             print(
                 """Usage:
-            monisec_client restart                  # Restart monisec_client
-            monisec_client stop                     # Stop monisec_client daemon
-            monisec_client pim start|stop|restart   # Control PIM process
-            monisec_client fim start|stop|restart   # Control FIM process
-            monisec_client lim start|stop|restart   # Control LIM process
-            monisec_client import-psk               # Import PSK for authentication
-            monisec_client auth test                # Test authentication, then exit
-"""
+            monisec_client restart                                # Restart monisec_client
+            monisec_client stop                                   # Stop monisec_client daemon
+            monisec_client pim start|stop|restart                 # Control PIM process
+            monisec_client fim start|stop|restart                 # Control FIM process
+            monisec_client lim start|stop|restart                 # Control LIM process
+            monisec_client import-psk                             # Import PSK for authentication
+            monisec_client auth test                              # Test authentication, then exit
+            monisec_client exclusion add <type> <value>           # Add an exclusion
+            monisec_client exclusion remove <type> <value>        # Remove an exclusion
+            monisec_client exclusion list [type]                  # List all exclusions or of a specific type
+            
+            Exclusion types: ip, user, file, directory, pattern, extension
+        """
             )
             sys.exit(1)
 
