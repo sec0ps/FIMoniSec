@@ -1,778 +1,1336 @@
-# 3. MITRE ATT&CK classification for any detections
-                for event in detection_events:
-                    details = event.get("details")
-                    mitre_info = classify_by_mitre_attck_windows(event["event_type"], info, details)
-                    if mitre_info:
-                        event["mitre"] = mitre_info
-                
-                # 4. Log all detection events
-                if detection_events:
-                    # Add to detection history and mark as alerted
-                    if pid not in detection_history:
-                        detection_history[pid] = []
-                    detection_history[pid].extend(detection_events)
-                    alerted_processes.add(pid)
-                    
-                    # Log each event
-                    for event in detection_events:
-                        log_event(
-                            event_type=event["event_type"],
-                            file_path=info.get("exe_path", "UNKNOWN"),
-                            previous_metadata=None,
-                            new_metadata={
-                                "process_info": info,
-                                "detection_details": event.get("details", {}),
-                                "mitre_mapping": event.get("mitre", {}),
-                                "threat_assessment": event.get("threat_assessment", {})
-                            },
-                            previous_hash=None,
-                            new_hash=info.get("hash", "UNKNOWN")
-                        )
-            
-            # Handle new processes (original functionality)
-            for pid, info in new_processes.items():
-                log_event(
-                    event_type="NEW_LISTENING_PROCESS",
-                    file_path=info["exe_path"],
-                    previous_metadata=None,
-                    new_metadata=info,
-                    previous_hash=None,
-                    new_hash=info.get("hash", "UNKNOWN")
-                )
-                update_process_tracking(info["exe_path"], info["hash"], info)
-                check_for_unusual_port_use(info)
-                check_lineage_baseline(info, known_lineages)
-            
-            # Handle terminated processes (original functionality)
-            for pid, info in terminated_processes.items():
-                if pid in terminated_pids:
-                    continue
-                
-                stored_info = load_process_metadata().get(str(pid), None)
-                log_event(
-                    event_type="PROCESS_TERMINATED",
-                    file_path=info["exe_path"] if stored_info else "UNKNOWN",
-                    previous_metadata=stored_info if stored_info else "UNKNOWN",
-                    new_metadata=None,
-                    previous_hash=stored_info["hash"] if stored_info else "UNKNOWN",
-                    new_hash=None
-                )
-                remove_process_tracking(str(pid))
-                terminated_pids.add(pid)
-                
-                # Remove from detection history when process terminates
-                if pid in detection_history:
-                    del detection_history[pid]
-                if pid in alerted_processes:
-                    alerted_processes.remove(pid)
-            
-            # Periodically clear the alerted_processes set and retrain model
-            ml_retrain_counter += 1
-            if ml_retrain_counter >= 60:  # Every ~2 minutes
-                print("[INFO] Retraining ML model and resetting alerts...")
-                if ML_LIBRARIES_AVAILABLE:
-                    ml_model_info = implement_behavioral_baselining()
-                ml_retrain_counter = 0
-                alerted_processes.clear()  # Allow processes to trigger alerts again
-            
-            known_processes = current_processes
-            time.sleep(interval)
-            
-        except Exception as e:
-            print(f"[ERROR] Exception in enhanced monitoring loop: {e}")
-            traceback.print_exc()
-            continue
+import os
+import time
+import json
+import sys
+import subprocess
+import hashlib
+import threading
+import traceback
+import logging
+import ctypes
+from pathlib import Path
+from datetime import datetime
 
-def rescan_listening_processes(interval=120):
-    """Periodically scans listening processes and ensures accurate tracking."""
-    while SERVICE_RUNNING:
+# Windows-specific imports
+import win32api
+import win32con
+import win32service
+import win32serviceutil
+import win32security
+import win32file
+import win32event
+import win32process
+import win32pdh
+import wmi
+import psutil
+
+# Optional ML imports with proper error handling
+try:
+    import numpy as np
+    import pandas as pd
+    from sklearn.ensemble import IsolationForest
+    ML_LIBRARIES_AVAILABLE = True
+except ImportError:
+    print("[WARNING] Machine learning libraries not found. ML-based detection disabled.")
+    ML_LIBRARIES_AVAILABLE = False
+
+# Define paths for Windows
+BASE_DIR = os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), "FIMoniSec\\Windows-Client")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "process_monitor.log")
+PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
+INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
+PID_FILE = os.path.join(OUTPUT_DIR, "pim.pid")
+FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
+KNOWN_PORTS_FILE = os.path.join(OUTPUT_DIR, "known_ports.json")
+KNOWN_LINEAGES_FILE = os.path.join(OUTPUT_DIR, "known_lineages.json")
+MITRE_MAPPING_FILE = os.path.join(OUTPUT_DIR, "mitre_mappings.json")
+
+# Global flags
+SERVICE_RUNNING = True
+
+def is_admin():
+    """Check if the script is running with administrator privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception as e:
+        logging.error(f"Error checking admin status: {e}")
+        return False
+
+def ensure_directories():
+    """Create all necessary directories for the application."""
+    directories = [BASE_DIR, OUTPUT_DIR, LOG_DIR]
+    for directory in directories:
         try:
-            print("[PERIODIC SCAN] Running integrity check on listening processes...")
-
-            from fim_client import log_event
-
-            integrity_state = load_process_metadata()  # Load stored metadata indexed by PID
-            current_processes = get_listening_processes()  # Get active processes
-
-            for pid, current_info in current_processes.items():
-                pid_str = str(pid)  # Ensure PID is a string for key lookup
-
-                if pid_str in integrity_state:
-                    stored_info = integrity_state[pid_str]
-
-                    # Ensure process hash and metadata match before reporting changes
-                    if stored_info["hash"] != current_info["hash"] and stored_info["hash"] != "ACCESS_DENIED" and current_info["hash"] != "ACCESS_DENIED":
-                        print(f"[ALERT] Hash mismatch detected for PID {pid_str} ({current_info['exe_path']})")
-                        log_event(
-                            event_type="PROCESS_MODIFIED",
-                            file_path=current_info["exe_path"],
-                            previous_metadata=stored_info,
-                            new_metadata=current_info,
-                            previous_hash=stored_info["hash"],
-                            new_hash=current_info["hash"]
-                        )
-
-                    # Check for metadata changes
-                    changed_fields = {}
-                    for key in ["user", "port", "cmdline"]:
-                        if stored_info[key] != current_info[key]:
-                            changed_fields[key] = {
-                                "previous": stored_info[key],
-                                "current": current_info[key]
-                            }
-
-                    if changed_fields:
-                        print(f"[ALERT] Metadata changes detected for PID {pid_str}: {changed_fields}")
-                        log_event(
-                            event_type="PROCESS_METADATA_CHANGED",
-                            file_path=current_info["exe_path"],
-                            previous_metadata=stored_info,
-                            new_metadata=current_info,
-                            previous_hash=stored_info["hash"],
-                            new_hash=current_info["hash"]
-                        )
-
-                else:
-                    # Process is missing in integrity records ? log as new
-                    print(f"[ALERT] New untracked process detected: PID {pid_str} ({current_info['exe_path']})")
-                    log_event(
-                        event_type="NEW_UNTRACKED_PROCESS",
-                        file_path=current_info["exe_path"],
-                        previous_metadata="N/A",
-                        new_metadata=current_info,
-                        previous_hash="N/A",
-                        new_hash=current_info["hash"]
-                    )
-
-            time.sleep(interval)
-
+            os.makedirs(directory, exist_ok=True)
+            logging.debug(f"Ensured directory exists: {directory}")
         except Exception as e:
-            print(f"[ERROR] Exception in periodic scan: {e}")
+            logging.error(f"Failed to create directory {directory}: {e}")
+            
+def set_secure_permissions(file_path):
+    """Apply secure permissions to a file (admin and system only)."""
+    try:
+        sd = win32security.GetFileSecurity(
+            file_path, 
+            win32security.DACL_SECURITY_INFORMATION
+        )
+        dacl = win32security.ACL()
+        
+        # Get SIDs for Administrators and SYSTEM
+        admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
+        system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
+        
+        # Use proper access rights constants
+        # GENERIC_ALL gives full control
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.GENERIC_ALL, admin_sid)
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.GENERIC_ALL, system_sid)
+        
+        # Apply the ACL
+        sd.SetSecurityDescriptorDacl(1, dacl, 0)
+        win32security.SetFileSecurity(
+            file_path, 
+            win32security.DACL_SECURITY_INFORMATION, 
+            sd
+        )
+        logging.debug(f"Secured file: {file_path}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to set secure permissions on {file_path}: {e}")
+        return False
+
+def ensure_file_exists(file_path, default_content="", is_json=False):
+    """Ensure a file exists with proper permissions, creating it if necessary."""
+    directory = os.path.dirname(file_path)
+    if not os.path.exists(directory):
+        os.makedirs(directory, exist_ok=True)
+        
+    if not os.path.exists(file_path):
+        with open(file_path, "w") as f:
+            if is_json:
+                if isinstance(default_content, str):
+                    json.dump({}, f, indent=4)
+                else:
+                    json.dump(default_content, f, indent=4)
+                
+        set_secure_permissions(file_path)
+        logging.debug(f"Created and secured file: {file_path}")
+    return True
+
+def safe_write_json(file_path, data):
+    """Safely write JSON data to a file with proper error handling and atomic operations."""
+    temp_file = f"{file_path}.tmp"
+    try:
+        with open(temp_file, "w") as f:
+            json.dump(data, f, indent=4)
+            
+        # Replace original file with temp file (atomic operation)
+        os.replace(temp_file, file_path)
+        set_secure_permissions(file_path)
+        return True
+    except Exception as e:
+        logging.error(f"Failed to write to {file_path}: {e}")
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        return False
+
+def safe_write_text(file_path, data):
+    """Safely write text data to a file with proper error handling and atomic operations."""
+    temp_file = f"{file_path}.tmp"
+    try:
+        with open(temp_file, "w") as f:
+            f.write(data)
+            
+        # Replace original file with temp file (atomic operation)
+        os.replace(temp_file, file_path)
+        set_secure_permissions(file_path)
+        return True
+    except Exception as e:
+        logging.error(f"Failed to write to {file_path}: {e}")
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        return False
+
+def load_process_hashes():
+    """Load stored process hashes from process_hashes.txt."""
+    if os.path.exists(PROCESS_HASHES_FILE):
+        try:
+            with open(PROCESS_HASHES_FILE, "r") as f:
+                return dict(line.strip().split(":", 1) for line in f if ":" in line)
+        except Exception as e:
+            logging.error(f"Failed to load process hashes: {e}")
+            return {}
+    return {}
+
+def save_process_hashes(process_hashes):
+    """Save process hashes to process_hashes.txt safely."""
+    lines = []
+    for exe_path, hash_value in process_hashes.items():
+        lines.append(f"{exe_path}:{hash_value}")
+    
+    return safe_write_text(PROCESS_HASHES_FILE, "\n".join(lines))
+
+def get_process_hash(exe_path, cmdline=None):
+    """Generate SHA-256 hash of the process executable and optionally include cmdline."""
+    try:
+        # Check if the file exists first
+        if not os.path.exists(exe_path):
+            logging.error(f"File not found: {exe_path}")
+            return "ERROR_FILE_NOT_FOUND"
+            
+        hash_obj = hashlib.sha256()
+
+        # First try standard file opening
+        try:
+            with open(exe_path, "rb") as f:
+                # Read in chunks to handle large files
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_obj.update(chunk)
+        except PermissionError:
+            # Try with Windows API for system files with sharing enabled
+            try:
+                handle = win32file.CreateFile(
+                    exe_path,
+                    win32file.GENERIC_READ,
+                    win32file.FILE_SHARE_READ,
+                    None,
+                    win32file.OPEN_EXISTING,
+                    0,
+                    None
+                )
+                
+                try:
+                    # Read the file in chunks
+                    file_size = win32file.GetFileSize(handle)
+                    chunks_read = 0
+                    buffer_size = 1024 * 1024  # 1MB buffer
+                    
+                    while chunks_read < file_size:
+                        bytes_to_read = min(buffer_size, file_size - chunks_read)
+                        hr, data = win32file.ReadFile(handle, bytes_to_read)
+                        hash_obj.update(data)
+                        chunks_read += len(data)
+                        
+                finally:
+                    win32file.CloseHandle(handle)
+            except Exception as e:
+                logging.error(f"Windows API file access failed for {exe_path}: {e}")
+                return "ERROR_HASHING_PERMISSION"
+
+        # Optionally include command-line arguments in hashing
+        if cmdline and isinstance(cmdline, str):
+            hash_obj.update(cmdline.encode("utf-8"))
+
+        return hash_obj.hexdigest()
+
+    except FileNotFoundError:
+        logging.error(f"File not found: {exe_path}")
+        return "ERROR_FILE_NOT_FOUND"
+    except Exception as e:
+        logging.error(f"Failed to hash {exe_path}: {e}")
+        return "ERROR_HASHING_UNKNOWN"
+
+def load_process_metadata():
+    """Load stored process metadata from integrity_processes.json."""
+    if os.path.exists(INTEGRITY_PROCESS_FILE):
+        try:
+            with open(INTEGRITY_PROCESS_FILE, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON decode error in integrity_processes.json: {e}")
+            return {}
+        except Exception as e:
+            logging.error(f"Error loading process metadata: {e}")
+            return {}
+    return {}
+
+def save_process_metadata(processes):
+    """Save full process metadata to integrity_processes.json safely."""
+    return safe_write_json(INTEGRITY_PROCESS_FILE, processes)
+
+def update_process_tracking(exe_path, process_hash, metadata):
+    """Update process tracking files with new or modified processes."""
+    # Load existing data
+    process_hashes = load_process_hashes()
+    integrity_state = load_process_metadata()
+
+    pid = metadata["pid"]  # Use PID as a unique key
+    
+    # Store metadata by PID
+    integrity_state[str(pid)] = metadata
+    
+    # Update hash tracking separately
+    if process_hash != "ERROR_HASHING_PERMISSION" and process_hash != "ERROR_FILE_NOT_FOUND":
+        process_hashes[exe_path] = process_hash
+
+    # Save updates
+    success1 = save_process_metadata(integrity_state)
+    success2 = save_process_hashes(process_hashes)
+    
+    return success1 and success2
+
+def remove_process_tracking(pid):
+    """Remove process metadata from integrity_processes.json and process_hashes.txt."""
+    process_hashes = load_process_hashes()
+    integrity_state = load_process_metadata()
+    known_lineages = load_known_lineages()
+
+    pid_str = str(pid)
+
+    if pid_str in integrity_state:
+        process_info = integrity_state[pid_str]
+        proc_name = process_info.get("process_name", "UNKNOWN")
+        lineage = process_info.get("lineage", [])
+
+        # Remove the process metadata
+        del integrity_state[pid_str]
+        save_process_metadata(integrity_state)
+
+        # Check if lineage for that process name should be retained
+        still_running_with_same_lineage = any(
+            p.get("process_name") == proc_name and p.get("lineage") == known_lineages.get(proc_name)
+            for p in integrity_state.values()
+        )
+
+        if proc_name in known_lineages and not still_running_with_same_lineage:
+            logging.info(f"Removing lineage for {proc_name} from known_lineages.json")
+            del known_lineages[proc_name]
+            save_known_lineages(known_lineages)
+
+        # Remove from hash tracking if necessary
+        exe_path = process_info.get("exe_path")
+        if exe_path and exe_path in process_hashes:
+            del process_hashes[exe_path]
+            save_process_hashes(process_hashes)
+
+        logging.info(f"Process {pid_str} removed from tracking")
+        return True
+    else:
+        logging.warning(f"No matching process found for PID: {pid_str}")
+        return False
 
 def load_known_lineages():
+    """Load the known process lineage mapping."""
     if not os.path.exists(KNOWN_LINEAGES_FILE):
-        print("[DEBUG] known_lineages.json does not exist, starting fresh.")
+        logging.debug("known_lineages.json does not exist, starting fresh")
         return {}
     try:
         with open(KNOWN_LINEAGES_FILE, "r") as f:
             return json.load(f)
     except Exception as e:
-        print(f"[ERROR] Failed to load known_lineages.json: {e}")
+        logging.error(f"Failed to load known_lineages.json: {e}")
         return {}
 
 def save_known_lineages(lineages):
-    try:
-        temp_file = f"{KNOWN_LINEAGES_FILE}.tmp"
-        with open(temp_file, "w") as f:
-            json.dump(lineages, f, indent=4)
-
-        os.replace(temp_file, KNOWN_LINEAGES_FILE)
-        # Set Windows file security
-        try:
-            sd = win32security.GetFileSecurity(
-                KNOWN_LINEAGES_FILE, 
-                win32security.DACL_SECURITY_INFORMATION
-            )
-            dacl = win32security.ACL()
-            
-            admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-            system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-            
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-            
-            sd.SetSecurityDescriptorDacl(1, dacl, 0)
-            win32security.SetFileSecurity(
-                KNOWN_LINEAGES_FILE, 
-                win32security.DACL_SECURITY_INFORMATION, 
-                sd
-            )
-        except Exception as e:
-            print(f"[ERROR] Failed to set secure permissions on {KNOWN_LINEAGES_FILE}: {e}")
-        print("[DEBUG] Saved updated known_lineages.json")
-    except Exception as e:
-        print(f"[ERROR] Failed to save known_lineages.json: {e}")
-
-def check_lineage_baseline(process_info, known_lineages):
-    proc_name = process_info["process_name"]
-    lineage = process_info.get("lineage", [])
-
-    if not lineage:
-        return
-
-    baseline = known_lineages.get(proc_name)
-
-    if not baseline:
-        known_lineages[proc_name] = lineage
-        print(f"[INFO] Baseline lineage established for {proc_name}: {lineage}")
-        save_known_lineages(known_lineages)
-    elif lineage != baseline:
-        print(f"[ALERT] Lineage deviation for {proc_name}:")
-        print(f"  Expected: {baseline}")
-        print(f"  Found:    {lineage}")
-        from fim_client import log_event
-        log_event(
-            event_type="LINEAGE_DEVIATION",
-            file_path=process_info["exe_path"],
-            previous_metadata={"lineage": baseline},
-            new_metadata={"lineage": lineage},
-            previous_hash="N/A",
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
+    """Save the process lineage mapping to known_lineages.json."""
+    return safe_write_json(KNOWN_LINEAGES_FILE, lineages)
 
 def resolve_lineage(pid):
-    """Walks the parent process chain to build the process lineage using Windows APIs."""
+    """Walk the parent process chain to build the process lineage."""
     lineage = []
     
     try:
         seen_pids = set()
         current_pid = pid
         
-        while current_pid not in seen_pids and current_pid > 0:
+        while current_pid and current_pid not in seen_pids and current_pid > 0:
             seen_pids.add(current_pid)
             
             try:
                 process = psutil.Process(current_pid)
                 process_name = process.name()
                 
-                # Insert at the beginning to get the ancestry in the right order
+                # Insert at beginning to maintain ancestry order (root ? leaf)
                 lineage.insert(0, process_name)
                 
                 # Get parent PID
                 parent_pid = process.ppid()
                 
-                # Break the loop if we've reached the System process or the same process
+                # Break if we've reached the System process or a loop
                 if parent_pid == 0 or parent_pid == 4 or parent_pid == current_pid:
                     break
                 
                 current_pid = parent_pid
                 
             except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                print(f"[DEBUG] Could not access process {current_pid}: {e}")
+                logging.debug(f"Could not access process {current_pid}: {e}")
                 break
     
     except Exception as e:
-        print(f"[ERROR] Failed to resolve lineage for PID {pid}: {e}")
+        logging.error(f"Failed to resolve lineage for PID {pid}: {e}")
     
     return lineage
 
-def implement_behavioral_baselining():
-    """Implement ML-based behavioral baselining for Windows process activity."""
-    if not ML_LIBRARIES_AVAILABLE:
-        print("[WARNING] ML libraries are not available. Skipping behavioral baselining.")
-        return None
-        
-    from sklearn.ensemble import IsolationForest
-    import numpy as np
-    import pandas as pd
+def check_lineage_baseline(process_info, known_lineages):
+    """Check if a process's lineage matches the baseline."""
+    proc_name = process_info["process_name"]
+    lineage = process_info.get("lineage", [])
+
+    if not lineage:
+        return False
+
+    baseline = known_lineages.get(proc_name)
+
+    if not baseline:
+        # First time seeing this process - establish baseline
+        known_lineages[proc_name] = lineage
+        logging.info(f"Baseline lineage established for {proc_name}: {lineage}")
+        save_known_lineages(known_lineages)
+        return True
+    elif lineage != baseline:
+        # Lineage deviation detected
+        logging.warning(f"Lineage deviation for {proc_name}:")
+        logging.warning(f"  Expected: {baseline}")
+        logging.warning(f"  Found:    {lineage}")
+        return False
     
-    # Define system processes that should have special treatment
-    system_processes = ["system", "smss.exe", "csrss.exe", "wininit.exe", "services.exe", "lsass.exe", "svchost.exe"]
-    
-    # Collect historical process behavior data
-    processes_data = []
-    integrity_state = load_process_metadata()
-    
-    for pid, process in integrity_state.items():
-        process_name = process.get("process_name", "").lower()
-        
-        # Skip system processes in the training data
-        if process_name in system_processes and int(pid) <= 4:
+    return True
+
+def load_known_ports():
+    """Load the known process-port mapping."""
+    if not os.path.exists(KNOWN_PORTS_FILE):
+        return {}
+    try:
+        with open(KNOWN_PORTS_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load known_ports.json: {e}")
+        return {}
+
+def save_known_ports(mapping):
+    """Save the process-port mapping to known_ports.json."""
+    return safe_write_json(KNOWN_PORTS_FILE, mapping)
+
+def build_known_ports_baseline(processes):
+    """Build a baseline of known process-port mappings."""
+    known_ports = {}
+
+    for proc in processes.values():
+        proc_name = proc.get("process_name", "UNKNOWN")
+        if proc_name == "UNKNOWN":
             continue
-            
-        # Extract features
-        try:
-            features = {
-                'pid': int(pid),
-                'port': int(process['port']) if isinstance(process['port'], (int, str)) and str(process['port']).isdigit() else 0,
-                'lineage_length': len(process.get('lineage', [])),
-                'cmdline_length': len(process.get('cmdline', '')),
-                'user_is_admin': 1 if 'admin' in process.get('user', '').lower() else 0,
-                'child_processes': get_child_process_count_windows(int(pid))
+
+        if proc_name not in known_ports:
+            known_ports[proc_name] = {
+                "ports": [],
+                "metadata": proc  # store full metadata
             }
+
+        port = proc.get("port")
+        if port not in known_ports[proc_name]["ports"]:
+            known_ports[proc_name]["ports"].append(port)
+
+    success = safe_write_json(KNOWN_PORTS_FILE, known_ports)
+    logging.info(f"Port baseline created: {len(known_ports)} processes recorded")
+    return success
+
+def check_for_unusual_port_use(process_info):
+    """Check if a process is listening on a non-standard port."""
+    known_ports = load_known_ports()
+    if not known_ports:
+        return []  # Return empty list, not False
+        
+    proc_name = process_info.get("process_name")
+    proc_port = str(process_info.get("port"))
+    
+    # Skip if we don't know about this process yet
+    if proc_name not in known_ports:
+        return []  # Return empty list, not False
+        
+    expected_ports = list(map(str, known_ports[proc_name].get("ports", [])))
+    baseline_metadata = known_ports[proc_name].get("metadata", {})
+    
+    alerts = []
+    
+    # Check for port mismatch
+    if proc_port not in expected_ports:
+        logging.warning(f"{proc_name} listening on unexpected port {proc_port}. Expected: {expected_ports}")
+        alerts.append({
+            "type": "UNUSUAL_PORT_USE",
+            "details": {
+                "process": proc_name,
+                "expected_ports": expected_ports,
+                "actual_port": proc_port
+            }
+        })
+    
+    # Check for other metadata mismatches
+    if baseline_metadata.get("exe_path") != process_info.get("exe_path"):
+        logging.warning(f"Executable path mismatch for {proc_name}: expected '{baseline_metadata.get('exe_path')}', got '{process_info.get('exe_path')}'")
+        alerts.append({
+            "type": "EXECUTABLE_PATH_MISMATCH",
+            "details": {
+                "process": proc_name,
+                "expected_path": baseline_metadata.get("exe_path"),
+                "actual_path": process_info.get("exe_path")
+            }
+        })
+    
+    if baseline_metadata.get("hash") != process_info.get("hash") and "ERROR" not in baseline_metadata.get("hash", "") and "ERROR" not in process_info.get("hash", ""):
+        logging.warning(f"Binary hash mismatch for {proc_name}: expected '{baseline_metadata.get('hash')}', got '{process_info.get('hash')}'")
+        alerts.append({
+            "type": "HASH_MISMATCH",
+            "details": {
+                "process": proc_name,
+                "expected_hash": baseline_metadata.get("hash"),
+                "actual_hash": process_info.get("hash")
+            }
+        })
+    
+    if baseline_metadata.get("user") != process_info.get("user"):
+        logging.warning(f"User mismatch for {proc_name}: expected '{baseline_metadata.get('user')}', got '{process_info.get('user')}'")
+        alerts.append({
+            "type": "USER_MISMATCH",
+            "details": {
+                "process": proc_name,
+                "expected_user": baseline_metadata.get("user"),
+                "actual_user": process_info.get("user")
+            }
+        })
+        
+    return alerts  # Always return a list, even if empty
+
+def get_listening_processes():
+    """Get detailed information about all listening processes."""
+    listening_processes = {}
+
+    try:
+        # Use netstat to get processes listening on TCP ports
+        netstat_output = subprocess.check_output("netstat -ano -p TCP", shell=True, text=True)
+        
+        # Build a map of PID to port
+        pid_to_ports = {}
+        
+        for line in netstat_output.splitlines():
+            if "LISTENING" not in line:
+                continue
+                
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+                
+            # Extract local address and PID
+            local_address = parts[1]
+            try:
+                pid = int(parts[4])
+            except ValueError:
+                continue
             
-            # Add memory usage as a feature
-            mem_usage = get_process_memory_usage_windows(int(pid))
-            if mem_usage:
-                features['memory_usage'] = mem_usage
+            # Extract port number
+            try:
+                port = int(local_address.split(":")[-1])
+                if pid not in pid_to_ports:
+                    pid_to_ports[pid] = []
+                pid_to_ports[pid].append(port)
+            except (IndexError, ValueError):
+                continue
+        
+        # Get process details for each listening PID
+        for pid, ports in pid_to_ports.items():
+            try:
+                proc = psutil.Process(pid)
                 
-            # Add handle count
-            handle_count = get_handle_count_windows(int(pid))
-            if handle_count:
-                features['handle_count'] = handle_count
+                # Get basic process info
+                try:
+                    exe_path = proc.exe()
+                except (psutil.AccessDenied, FileNotFoundError):
+                    exe_path = "ACCESS_DENIED"
                 
-            processes_data.append(features)
-        except Exception as e:
-            print(f"[ERROR] Error extracting features for PID {pid}: {e}")
+                try:
+                    cmdline = " ".join(proc.cmdline())
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    cmdline = "ACCESS_DENIED"
+                
+                try:
+                    start_time = time.strftime('%Y-%m-%d %H:%M:%S', 
+                                             time.localtime(proc.create_time()))
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    start_time = "UNKNOWN"
+                
+                try:
+                    username = proc.username()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    username = "UNKNOWN"
+                
+                try:
+                    ppid = proc.ppid()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    ppid = "UNKNOWN"
+                
+                # Get process hash
+                if exe_path != "ACCESS_DENIED" and os.path.exists(exe_path):
+                    process_hash = get_process_hash(exe_path, cmdline)
+                else:
+                    process_hash = "ACCESS_DENIED"
+                
+                # Get process lineage
+                lineage = resolve_lineage(pid)
+                
+                # Store info for each port
+                for port in ports:
+                    process_key = f"{pid}:{port}"
+                    listening_processes[process_key] = {
+                        "pid": pid,
+                        "exe_path": exe_path,
+                        "process_name": os.path.basename(exe_path) if exe_path != "ACCESS_DENIED" else "UNKNOWN",
+                        "port": port,
+                        "user": username,
+                        "start_time": start_time,
+                        "cmdline": cmdline,
+                        "hash": process_hash,
+                        "ppid": ppid,
+                        "lineage": lineage
+                    }
+                
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                logging.error(f"Failed to get information for PID {pid}: {e}")
     
-    # Return empty model info if not enough data
-    if len(processes_data) < 5:
-        return {
-            'model': None,
-            'features': [],
-            'system_processes': system_processes
-        }
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Failed to execute netstat command: {e}")
     
-    # Create dataframe and train model
-    df = pd.DataFrame(processes_data)
-    numerical_features = [col for col in df.columns if col != 'pid' and df[col].dtype in [np.int64, np.float64]]
-    
-    # Train isolation forest
-    model = IsolationForest(contamination=0.1, random_state=42)
-    model.fit(df[numerical_features])
-    
-    # Store model info
-    model_info = {
-        'model': model,
-        'features': numerical_features,
-        'system_processes': system_processes
+    return listening_processes
+
+def get_process_memory_info(pid):
+    """Get detailed memory information for a process."""
+    memory_info = {
+        "total_memory_kb": 0,
+        "working_set_kb": 0,
+        "private_bytes_kb": 0,
+        "regions": []
     }
     
-    return model_info
-
-def analyze_process_for_windows_anomalies(pid, info):
-    """Analyze a Windows process for anomalies using Windows-specific detection techniques."""
-    # Skip certain system processes
-    if info.get('process_name', '').lower() in ['system', 'smss.exe', 'csrss.exe'] and pid <= 4:
-        return None
-        
-    try:
-        # Extract features for anomaly detection
-        features = {
-            'port': int(info.get('port', 0)) if isinstance(info.get('port', 0), (int, str)) and str(info.get('port', 0)).isdigit() else 0,
-            'lineage_length': len(info.get('lineage', [])),
-            'cmdline_length': len(info.get('cmdline', '')),
-            'user_is_admin': 1 if 'admin' in info.get('user', '').lower() else 0,
-            'child_processes': get_child_process_count_windows(pid),
-            'handle_count': get_handle_count_windows(pid) 
-        }
-        
-        mem_usage = get_process_memory_usage_windows(pid)
-        if mem_usage:
-            features['memory_usage'] = mem_usage
-            
-        # Check for suspicious patterns through lineage
-        lineage = info.get('lineage', [])
-        suspicious_patterns = []
-        
-        # Check for command shells in lineage of server processes
-        shell_in_lineage = any(shell.lower() in [name.lower() for name in lineage] for shell in ['cmd.exe', 'powershell.exe', 'wscript.exe', 'cscript.exe'])
-        unexpected_execution = shell_in_lineage and any(x in info.get('process_name', '').lower() for x in ['w3wp', 'httpd', 'tomcat', 'nginx', 'iis'])
-        
-        if unexpected_execution:
-            suspicious_patterns.append(f"Unusual process ancestry for {info.get('process_name')}: includes command shell")
-        
-        # Check if running from unusual directory
-        exe_path = info.get('exe_path', '').lower()
-        non_standard_dirs = ["\\temp\\", "\\windows\\temp\\", "\\appdata\\local\\temp\\", "\\programdata\\temp\\", "\\users\\public\\"]
-        for unusual_dir in non_standard_dirs:
-            if unusual_dir in exe_path:
-                suspicious_patterns.append(f"Running from unusual directory: {unusual_dir}")
-                break
-        
-        # Check for unusual port
-        if isinstance(info.get('port'), int) and info.get('port') > 1024 and info.get('port') not in [8080, 8443, 3000, 3001, 5000, 5001]:
-            suspicious_patterns.append(f"Unusual port: {info.get('port')}")
-        
-        # Windows-specific checks
-        
-        # Check for unusual parent-child relationships
-        if "services.exe" not in lineage and info.get('process_name', '').lower() == "svchost.exe":
-            suspicious_patterns.append("svchost.exe running without services.exe as ancestor")
-        
-        # Process running from %TEMP% directory
-        temp_dir_patterns = ["\\local\\temp\\", "\\temp\\", "\\tmp\\", "\\windows\\temp\\"]
-        if any(pattern in exe_path for pattern in temp_dir_patterns):
-            suspicious_patterns.append(f"Process running from temporary directory: {exe_path}")
-        
-        # Check for PowerShell with encoded commands
-        cmdline = info.get('cmdline', '').lower()
-        if "powershell" in exe_path.lower() and any(flag in cmdline for flag in ["-encodedcommand", "-enc", "-e"]):
-            suspicious_patterns.append("PowerShell with encoded command detected")
-        
-        # Detect LOLBAS (Living Off The Land Binaries And Scripts)
-        lolbas_binaries = ["certutil.exe", "regsvr32.exe", "mshta.exe", "rundll32.exe", "msiexec.exe", "installutil.exe", "regasm.exe", "regedt32.exe"]
-        for binary in lolbas_binaries:
-            if binary.lower() in exe_path.lower() and any(flag in cmdline for flag in ["/urlcache", "/url", "javascript:", "vbscript:", "http:", "https:", "-Sta", "-W", "hidden"]):
-                suspicious_patterns.append(f"Potential LOLBin abuse: {binary}")
-        
-        # Return results if any suspicious patterns found
-        if suspicious_patterns:
-            return {
-                "suspicious_patterns": suspicious_patterns,
-                "features": features
-            }
-        
-        return None
-    except Exception as e:
-        print(f"[ERROR] Error analyzing process {pid} for anomalies: {e}")
-        return None
-
-def get_process_memory_usage_windows(pid):
-    """Get memory usage of a Windows process in KB."""
     try:
         process = psutil.Process(pid)
-        # Return the working set size (resident memory) in KB
-        return process.memory_info().rss // 1024
-    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-        print(f"[DEBUG] Could not get memory usage for PID {pid}: {e}")
-        return None
-
-def get_child_process_count_windows(pid):
-    """Count child processes of the given PID in Windows."""
-    try:
-        # Use psutil to get children
-        process = psutil.Process(pid)
-        children = process.children(recursive=False)
-        return len(children)
-    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-        print(f"[DEBUG] Could not get child process count for PID {pid}: {e}")
-        return 0
-
-def get_handle_count_windows(pid):
-    """Count open handles for a Windows process."""
-    try:
-        process = psutil.Process(pid)
-        return process.num_handles()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError) as e:
-        print(f"[DEBUG] Could not get handle count for PID {pid}: {e}")
-        return 0
-
-def scan_process_memory_windows(pid):
-    """Scan Windows process memory for potential code injection using VAD (Virtual Address Descriptor) analysis."""
-    suspicious_regions = []
-    exe_path = ""
-    
-    try:
-        # Get process information
-        try:
-            process = psutil.Process(pid)
-            exe_path = process.exe()
-            process_name = os.path.basename(exe_path)
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            print(f"[DEBUG] Could not get process information for PID {pid}: {e}")
-            return []
-            
-        # Use PowerShell to query memory regions with executable permissions
-        # This requires administrative privileges
-        if not is_admin():
-            print("[WARNING] Administrator privileges required for memory scanning")
-            return []
+        mem = process.memory_info()
+        memory_info["working_set_kb"] = mem.rss // 1024
+        memory_info["private_bytes_kb"] = mem.private // 1024
+        memory_info["total_memory_kb"] = memory_info["working_set_kb"]
         
-        # Use memory_maps from psutil to enumerate memory regions
-        try:
+        # For getting detailed memory regions, we need admin rights and WinAPI
+        if is_admin():
             memory_regions = enumerate_process_memory_regions(pid)
+            memory_info["regions"] = memory_regions
             
-            # Apply heuristics to detect suspicious memory regions
-            for region in memory_regions:
-                # Executable, non-image memory is suspicious (often used for shellcode)
-                if region.get('is_executable') and not region.get('is_image') and region.get('type') in ['Private', 'MEM_PRIVATE']:
-                    suspicious_regions.append({
-                        'region': region,
-                        'reason': 'Executable non-image memory',
-                        'severity': 'high'
-                    })
-                
-                # RWX memory is highly suspicious in legitimate applications
-                elif region.get('is_executable') and region.get('is_writable') and region.get('type') in ['Private', 'MEM_PRIVATE']:
-                    suspicious_regions.append({
-                        'region': region,
-                        'reason': 'Memory region with RWX permissions',
-                        'severity': 'high'
-                    })
-                
-                # Large executable allocations in heap or not mapped to a DLL
-                elif region.get('is_executable') and not region.get('mapped_file') and region.get('size', 0) > 1024 * 1024:
-                    suspicious_regions.append({
-                        'region': region,
-                        'reason': 'Large executable memory allocation',
-                        'severity': 'medium'
-                    })
-            
-            if suspicious_regions:
-                from fim_client import log_event
-                log_event(
-                    event_type="SUSPICIOUS_MEMORY_REGION",
-                    file_path=exe_path,
-                    previous_metadata=None,
-                    new_metadata={
-                        "pid": pid,
-                        "process_name": process_name,
-                        "suspicious_regions": [f"{r['region'].get('address', 'Unknown')} - {r['reason']}" for r in suspicious_regions]
-                    },
-                    previous_hash=None,
-                    new_hash=None
-                )
-        except Exception as e:
-            print(f"[ERROR] Failed to enumerate memory regions for PID {pid}: {e}")
+    except (psutil.AccessDenied, psutil.NoSuchProcess) as e:
+        logging.error(f"Failed to get memory info for PID {pid}: {e}")
     
-    except Exception as e:
-        print(f"[ERROR] Failed to scan memory for PID {pid}: {e}")
-    
-    return suspicious_regions
+    return memory_info
 
 def enumerate_process_memory_regions(pid):
-    """Get memory regions for a process using Windows API via Python."""
-    memory_regions = []
+    """Enumerate memory regions for a process to detect potential code injection."""
+    regions = []
+    
+    if not is_admin():
+        logging.warning("Administrator privileges required for memory region enumeration")
+        return regions
+        
+    try:
+        # Get handle to process with memory read rights
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ = 0x0010
+        
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            False,
+            pid
+        )
+        
+        if not handle:
+            logging.error(f"Failed to open process {pid}: {ctypes.GetLastError()}")
+            return regions
+            
+        try:
+            # Define memory region structure
+            class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BaseAddress", ctypes.c_void_p),
+                    ("AllocationBase", ctypes.c_void_p),
+                    ("AllocationProtect", ctypes.c_ulong),
+                    ("RegionSize", ctypes.c_size_t),
+                    ("State", ctypes.c_ulong),
+                    ("Protect", ctypes.c_ulong),
+                    ("Type", ctypes.c_ulong)
+                ]
+            
+            # Memory protection constants
+            PAGE_NOACCESS = 0x01
+            PAGE_READONLY = 0x02
+            PAGE_READWRITE = 0x04
+            PAGE_WRITECOPY = 0x08
+            PAGE_EXECUTE = 0x10
+            PAGE_EXECUTE_READ = 0x20
+            PAGE_EXECUTE_READWRITE = 0x40
+            PAGE_EXECUTE_WRITECOPY = 0x80
+            
+            # Memory state constants
+            MEM_COMMIT = 0x1000
+            MEM_FREE = 0x10000
+            MEM_RESERVE = 0x2000
+            
+            # Memory type constants
+            MEM_IMAGE = 0x1000000
+            MEM_MAPPED = 0x40000
+            MEM_PRIVATE = 0x20000
+            
+            # Process memory from start to end
+            address = 0
+            mbi = MEMORY_BASIC_INFORMATION()
+            while ctypes.windll.kernel32.VirtualQueryEx(
+                handle,
+                address,
+                ctypes.byref(mbi),
+                ctypes.sizeof(mbi)
+            ):
+                # Only look at committed memory
+                if mbi.State == MEM_COMMIT:
+                    # Determine permissions
+                    is_executable = bool(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | 
+                                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+                    is_writable = bool(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | 
+                                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+                    is_readable = bool(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | 
+                                       PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))
+                    
+                    # Determine type
+                    region_type = "Unknown"
+                    if mbi.Type == MEM_IMAGE:
+                        region_type = "Image"
+                    elif mbi.Type == MEM_MAPPED:
+                        region_type = "Mapped"
+                    elif mbi.Type == MEM_PRIVATE:
+                        region_type = "Private"
+                    
+                    # Store region info
+                    regions.append({
+                        "address": f"0x{address:X}",
+                        "size_kb": mbi.RegionSize // 1024,
+                        "protection": {
+                            "executable": is_executable,
+                            "writable": is_writable,
+                            "readable": is_readable
+                        },
+                        "type": region_type,
+                        "allocation_base": f"0x{mbi.AllocationBase:X}"
+                    })
+                
+                # Move to next region
+                address += mbi.RegionSize
+                
+                # Prevent infinite loop
+                if address > 0x7FFFFFFF0000:
+                    break
+        
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    
+    except Exception as e:
+        logging.error(f"Error enumerating memory regions for PID {pid}: {e}")
+    
+    return regions
+
+def scan_process_memory(pid, process_info=None):
+    """Scan process memory for potential code injection or malicious behaviors."""
+    if not is_admin():
+        logging.warning("Administrator privileges required for memory scanning")
+        return []
+        
+    suspicious_regions = []
     
     try:
-        # Use WMI to get process modules (DLLs) for context
-        loaded_modules = {}
-        try:
-            process = psutil.Process(pid)
-            modules = process.memory_maps(grouped=False)
-            for module in modules:
-                base_address = module.addr.split('-')[0]
-                loaded_modules[base_address] = {
-                    'path': module.path,
-                    'size': int(module.rss),
-                    'is_image': True
-                }
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            print(f"[DEBUG] Could not get modules for PID {pid}: {e}")
-        
-        # Get memory regions
-        try:
-            # Use psutil.Process.memory_maps() to get memory regions
-            process = psutil.Process(pid)
-            memory_maps = process.memory_maps(grouped=False)
+        memory_regions = enumerate_process_memory_regions(pid)
+        if not memory_regions:
+            return []
             
-            for memory_map in memory_maps:
-                # Parse address range
-                addr_range = memory_map.addr.split('-')
-                if len(addr_range) != 2:
-                    continue
-                
-                start_addr = int(addr_range[0], 16)
-                end_addr = int(addr_range[1], 16)
-                size = end_addr - start_addr
-                
-                # Parse permissions
-                perms = memory_map.perms
-                is_readable = 'r' in perms
-                is_writable = 'w' in perms
-                is_executable = 'x' in perms
-                is_private = 'p' in perms
-                is_shared = 's' in perms
-                
-                # Determine type
-                mem_type = 'MEM_PRIVATE' if is_private else 'MEM_MAPPED'
-                
-                # Determine if this is an image (DLL or EXE)
-                mapped_file = memory_map.path if hasattr(memory_map, 'path') else None
-                is_image = mapped_file.lower().endswith(('.dll', '.exe')) if mapped_file else False
-                
-                memory_regions.append({
-                    'address': f"0x{start_addr:X}",
-                    'size': size,
-                    'is_readable': is_readable,
-                    'is_writable': is_writable,
-                    'is_executable': is_executable,
-                    'type': mem_type,
-                    'is_image': is_image,
-                    'mapped_file': mapped_file
+        process_name = process_info.get("process_name", "unknown") if process_info else "unknown"
+        
+        # Look for suspicious memory patterns
+        for region in memory_regions:
+            # Executable private memory (often used for shellcode)
+            if region["protection"]["executable"] and region["type"] == "Private" and region["size_kb"] > 4:
+                suspicious_regions.append({
+                    "region": region,
+                    "reason": "Executable private memory",
+                    "severity": "medium"
+                })
+            
+            # RWX memory is highly suspicious
+            if region["protection"]["executable"] and region["protection"]["writable"] and region["type"] == "Private":
+                suspicious_regions.append({
+                    "region": region,
+                    "reason": "Memory with RWX permissions",
+                    "severity": "high"
+                })
+            
+            # Large executable allocations that aren't mapped to a DLL
+            if region["protection"]["executable"] and region["type"] == "Private" and region["size_kb"] > 1024:
+                suspicious_regions.append({
+                    "region": region, 
+                    "reason": "Large executable memory allocation",
+                    "severity": "medium"
                 })
         
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            print(f"[DEBUG] Could not get memory maps for PID {pid}: {e}")
+        if suspicious_regions:
+            logging.warning(f"Found {len(suspicious_regions)} suspicious memory regions in PID {pid} ({process_name})")
             
     except Exception as e:
-        print(f"[ERROR] Failed to enumerate memory regions: {e}")
+        logging.error(f"Error scanning memory for PID {pid}: {e}")
         
-    return memory_regions
+    return suspicious_regions
 
-def classify_by_mitre_attck_windows(event_type, process_info, detection_details=None):
-    """Map detected activities to MITRE ATT&CK techniques using Windows-specific classifications."""
-    # Load MITRE ATT&CK mappings from a JSON file if it exists
-    mitre_mapping_file = os.path.join(OUTPUT_DIR, "mitre_mappings.json")
+def get_process_stats(pid):
+    """Get detailed statistics about a process for behavioral analysis."""
+    stats = {
+        "memory_usage_kb": 0,
+        "cpu_percent": 0,
+        "handle_count": 0,
+        "thread_count": 0,
+        "child_process_count": 0,
+        "io_read_bytes": 0,
+        "io_write_bytes": 0,
+        "connection_count": 0
+    }
     
-    if os.path.exists(mitre_mapping_file):
+    try:
+        process = psutil.Process(pid)
+        
+        # CPU and memory stats
+        stats["cpu_percent"] = process.cpu_percent(interval=0.1)
+        stats["memory_usage_kb"] = process.memory_info().rss // 1024
+        
+        # Resource usage
+        stats["handle_count"] = process.num_handles() if hasattr(process, 'num_handles') else 0
+        stats["thread_count"] = process.num_threads()
+        
+        # Child processes
+        stats["child_process_count"] = len(process.children())
+        
+        # IO stats
         try:
-            with open(mitre_mapping_file, "r") as f:
-                mitre_mapping = json.load(f)
-        except Exception as e:
-            print(f"[ERROR] Failed to load MITRE mappings: {e}")
-            mitre_mapping = {}
-    else:
-        # Default mappings as fallback - Windows specific
-        mitre_mapping = {
-            "NEW_LISTENING_PROCESS": [{
-                "technique_id": "T1059.003",
-                "technique_name": "Command and Scripting Interpreter: Windows Command Shell",
-                "tactic": "Execution"
-            }],
-            "UNUSUAL_PORT_USE": [{
-                "technique_id": "T1571", 
-                "technique_name": "Non-Standard Port",
-                "tactic": "Command and Control"
-            }],
-            "PROCESS_MODIFIED": [{
-                "technique_id": "T1055", 
-                "technique_name": "Process Injection",
-                "tactic": "Defense Evasion"
-            }],
-            "SUSPICIOUS_MEMORY_REGION": [{
-                "technique_id": "T1055", 
-                "technique_name": "Process Injection",
-                "tactic": "Defense Evasion"
-            }],
-            "LINEAGE_DEVIATION": [{
-                "technique_id": "T1036", 
-                "technique_name": "Masquerading",
-                "tactic": "Defense Evasion"
-            }],
-            "ML_DETECTED_ANOMALY": [
-                {
-                    "technique_id": "T1036", 
-                    "technique_name": "Masquerading",
-                    "tactic": "Defense Evasion"
-                },
-                {
-                    "technique_id": "T1059", 
-                    "technique_name": "Command and Scripting Interpreter",
-                    "tactic": "Execution"
-                }
-            ],
-            "SUSPICIOUS_BEHAVIOR": [
-                {
-                    "technique_id": "T1059", 
-                    "technique_name": "Command and Scripting Interpreter",
-                    "tactic": "Execution"
-                }
-            ]
-        }
+            io_counters = process.io_counters()
+            stats["io_read_bytes"] = io_counters.read_bytes
+            stats["io_write_bytes"] = io_counters.write_bytes
+        except (psutil.AccessDenied, AttributeError):
+            pass
+        
+        # Network connections
+        try:
+            connections = process.connections()
+            stats["connection_count"] = len(connections)
+        except (psutil.AccessDenied, AttributeError):
+            pass
+            
+    except (psutil.AccessDenied, psutil.NoSuchProcess) as e:
+        logging.debug(f"Could not get complete stats for PID {pid}: {e}")
+        
+    return stats
+
+def analyze_process_behavior(pid, process_info):
+    """Analyze a process for suspicious behavior patterns."""
+    suspicious_patterns = []
     
-    # Context-based classification enhancements for Windows
+    try:
+        # Skip system processes
+        if process_info.get("process_name", "").lower() in ["system", "smss.exe", "csrss.exe"] and pid <= 4:
+            return []
+            
+        # Get process stats
+        process_stats = get_process_stats(pid)
+        
+        # Get process lineage and other metadata
+        lineage = process_info.get("lineage", [])
+        exe_path = process_info.get("exe_path", "").lower()
+        cmdline = process_info.get("cmdline", "").lower()
+        port = process_info.get("port", 0)
+        user = process_info.get("user", "").lower()
+        
+        # 1. Check for command shells in lineage of server processes
+        shell_in_lineage = any(shell.lower() in [p.lower() for p in lineage] 
+                            for shell in ['cmd.exe', 'powershell.exe', 'wscript.exe', 'cscript.exe'])
+        
+        server_process = any(server in process_info.get("process_name", "").lower() 
+                          for server in ['w3wp', 'httpd', 'tomcat', 'nginx', 'iis'])
+                          
+        if shell_in_lineage and server_process:
+            suspicious_patterns.append(f"Unusual process ancestry: command shell in lineage of web server")
+        
+        # 2. Check if running from unusual directory
+        suspicious_dirs = ["\\temp\\", "\\windows\\temp\\", "\\appdata\\local\\temp\\", 
+                       "\\programdata\\temp\\", "\\users\\public\\", "\\downloads\\"]
+                       
+        for suspect_dir in suspicious_dirs:
+            if suspect_dir in exe_path:
+                suspicious_patterns.append(f"Executing from suspicious location: {suspect_dir}")
+                break
+        
+        # 3. Check for unusual port (excluding common alternative ports)
+        common_high_ports = [8080, 8443, 3000, 3001, 5000, 5001, 8000, 8008, 8888]
+        if isinstance(port, int) and port > 1024 and port not in common_high_ports:
+            suspicious_patterns.append(f"Listening on unusual high port: {port}")
+        
+        # 4. Windows-specific process relationship checks
+        if "services.exe" not in lineage and process_info.get("process_name", "").lower() == "svchost.exe":
+            suspicious_patterns.append("svchost.exe running without services.exe as ancestor")
+        
+        # 5. PowerShell encoded command detection
+        if "powershell" in exe_path and any(enc in cmdline 
+                                         for enc in ["-encodedcommand", "-enc", "-e", "frombase64string"]):
+            suspicious_patterns.append("PowerShell with encoded command detected")
+        
+        # 6. LOLBins (Living Off The Land Binaries) detection
+        lolbins = {
+            "certutil.exe": ["/urlcache", "/verifyctl", "/decode"],
+            "regsvr32.exe": ["scrobj.dll", "/i:", "/u", "/s"],
+            "mshta.exe": ["javascript:", "vbscript:", ".hta"],
+            "rundll32.exe": ["advpack.dll", "setupapi.dll", "shdocvw.dll", "javascript:"],
+            "msiexec.exe": ["/y", "/z"],
+            "installutil.exe": ["/logfile=", "/u"],
+            "regasm.exe": ["/quiet"],
+            "regedt32.exe": ["/i"],
+            "wmic.exe": ["process call create", "shadowcopy"]
+        }
+        
+        process_name = process_info.get("process_name", "").lower()
+        for lolbin, flags in lolbins.items():
+            if lolbin.lower() == process_name:
+                for flag in flags:
+                    if flag.lower() in cmdline:
+                        suspicious_patterns.append(f"Potential LOLBin abuse: {lolbin} with {flag}")
+                        break
+        
+        # 7. Unusual parent-child relationships
+        unusual_parents = {
+            "lsass.exe": ["cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe"],
+            "svchost.exe": ["cmd.exe", "powershell.exe", "rundll32.exe"]
+        }
+        
+        for child, suspicious_parents in unusual_parents.items():
+            if process_name == child and lineage and lineage[0].lower() in [p.lower() for p in suspicious_parents]:
+                suspicious_patterns.append(f"Unusual parent process {lineage[0]} for {child}")
+        
+        # 8. High resource usage for certain processes
+        if process_stats["cpu_percent"] > 80 and process_name in ["svchost.exe", "lsass.exe", "csrss.exe"]:
+            suspicious_patterns.append(f"Unusually high CPU usage ({process_stats['cpu_percent']}%) for {process_name}")
+        
+        # 9. Very high connection count for non-server processes
+        if (process_stats["connection_count"] > 50 and 
+            not any(server in process_name for server in ["iis", "apache", "nginx", "w3wp", "httpd", "tomcat"])):
+            suspicious_patterns.append(f"High connection count ({process_stats['connection_count']}) for non-server process")
+        
+    except Exception as e:
+        logging.error(f"Error analyzing process behavior for PID {pid}: {e}")
+    
+    return suspicious_patterns
+
+def implement_behavioral_baselining():
+    """Train an ML model for process behavior anomaly detection if libraries are available."""
+    if not ML_LIBRARIES_AVAILABLE:
+        logging.warning("ML libraries not available - skipping behavioral baselining")
+        return None
+        
+    try:
+        from sklearn.ensemble import IsolationForest
+        import numpy as np
+        import pandas as pd
+        
+        # Define system processes that should have special treatment
+        system_processes = ["system", "smss.exe", "csrss.exe", "wininit.exe", 
+                          "services.exe", "lsass.exe", "svchost.exe"]
+        
+        # Collect historical process behavior data
+        processes_data = []
+        integrity_state = load_process_metadata()
+        
+        for pid_str, process in integrity_state.items():
+            pid = int(pid_str)
+            process_name = process.get("process_name", "").lower()
+            
+            # Skip system processes in the training data
+            if process_name in system_processes and pid <= 4:
+                continue
+                
+            # Extract features
+            try:
+                # Get additional stats if process is still running
+                try:
+                    current_stats = get_process_stats(pid)
+                except:
+                    current_stats = {
+                        "memory_usage_kb": 0,
+                        "cpu_percent": 0,
+                        "handle_count": 0, 
+                        "thread_count": 0,
+                        "child_process_count": 0,
+                        "connection_count": 0
+                    }
+                
+                # Basic features from stored metadata
+                features = {
+                    'pid': pid,
+                    'port': int(process.get('port', 0)) if isinstance(process.get('port', 0), (int, str)) and 
+                                                       str(process.get('port', 0)).isdigit() else 0,
+                    'lineage_length': len(process.get('lineage', [])),
+                    'cmdline_length': len(process.get('cmdline', '')),
+                    'is_admin': 1 if 'admin' in process.get('user', '').lower() else 0,
+                    'is_system': 1 if 'system' in process.get('user', '').lower() else 0,
+                    'child_processes': current_stats.get('child_process_count', 0),
+                    'handle_count': current_stats.get('handle_count', 0),
+                    'thread_count': current_stats.get('thread_count', 0),
+                    'memory_usage_mb': current_stats.get('memory_usage_kb', 0) / 1024,
+                    'connection_count': current_stats.get('connection_count', 0)
+                }
+                
+                processes_data.append(features)
+            except Exception as e:
+                logging.error(f"Error extracting ML features for PID {pid}: {e}")
+        
+        # Return empty model info if not enough data
+        if len(processes_data) < 5:
+            logging.warning("Not enough process data for ML model training")
+            return {
+                'model': None,
+                'features': [],
+                'system_processes': system_processes
+            }
+        
+        # Create dataframe and train model
+        df = pd.DataFrame(processes_data)
+        numerical_features = [col for col in df.columns if col != 'pid' and 
+                            df[col].dtype in [np.int64, np.float64, np.bool_]]
+        
+        # Train isolation forest with auto contamination
+        contamination = min(0.1, 1/len(df))  # At most 10% anomalies, or 1 if few samples
+        model = IsolationForest(contamination=contamination, random_state=42)
+        model.fit(df[numerical_features])
+        
+        logging.info(f"Trained ML model on {len(df)} processes with {len(numerical_features)} features")
+        
+        # Store model info
+        model_info = {
+            'model': model,
+            'features': numerical_features,
+            'system_processes': system_processes,
+            'training_size': len(df)
+        }
+        
+        return model_info
+        
+    except Exception as e:
+        logging.error(f"Error training ML model: {e}")
+        return None
+
+def detect_anomalies_ml(process_info, ml_model_info):
+    """Detect process anomalies using the trained ML model."""
+    if not ml_model_info or not ml_model_info.get('model'):
+        return None
+        
+    try:
+        import pandas as pd
+        
+        pid = process_info.get('pid')
+        process_name = process_info.get('process_name', '').lower()
+        
+        # Skip system processes
+        if (process_name in ml_model_info.get('system_processes', []) and 
+            (pid <= 4 or process_name == 'system')):
+            return None
+        
+        # Get process stats
+        process_stats = get_process_stats(pid)
+        
+        # Prepare features matching the trained model's feature set
+        features = {
+            'port': int(process_info.get('port', 0)) if isinstance(process_info.get('port', 0), (int, str)) and 
+                                                   str(process_info.get('port', 0)).isdigit() else 0,
+            'lineage_length': len(process_info.get('lineage', [])),
+            'cmdline_length': len(process_info.get('cmdline', '')),
+            'is_admin': 1 if 'admin' in process_info.get('user', '').lower() else 0,
+            'is_system': 1 if 'system' in process_info.get('user', '').lower() else 0,
+            'child_processes': process_stats.get('child_process_count', 0),
+            'handle_count': process_stats.get('handle_count', 0),
+            'thread_count': process_stats.get('thread_count', 0),
+            'memory_usage_mb': process_stats.get('memory_usage_kb', 0) / 1024,
+            'connection_count': process_stats.get('connection_count', 0)
+        }
+        
+        # Ensure we only use features available in the model
+        prediction_features = {}
+        for feature in ml_model_info['features']:
+            prediction_features[feature] = features.get(feature, 0)
+        
+        # Make prediction and get anomaly score
+        model = ml_model_info['model']
+        prediction = model.predict(pd.DataFrame([prediction_features]))[0]
+        
+        if prediction == -1:  # Anomaly detected
+            score = model.decision_function(pd.DataFrame([prediction_features]))[0]
+            
+            # Filter out weak anomalies to reduce noise
+            if score < -0.1:
+                return {
+                    'is_anomaly': True,
+                    'score': score,
+                    'features': features
+                }
+        
+        return None
+        
+    except Exception as e:
+        logging.error(f"Error detecting ML anomalies for PID {process_info.get('pid')}: {e}")
+        return None
+
+def load_mitre_mapping():
+    """Load MITRE ATT&CK technique mappings from file or use defaults."""
+    if os.path.exists(MITRE_MAPPING_FILE):
+        try:
+            with open(MITRE_MAPPING_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Failed to load MITRE mappings: {e}")
+    
+    # Default mappings as fallback - Windows specific
+    return {
+        "NEW_LISTENING_PROCESS": [{
+            "technique_id": "T1059.003",
+            "technique_name": "Command and Scripting Interpreter: Windows Command Shell",
+            "tactic": "Execution"
+        }],
+        "UNUSUAL_PORT_USE": [{
+            "technique_id": "T1571", 
+            "technique_name": "Non-Standard Port",
+            "tactic": "Command and Control"
+        }],
+        "PROCESS_MODIFIED": [{
+            "technique_id": "T1055", 
+            "technique_name": "Process Injection",
+            "tactic": "Defense Evasion"
+        }],
+        "SUSPICIOUS_MEMORY_REGION": [{
+            "technique_id": "T1055", 
+            "technique_name": "Process Injection",
+            "tactic": "Defense Evasion"
+        }],
+        "LINEAGE_DEVIATION": [{
+            "technique_id": "T1036", 
+            "technique_name": "Masquerading",
+            "tactic": "Defense Evasion"
+        }],
+        "ML_DETECTED_ANOMALY": [{
+            "technique_id": "T1036", 
+            "technique_name": "Masquerading",
+            "tactic": "Defense Evasion"
+        }],
+        "SUSPICIOUS_BEHAVIOR": [{
+            "technique_id": "T1059", 
+            "technique_name": "Command and Scripting Interpreter",
+            "tactic": "Execution"
+        }],
+        "EXECUTABLE_PATH_MISMATCH": [{
+            "technique_id": "T1036", 
+            "technique_name": "Masquerading",
+            "tactic": "Defense Evasion"
+        }],
+        "HASH_MISMATCH": [{
+            "technique_id": "T1036", 
+            "technique_name": "Masquerading",
+            "tactic": "Defense Evasion"
+        }],
+        "USER_MISMATCH": [{
+            "technique_id": "T1078", 
+            "technique_name": "Valid Accounts",
+            "tactic": "Persistence"
+        }]
+    }
+
+def classify_by_mitre_attck(event_type, process_info, detection_details=None):
+    """Map detected activities to MITRE ATT&CK techniques using contextual analysis."""
+    mitre_mapping = load_mitre_mapping()
+    
+    # Start with base techniques for the event type
+    techniques = mitre_mapping.get(event_type, []).copy()
+    
+    # Process metadata for context-based classification
     process_name = process_info.get("process_name", "").lower()
     cmdline = process_info.get("cmdline", "").lower()
     user = process_info.get("user", "").lower()
+    lineage = process_info.get("lineage", [])
     
-    # Build contextual insights
-    context_insights = []
+    # Add context-based techniques
+    context_techniques = []
     
-    # Windows-specific process name checks
+    # Process type-specific techniques
     if process_name in ["powershell.exe", "pwsh.exe"]:
-        context_insights.append({
+        context_techniques.append({
             "technique_id": "T1059.001",
             "technique_name": "Command and Scripting Interpreter: PowerShell",
             "tactic": "Execution"
         })
     elif process_name in ["cmd.exe"]:
-        context_insights.append({
+        context_techniques.append({
             "technique_id": "T1059.003",
             "technique_name": "Command and Scripting Interpreter: Windows Command Shell",
             "tactic": "Execution"
         })
     elif process_name in ["wscript.exe", "cscript.exe"]:
-        context_insights.append({
+        context_techniques.append({
             "technique_id": "T1059.005",
             "technique_name": "Command and Scripting Interpreter: Visual Basic",
             "tactic": "Execution"
         })
     elif process_name in ["rundll32.exe"]:
-        context_insights.append({
+        context_techniques.append({
             "technique_id": "T1218.011",
             "technique_name": "Signed Binary Proxy Execution: Rundll32",
             "tactic": "Defense Evasion"
         })
     elif process_name in ["regsvr32.exe"]:
-        context_insights.append({
+        context_techniques.append({
             "technique_id": "T1218.010",
             "technique_name": "Signed Binary Proxy Execution: Regsvr32",
             "tactic": "Defense Evasion"
         })
     
-    # Special handling for user context
-    if "system" in user or "administrator" in user:
-        context_insights.append({
+    # User context
+    if "system" in user:
+        context_techniques.append({
+            "technique_id": "T1078.003",
+            "technique_name": "Valid Accounts: Local Accounts",
+            "tactic": "Persistence"
+        })
+    elif "administrator" in user or "admin" in user:
+        context_techniques.append({
             "technique_id": "T1078.003",
             "technique_name": "Valid Accounts: Local Accounts",
             "tactic": "Persistence"
         })
     
-    # Special handling for command line analysis
-    if "http:" in cmdline or "https:" in cmdline:
-        # Look for suspicious URL invocation patterns
-        if any(tool in cmdline for tool in ["powershell", "cmd", "wscript", "cscript", "rundll32", "regsvr32", "mshta"]):
-            context_insights.append({
-                "technique_id": "T1105",
-                "technique_name": "Ingress Tool Transfer",
-                "tactic": "Command and Control"
-            })
+    # Command line analysis
+    if ("http:" in cmdline or "https:" in cmdline) and any(tool in cmdline for tool in 
+        ["powershell", "cmd", "wscript", "cscript", "rundll32", "regsvr32", "mshta"]):
+        context_techniques.append({
+            "technique_id": "T1105",
+            "technique_name": "Ingress Tool Transfer",
+            "tactic": "Command and Control"
+        })
     
-    # PowerShell encoded command
-    if "-enc" in cmdline or "-encodedcommand" in cmdline:
-        context_insights.append({
+    if "-enc" in cmdline or "-encodedcommand" in cmdline or "frombase64string" in cmdline:
+        context_techniques.append({
             "technique_id": "T1027",
             "technique_name": "Obfuscated Files or Information",
             "tactic": "Defense Evasion"
         })
     
-    # Special handling for SUSPICIOUS_BEHAVIOR events with pattern field
-    if event_type == "SUSPICIOUS_BEHAVIOR" and detection_details:
-        # Handle the patterns list format
-        if "suspicious_patterns" in detection_details:
-            patterns = detection_details.get("suspicious_patterns", [])
+    # Special handling for suspicious behaviors
+    if event_type == "SUSPICIOUS_BEHAVIOR" and isinstance(detection_details, list):
+        for pattern in detection_details:
+            pattern_lower = pattern.lower()
             
-            for pattern in patterns:
-                pattern_lower = pattern.lower()
-                
-                if "unusual directory" in pattern_lower or "temp directory" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1074", 
-                        "technique_name": "Data Staged",
-                        "tactic": "Collection",
-                        "evidence": pattern
-                    })
-                    
-                elif "unusual port" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1571", 
-                        "technique_name": "Non-Standard Port",
-                        "tactic": "Command and Control",
-                        "evidence": pattern
-                    })
-                    
-                elif "encoded command" in pattern_lower or "powershell" in pattern_lower and ("encoded" in pattern_lower or "-enc" in pattern_lower):
-                    context_insights.append({
-                        "technique_id": "T1027", 
-                        "technique_name": "Obfuscated Files or Information",
-                        "tactic": "Defense Evasion",
-                        "evidence": pattern
-                    })
-                    
-                elif "webshell" in pattern_lower or "w3wp.exe" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1505.003", 
-                        "technique_name": "Server Software Component: Web Shell",
-                        "tactic": "Persistence",
-                        "evidence": pattern
-                    })
-                    
-                elif "lolbin" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1218", 
-                        "technique_name": "Signed Binary Proxy Execution",
-                        "tactic": "Defense Evasion",
-                        "evidence": pattern
-                    })
+            if "temp directory" in pattern_lower or "unusual directory" in pattern_lower:
+                context_techniques.append({
+                    "technique_id": "T1074", 
+                    "technique_name": "Data Staged",
+                    "tactic": "Collection",
+                    "evidence": pattern
+                })
+            
+            elif "unusual port" in pattern_lower:
+                context_techniques.append({
+                    "technique_id": "T1571", 
+                    "technique_name": "Non-Standard Port",
+                    "tactic": "Command and Control",
+                    "evidence": pattern
+                })
+            
+            elif "encoded command" in pattern_lower or "powershell" in pattern_lower and "encoded" in pattern_lower:
+                context_techniques.append({
+                    "technique_id": "T1027", 
+                    "technique_name": "Obfuscated Files or Information",
+                    "tactic": "Defense Evasion",
+                    "evidence": pattern
+                })
+            
+            elif "webshell" in pattern_lower or "w3wp.exe" in pattern_lower and "cmd" in pattern_lower:
+                context_techniques.append({
+                    "technique_id": "T1505.003", 
+                    "technique_name": "Server Software Component: Web Shell",
+                    "tactic": "Persistence",
+                    "evidence": pattern
+                })
+            
+            elif "lolbin" in pattern_lower:
+                context_techniques.append({
+                    "technique_id": "T1218", 
+                    "technique_name": "Signed Binary Proxy Execution",
+                    "tactic": "Defense Evasion",
+                    "evidence": pattern
+                })
     
-    # Merge base classifications with context-specific insights
-    techniques = mitre_mapping.get(event_type, []) + context_insights
+    # Memory-related issues
+    if event_type == "SUSPICIOUS_MEMORY_REGION":
+        # Look for specific memory injection techniques
+        rwx_memory = False
+        large_exec = False
+        
+        if detection_details and isinstance(detection_details, list):
+            for region in detection_details:
+                if isinstance(region, dict):
+                    reason = region.get("reason", "").lower()
+                    if "rwx" in reason:
+                        rwx_memory = True
+                    elif "large executable" in reason:
+                        large_exec = True
+        
+        if rwx_memory:
+            context_techniques.append({
+                "technique_id": "T1055.001",
+                "technique_name": "Process Injection: Dynamic-link Library Injection",
+                "tactic": "Defense Evasion"
+            })
+        elif large_exec:
+            context_techniques.append({
+                "technique_id": "T1055.002",
+                "technique_name": "Process Injection: Portable Executable Injection",
+                "tactic": "Defense Evasion"
+            })
+    
+    # ML anomaly details
+    if event_type == "ML_DETECTED_ANOMALY" and isinstance(detection_details, dict):
+        # Get info about which features contributed to anomaly
+        features = detection_details.get("features", {})
+        
+        if features.get("connection_count", 0) > 30:
+            context_techniques.append({
+                "technique_id": "T1071",
+                "technique_name": "Application Layer Protocol",
+                "tactic": "Command and Control"
+            })
+        
+        if features.get("child_processes", 0) > 10:
+            context_techniques.append({
+                "technique_id": "T1106",
+                "technique_name": "Native API",
+                "tactic": "Execution"
+            })
+    
+    # Combine all techniques
+    all_techniques = techniques + context_techniques
     
     # Deduplicate techniques
     unique_techniques = []
     seen_ids = set()
-    for technique in techniques:
-        if technique["technique_id"] not in seen_ids:
+    
+    for technique in all_techniques:
+        technique_id = technique["technique_id"]
+        if technique_id not in seen_ids:
             unique_techniques.append(technique)
-            seen_ids.add(technique["technique_id"])
+            seen_ids.add(technique_id)
     
     if unique_techniques:
-        # Log all applicable techniques
-        technique_list = [f"{t['technique_id']} ({t['technique_name']})" for t in unique_techniques]
-        print(f"[MITRE ATT&CK] Event {event_type} mapped to: {', '.join(technique_list)}")
-        
         return {
             "techniques": unique_techniques,
             "evidence": {
@@ -784,9 +1342,9 @@ def classify_by_mitre_attck_windows(event_type, process_info, detection_details=
         }
     
     return None
-    
-def calculate_threat_score_windows(process_info, detection_events):
-    """Calculate a threat score for a Windows process based on its behavior and detections."""
+
+def calculate_threat_score(process_info, detection_events):
+    """Calculate a threat score for a process based on detections and context."""
     base_score = 0
     reasons = []
     
@@ -797,24 +1355,29 @@ def calculate_threat_score_windows(process_info, detection_events):
     port = process_info.get("port", 0)
     lineage = process_info.get("lineage", [])
     
-    # 1. Score based on user (system/admin processes get higher baseline)
-    if "system" in user or "administrator" in user:
+    # 1. Score based on user context
+    if "system" in user:
         base_score += 10
-        reasons.append("Running as privileged user")
+        reasons.append("Running as SYSTEM")
+    elif "admin" in user or "administrator" in user:
+        base_score += 8
+        reasons.append("Running as Administrator")
     
     # 2. Score based on process lineage
-    suspicious_lineage = False
-    suspicious_ancestry = ["cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", "rundll32.exe", "regsvr32.exe"]
+    suspicious_ancestry = ["cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe", 
+                         "rundll32.exe", "regsvr32.exe", "mshta.exe"]
+                         
     for proc in lineage:
         proc_lower = proc.lower()
-        if proc_lower in suspicious_ancestry:
-            suspicious_lineage = True
+        if proc_lower in [s.lower() for s in suspicious_ancestry]:
             base_score += 15
             reasons.append(f"Suspicious process in lineage: {proc}")
             break
     
     # 3. Score based on execution path
-    suspicious_paths = ["\\temp\\", "\\windows\\temp\\", "\\appdata\\local\\temp\\", "\\users\\public\\", "\\programdata\\"]
+    suspicious_paths = ["\\temp\\", "\\windows\\temp\\", "\\appdata\\local\\temp\\", 
+                      "\\users\\public\\", "\\programdata\\", "\\downloads\\"]
+                      
     for path in suspicious_paths:
         if path in exe_path:
             base_score += 25
@@ -829,13 +1392,13 @@ def calculate_threat_score_windows(process_info, detection_events):
             base_score += 30
             reasons.append(f"Listening on known malicious port: {port}")
         # Non-standard high ports (possibly suspicious)
-        elif port > 10000 and port not in [27017, 28017, 50070, 50075, 50030, 50060]:
+        elif port > 10000 and port not in [27017, 28017, 50070, 50075, 50030, 50060, 8080, 8443]:
             base_score += 15
             reasons.append(f"Listening on high non-standard port: {port}")
     
     # 5. Score based on detection events
     for event in detection_events:
-        event_type = event.get("event_type")
+        event_type = event.get("type", "")
         
         if event_type == "SUSPICIOUS_MEMORY_REGION":
             base_score += 40
@@ -848,7 +1411,7 @@ def calculate_threat_score_windows(process_info, detection_events):
         elif event_type == "ML_DETECTED_ANOMALY":
             # Score based on anomaly score
             details = event.get("details", {})
-            anomaly_score = details.get("anomaly_score", 0)
+            anomaly_score = details.get("score", 0)
             
             # More severe anomalies get higher scores
             if anomaly_score < -0.5:
@@ -862,10 +1425,10 @@ def calculate_threat_score_windows(process_info, detection_events):
                 reasons.append(f"Mild behavioral anomaly detected (score: {anomaly_score:.2f})")
                 
         elif event_type == "SUSPICIOUS_BEHAVIOR":
-            patterns = event.get("details", {}).get("suspicious_patterns", [])
+            patterns = event.get("details", [])
             if patterns:
                 for pattern in patterns:
-                    pattern_lower = pattern.lower()
+                    pattern_lower = pattern.lower() if isinstance(pattern, str) else ""
                     
                     if "webshell" in pattern_lower:
                         base_score += 40
@@ -886,7 +1449,7 @@ def calculate_threat_score_windows(process_info, detection_events):
                         base_score += 15
                         reasons.append(f"Suspicious behavior: {pattern}")
             else:
-                # Handle old format or simple pattern
+                # Handle simple pattern
                 base_score += 20
                 reasons.append("Suspicious behavior detected")
         
@@ -910,10 +1473,20 @@ def calculate_threat_score_windows(process_info, detection_events):
             base_score += 20
             reasons.append("Process lineage deviation")
     
-    # 6. Cap and categorize score
+    # 6. Special cases for known malicious processes
+    special_case_malware = [
+        "mimikatz", "meterpreter", "cobaltstrike", "empire", "beacon"
+    ]
+    
+    if any(malware in process_name or malware in exe_path 
+           for malware in special_case_malware):
+        base_score += 100
+        reasons.append(f"Known malicious tool signature: {process_name}")
+    
+    # 7. Cap and categorize score
     final_score = min(base_score, 100)
     
-    # Determine severity category
+# Determine severity category
     if final_score >= 80:
         severity = "critical"
     elif final_score >= 60:
@@ -930,64 +1503,422 @@ def calculate_threat_score_windows(process_info, detection_events):
         "severity": severity,
         "reasons": reasons
     }
+
+def monitor_listening_processes(interval=3):
+    """Main monitoring loop for detecting suspicious processes."""
+    global SERVICE_RUNNING
     
-def remove_process_tracking(pid):
-    """Remove process metadata from integrity_processes.json and process_hashes.txt using PID reference."""
-    process_hashes = load_process_hashes()
-    integrity_state = load_process_metadata()
+    # Setup tracking
+    known_processes = {}  # Store by key: pid:port
+    terminated_processes = set()  # Track terminated processes
+    ml_model_info = None
+    ml_retrain_counter = 0
+    alerted_processes = set()  # Avoid duplicate alerts
+    
+    # Initialize ML model if available
+    if ML_LIBRARIES_AVAILABLE:
+        ml_model_info = implement_behavioral_baselining()
+        logging.info("ML behavioral baselining completed")
+    
+    logging.info("Starting process monitoring...")
+    
+    # Load baselines
     known_lineages = load_known_lineages()
+    known_ports_mapping = load_known_ports()
+    
+    while SERVICE_RUNNING:
+        try:
+            # Get current listening processes
+            current_processes = get_listening_processes()
+            
+            # Identify new and terminated processes
+            current_keys = set(current_processes.keys())
+            known_keys = set(known_processes.keys())
+            
+            new_process_keys = current_keys - known_keys
+            terminated_process_keys = known_keys - current_keys
+            
+            # Process newly discovered listening processes
+            for key in new_process_keys:
+                process_info = current_processes[key]
+                pid = process_info.get("pid")
+                process_name = process_info.get("process_name")
+                port = process_info.get("port")
+                
+                logging.info(f"New listening process: {process_name} (PID: {pid}) on port {port}")
+                
+                # Save process info
+                update_process_tracking(
+                    process_info.get("exe_path"), 
+                    process_info.get("hash"), 
+                    process_info
+                )
+                
+                # Create baseline if none exists
+                if not known_ports_mapping:
+                    build_known_ports_baseline(current_processes)
+                    known_ports_mapping = load_known_ports()
+                
+                # Check for unusual port usage
+                port_alerts = check_for_unusual_port_use(process_info)
+                
+                # Check lineage
+                lineage_match = check_lineage_baseline(process_info, known_lineages)
+                if not lineage_match and process_info.get("lineage"):
+                    logging.warning(f"Lineage deviation detected for {process_name}")
+                    if port_alerts is False:
+                        port_alerts = []
+                    elif port_alerts is None:
+                        port_alerts = []
+                        
+                    # Create a new alert dictionary instead of trying to modify an existing string
+                    port_alerts.append({
+                        "type": "LINEAGE_DEVIATION",
+                        "details": {
+                            "process": process_name,
+                            "expected_lineage": known_lineages.get(process_name),
+                            "actual_lineage": process_info.get("lineage")
+                        }
+                    })
+                
+                # Log alerts for the new process
+                if port_alerts and isinstance(port_alerts, list):  # Make sure it's a list before iterating
+                    for alert in port_alerts:
+                        # Make sure alert is a dictionary
+                        if not isinstance(alert, dict):
+                            continue
+                            
+                        alert_type = alert.get("type", "UNKNOWN_ALERT")
+                        alert_details = alert.get("details", {})
+                        
+                        # Get MITRE ATT&CK classification
+                        mitre_info = classify_by_mitre_attck(alert_type, process_info, alert_details)
+                        
+                        logging.warning(f"Alert: {alert_type} for {process_name} (PID: {pid})")
+                        log_event_to_fim(
+                            event_type=alert_type,
+                            file_path=process_info.get("exe_path", ""),
+                            previous_metadata=None,
+                            new_metadata={
+                                "process_info": process_info,
+                                "alert_details": alert_details,
+                                "mitre_mapping": mitre_info
+                            },
+                            previous_hash=None,
+                            new_hash=process_info.get("hash", "")
+                        )
+            
+            # Process all active processes for behavioral/memory anomalies (not just new ones)
+            for key, process_info in current_processes.items():
+                # Skip if we've already alerted on this process recently
+                process_key = process_info.get("pid")
+                if process_key in alerted_processes:
+                    continue
+                
+                pid = process_info.get("pid")
+                
+                # Skip system process PID 4
+                if pid == 4:
+                    continue
+                    
+                process_name = process_info.get("process_name")
+                detection_events = []
+                
+                # 1. Memory analysis if admin privileges are available
+                if is_admin():
+                    try:
+                        suspicious_memory = scan_process_memory(pid, process_info)
+                        if suspicious_memory:
+                            logging.warning(f"Suspicious memory regions in PID {pid} ({process_name})")
+                            detection_events.append({
+                                "type": "SUSPICIOUS_MEMORY_REGION",
+                                "details": suspicious_memory
+                            })
+                    except Exception as e:
+                        logging.error(f"Error scanning memory for PID {pid}: {e}")
+                
+                # 2. Behavior analysis
+                try:
+                    suspicious_behaviors = analyze_process_behavior(pid, process_info)
+                    if suspicious_behaviors:
+                        logging.warning(f"Suspicious behavior in PID {pid} ({process_name})")
+                        detection_events.append({
+                            "type": "SUSPICIOUS_BEHAVIOR",
+                            "details": suspicious_behaviors
+                        })
+                except Exception as e:
+                    logging.error(f"Error analyzing behavior for PID {pid}: {e}")
+                
+                # 3. ML-based anomaly detection
+                if ml_model_info and ml_model_info.get('model'):
+                    try:
+                        anomaly_result = detect_anomalies_ml(process_info, ml_model_info)
+                        if anomaly_result and anomaly_result.get('is_anomaly'):
+                            score = anomaly_result.get('score', 0)
+                            logging.warning(
+                                f"ML-detected anomaly in PID {pid} ({process_name}), score: {score:.4f}"
+                            )
+                            detection_events.append({
+                                "type": "ML_DETECTED_ANOMALY",
+                                "details": anomaly_result
+                            })
+                    except Exception as e:
+                        logging.error(f"Error detecting ML anomalies for PID {pid}: {e}")
+                
+                # If we found detection events, calculate threat score and log them
+                if detection_events:
+                    # Calculate threat score
+                    try:
+                        threat_assessment = calculate_threat_score(process_info, detection_events)
+                        severity = threat_assessment.get("severity", "").upper()
+                        score = threat_assessment.get("score", 0)
+                        
+                        logging.warning(
+                            f"Threat assessment: {severity} (Score: {score}) - PID {pid} ({process_name})"
+                        )
+                        
+                        # Log all detections
+                        for event in detection_events:
+                            event_type = event.get("type")
+                            details = event.get("details")
+                            
+                            # Get MITRE mapping
+                            mitre_info = classify_by_mitre_attck(event_type, process_info, details)
+                            
+                            # Log to FIM system
+                            log_event_to_fim(
+                                event_type=event_type,
+                                file_path=process_info.get("exe_path", ""),
+                                previous_metadata=None,
+                                new_metadata={
+                                    "process_info": process_info,
+                                    "detection_details": details,
+                                    "mitre_mapping": mitre_info,
+                                    "threat_assessment": threat_assessment
+                                },
+                                previous_hash=None,
+                                new_hash=process_info.get("hash", "")
+                            )
+                        
+                        # Mark as alerted to avoid duplicate alerts
+                        alerted_processes.add(process_key)
+                    except Exception as e:
+                        logging.error(f"Error processing detection events for PID {pid}: {e}")
+            
+            # Handle terminated processes
+            for key in terminated_process_keys:
+                process_info = known_processes[key]
+                pid = process_info.get("pid")
+                process_name = process_info.get("process_name")
+                
+                logging.info(f"Process terminated: {process_name} (PID: {pid})")
+                
+                # Remove from tracking
+                remove_process_tracking(pid)
+                
+                # Log event
+                log_event_to_fim(
+                    event_type="PROCESS_TERMINATED",
+                    file_path=process_info.get("exe_path", ""),
+                    previous_metadata=process_info,
+                    new_metadata=None,
+                    previous_hash=process_info.get("hash", ""),
+                    new_hash=None
+                )
+            
+            # Periodically retrain ML model and reset alerts
+            ml_retrain_counter += 1
+            if ml_retrain_counter >= 20:  # Every ~60 seconds with 3s interval
+                logging.info("Retraining ML model and resetting alerts...")
+                if ML_LIBRARIES_AVAILABLE:
+                    ml_model_info = implement_behavioral_baselining()
+                ml_retrain_counter = 0
+                alerted_processes.clear()  # Allow processes to trigger alerts again
+            
+            # Update known processes
+            known_processes = current_processes
+            
+            # Sleep until next interval
+            time.sleep(interval)
+            
+        except Exception as e:
+            logging.error(f"Error in monitoring loop: {e}")
+            logging.debug(traceback.format_exc())
+            
+            # Sleep a bit longer on error to avoid error loops
+            time.sleep(max(interval, 5))
 
-    pid_str = str(pid)
+def log_event_to_fim(event_type, file_path, previous_metadata, new_metadata, previous_hash, new_hash):
+    """Log security events to a central JSON file for reporting."""
+    try:
+        # Define the log file path
+        pim_log_file = os.path.join(BASE_DIR, "logs", "pim.json")
+        os.makedirs(os.path.dirname(pim_log_file), exist_ok=True)
+        
+        # Create event data
+        event = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": event_type,
+            "file_path": file_path,
+            "previous_metadata": previous_metadata,
+            "new_metadata": new_metadata,
+            "previous_hash": previous_hash,
+            "new_hash": new_hash
+        }
+        
+        # Get current events
+        events = []
+        if os.path.exists(pim_log_file):
+            try:
+                with open(pim_log_file, "r") as f:
+                    events = json.load(f)
+            except json.JSONDecodeError:
+                logging.warning(f"Error parsing {pim_log_file}, starting fresh")
+                events = []
+            except Exception as e:
+                logging.error(f"Error reading {pim_log_file}: {e}")
+                events = []
+        
+        # Add new event
+        events.append(event)
+        
+        # Keep only last 1000 events to prevent file from growing too large
+        if len(events) > 1000:
+            events = events[-1000:]
+            
+        # Write updated events atomically
+        temp_file = f"{pim_log_file}.tmp"
+        try:
+            with open(temp_file, "w") as f:
+                json.dump(events, f, indent=2)
+                
+            # Replace original file with temp file (atomic operation)
+            os.replace(temp_file, pim_log_file)
+            
+            # Set secure permissions
+            set_secure_permissions(pim_log_file)
+            
+            logging.debug(f"Event logged successfully: {event_type}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to write to temp log file: {e}")
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+            return False
+            
+    except Exception as e:
+        logging.error(f"Failed to log event: {e}")
+        return False
 
-    if pid_str in integrity_state:
-        process_info = integrity_state[pid_str]
-        proc_name = process_info.get("process_name", "UNKNOWN")
-        lineage = process_info.get("lineage", [])
-
-        # Remove the process metadata
-        del integrity_state[pid_str]
-        save_process_metadata(integrity_state)
-
-        # Check if lineage for that process name should still be retained
-        still_running_with_same_lineage = any(
-            p.get("process_name") == proc_name and p.get("lineage") == known_lineages.get(proc_name)
-            for p in integrity_state.values()
-        )
-
-        if proc_name in known_lineages and not still_running_with_same_lineage:
-            print(f"[INFO] Removing lineage for {proc_name} from known_lineages.json")
-            del known_lineages[proc_name]
-            save_known_lineages(known_lineages)
-
-        # Remove from hash tracking if necessary
-        exe_path = process_info.get("exe_path")
-        if exe_path and exe_path in process_hashes:
-            del process_hashes[exe_path]
-            save_process_hashes(process_hashes)
-
-        print(f"[INFO] Process {pid_str} removed from tracking.")
-    else:
-        print(f"[WARNING] No matching process found for PID: {pid_str}. It may have already been removed.")
-
-def update_process_tracking(exe_path, process_hash, metadata):
-    """Update process tracking files with new or modified processes."""
-    process_hashes = load_process_hashes()
-    integrity_state = load_process_metadata()
-
-    pid = metadata["pid"]  # Ensure PID is used as a unique key
-
-    # Ensure we store entries separately even if they have the same exe_path
-    integrity_state[str(pid)] = metadata  # Store by PID instead of exe_path
-
-    # Update hash tracking separately
-    process_hashes[exe_path] = process_hash
-
-    # Save the updated process metadata and hashes
-    save_process_metadata(integrity_state)
-    save_process_hashes(process_hashes)
-
-# Windows Service class for PIM
-class PIMService(win32serviceutil.ServiceFramework):
+def periodic_integrity_scan(interval=120):
+    """Periodically scan processes for integrity issues and changes."""
+    global SERVICE_RUNNING
+    
+    logging.info("Starting periodic integrity scan...")
+    
+    while SERVICE_RUNNING:
+        try:
+            logging.info("Running integrity check on listening processes...")
+            
+            # Load stored process metadata
+            integrity_state = load_process_metadata()
+            
+            # Get current active processes
+            current_processes = get_listening_processes()
+            
+            # Check each active process against stored metadata
+            for key, current_info in current_processes.items():
+                pid_str = str(current_info.get("pid"))
+                
+                # Skip system process (PID 4)
+                if current_info.get("pid") == 4:
+                    continue
+                
+                # Skip if no stored metadata for this PID
+                if pid_str not in integrity_state:
+                    process_name = current_info.get("process_name", "UNKNOWN")
+                    if process_name != "UNKNOWN":  # Only log for valid processes
+                        logging.warning(f"Untracked process detected: PID {pid_str} ({process_name})")
+                        log_event_to_fim(
+                            event_type="NEW_UNTRACKED_PROCESS",
+                            file_path=current_info.get("exe_path", ""),
+                            previous_metadata=None,
+                            new_metadata=current_info,
+                            previous_hash=None,
+                            new_hash=current_info.get("hash", "")
+                        )
+                    continue
+                
+                # Get stored metadata
+                stored_info = integrity_state[pid_str]
+                
+                # Check for changes
+                changes_detected = False
+                
+                # Check for hash mismatch (only if valid hashes)
+                if (stored_info.get("hash") != current_info.get("hash") and 
+                    "ERROR" not in stored_info.get("hash", "") and 
+                    "ERROR" not in current_info.get("hash", "")):
+                    
+                    logging.warning(f"Hash mismatch detected for PID {pid_str} ({current_info.get('exe_path')})")
+                    log_event_to_fim(
+                        event_type="PROCESS_MODIFIED",
+                        file_path=current_info.get("exe_path", ""),
+                        previous_metadata=stored_info,
+                        new_metadata=current_info,
+                        previous_hash=stored_info.get("hash", ""),
+                        new_hash=current_info.get("hash", "")
+                    )
+                    changes_detected = True
+                
+                # Check for metadata changes
+                key_fields = ["exe_path", "user", "port", "cmdline"]
+                changed_fields = {}
+                
+                for field in key_fields:
+                    if stored_info.get(field) != current_info.get(field):
+                        changed_fields[field] = {
+                            "previous": stored_info.get(field),
+                            "current": current_info.get(field)
+                        }
+                
+                if changed_fields:
+                    logging.warning(
+                        f"Metadata changes detected for PID {pid_str}: {list(changed_fields.keys())}"
+                    )
+                    log_event_to_fim(
+                        event_type="PROCESS_METADATA_CHANGED",
+                        file_path=current_info.get("exe_path", ""),
+                        previous_metadata=stored_info,
+                        new_metadata=current_info,
+                        previous_hash=stored_info.get("hash", ""),
+                        new_hash=current_info.get("hash", "")
+                    )
+                    changes_detected = True
+                
+                # Update tracking if changes were detected
+                if changes_detected:
+                    update_process_tracking(
+                        current_info.get("exe_path", ""),
+                        current_info.get("hash", ""),
+                        current_info
+                    )
+            
+            # Sleep until next check
+            time.sleep(interval)
+            
+        except Exception as e:
+            logging.error(f"Error in periodic integrity scan: {e}")
+            logging.debug(traceback.format_exc())
+            time.sleep(interval)
+            
+class ProcessMonitorService(win32serviceutil.ServiceFramework):
+    """Windows Service implementation for Process Integrity Monitor."""
+    
     _svc_name_ = "MoniSecPIM"
     _svc_display_name_ = "MoniSec Process Integrity Monitor"
     _svc_description_ = "Monitors system processes for security integrity violations"
@@ -995,21 +1926,39 @@ class PIMService(win32serviceutil.ServiceFramework):
     def __init__(self, args):
         win32serviceutil.ServiceFramework.__init__(self, args)
         self.stop_event = win32event.CreateEvent(None, 0, 0, None)
-        self.running = False
+        self.is_running = False
         
+        # Setup logging
+        log_file = os.path.join(LOG_DIR, "pim_service.log")
+        os.makedirs(LOG_DIR, exist_ok=True)
+        
+        logging.basicConfig(
+            filename=log_file,
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+    
     def SvcStop(self):
-        """Stop the Windows service."""
+        """Stop the service."""
         global SERVICE_RUNNING
+        
+        logging.info("Service stop requested...")
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
         win32event.SetEvent(self.stop_event)
         SERVICE_RUNNING = False
-        self.running = False
+        self.is_running = False
     
     def SvcDoRun(self):
-        """Run the Windows service."""
+        """Run the service."""
         global SERVICE_RUNNING
-        self.running = True
-        SERVICE_RUNNING = True
+        
+        logging.info("Service starting...")
+        
+        # Initialize directories
+        ensure_directories()
+        ensure_file_exists(PROCESS_HASHES_FILE)
+        ensure_file_exists(INTEGRITY_PROCESS_FILE, {}, is_json=True)
+        ensure_file_exists(FILE_MONITOR_JSON, {}, is_json=True)
         
         import servicemanager
         servicemanager.LogMsg(
@@ -1018,112 +1967,98 @@ class PIMService(win32serviceutil.ServiceFramework):
             (self._svc_name_, '')
         )
         
-        # Initialize the monitoring system
-        self.initialize_and_run()
-    
-    def initialize_and_run(self):
-        """Initialize the PIM monitoring system and run it."""
+        SERVICE_RUNNING = True
+        self.is_running = True
+        
+        # Start monitor threads
         try:
-            ensure_output_dir()
-            ensure_file_monitor_json()
-            
-            # Write PID file
-            with open(PID_FILE, "w") as f:
-                f.write(str(os.getpid()))
-                
-            # Start the monitoring
-            print("[INFO] MoniSec Process Integrity Monitor service started")
-            
-            # Log all listening processes on startup
-            print("[INFO] Logging all listening processes on startup...")
-            initial_processes = get_listening_processes()
-            
-            # Generate baseline if not present
-            if not os.path.exists(KNOWN_PORTS_FILE):
-                build_known_ports_baseline(initial_processes)
-                
-            # Load existing lineage map or create new one
-            known_lineages = load_known_lineages()
-            
-            # Track and validate lineage for all currently listening processes
-            for pid, info in initial_processes.items():
-                update_process_tracking(info["exe_path"], info["hash"], info)
-                check_lineage_baseline(info, known_lineages)
-                
-            print("[INFO] Initial process tracking complete.")
-            
-            # Start the periodic integrity check thread
-            integrity_thread = threading.Thread(target=rescan_listening_processes, daemon=True)
+            # Start integrity scan thread
+            integrity_thread = threading.Thread(
+                target=periodic_integrity_scan,
+                daemon=True
+            )
             integrity_thread.start()
             
-            # Run the main monitoring loop
+            # Run main monitoring loop
             monitor_listening_processes()
             
         except Exception as e:
-            print(f"[ERROR] Error in PIM service: {e}")
-            traceback.print_exc()
+            logging.error(f"Service error: {e}")
+            logging.debug(traceback.format_exc())
+            self.SvcStop()
 
 def run_as_console():
-    """Run the PIM service in console mode."""
+    """Run the monitor in console mode."""
+    global SERVICE_RUNNING
+    
+    # Configure logging to console and file
+    log_file = os.path.join(LOG_DIR, "pim_console.log")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    
+    logging.info("Starting Process Integrity Monitor in console mode...")
+    
+    # Initialize directories
+    ensure_directories()
+    ensure_file_exists(PROCESS_HASHES_FILE)
+    ensure_file_exists(INTEGRITY_PROCESS_FILE, {}, is_json=True)
+    ensure_file_exists(FILE_MONITOR_JSON, [], is_json=True)
+    
+    # Set signal handlers
+    def handle_shutdown(signum=None, frame=None):
+        global SERVICE_RUNNING
+        logging.info("Shutdown signal received, stopping...")
+        SERVICE_RUNNING = False
+        sys.exit(0)
+    
+    # Register signal handlers if possible
     try:
-        ensure_output_dir()
-        ensure_file_monitor_json()
-        
-        # Write PID file
-        with open(PID_FILE, "w") as f:
-            f.write(str(os.getpid()))
-        
-        print("[INFO] MoniSec Process Integrity Monitor started in console mode")
-        
-        # Set signal handlers for graceful shutdown
-        def handle_shutdown(signum, frame):
-            global SERVICE_RUNNING
-            print("\n[INFO] Shutdown signal received, stopping...")
-            SERVICE_RUNNING = False
-            sys.exit(0)
-            
-        # Register signal handlers if possible
-        try:
+        # Windows doesn't support all signals, use what's available
+        if hasattr(signal, 'SIGINT'):
             signal.signal(signal.SIGINT, handle_shutdown)
+        if hasattr(signal, 'SIGTERM'):
             signal.signal(signal.SIGTERM, handle_shutdown)
-        except (AttributeError, ValueError):
-            # Some signals might not be available on Windows
-            pass
-        
-        # Log all listening processes on startup
-        print("[INFO] Logging all listening processes on startup...")
-        initial_processes = get_listening_processes()
-        
-        # Generate baseline if not present
-        if not os.path.exists(KNOWN_PORTS_FILE):
-            build_known_ports_baseline(initial_processes)
             
-        # Load existing lineage map or create new one
-        known_lineages = load_known_lineages()
-        
-        # Track and validate lineage for all currently listening processes
-        for pid, info in initial_processes.items():
-            update_process_tracking(info["exe_path"], info["hash"], info)
-            check_lineage_baseline(info, known_lineages)
-            
-        print("[INFO] Initial process tracking complete.")
-        
-        # Start the periodic integrity check thread
-        integrity_thread = threading.Thread(target=rescan_listening_processes, daemon=True)
+        # Set up Windows-specific signal handling
+        win32api.SetConsoleCtrlHandler(
+            lambda event_type: handle_shutdown() if event_type in (0, 1) else None, 
+            True
+        )
+    except Exception as e:
+        logging.warning(f"Could not set up all signal handlers: {e}")
+    
+    SERVICE_RUNNING = True
+    
+    # Start monitor threads
+    try:
+        # Start integrity scan thread
+        integrity_thread = threading.Thread(
+            target=periodic_integrity_scan,
+            daemon=True
+        )
         integrity_thread.start()
         
-        # Run the main monitoring loop
+        # Run main monitoring loop
         monitor_listening_processes()
         
+    except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received, stopping...")
+        SERVICE_RUNNING = False
     except Exception as e:
-        print(f"[ERROR] Error in PIM console mode: {e}")
-        traceback.print_exc()
-    finally:
-        # Clean up on exit
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+        logging.error(f"Error in console mode: {e}")
+        logging.debug(traceback.format_exc())
+        SERVICE_RUNNING = False
 
 def print_help():
+    """Print help information."""
     help_text = """
 Process Integrity Monitor (PIM) for Windows - Help Menu
 
@@ -1134,6 +2069,7 @@ Usage:
   python pim.py start         Start the installed PIM service
   python pim.py stop          Stop the PIM service
   python pim.py restart       Restart the PIM service
+  python pim.py debug         Run in debug mode with extra logging
   python pim.py help          Show this help message
 
 Description:
@@ -1143,8 +2079,9 @@ Description:
     - Unexpected changes in process metadata (user, hash, command line, etc.)
     - Suspicious memory regions (e.g., shellcode injection or unsigned code)
     - Windows-specific behavioral anomalies
+    - Machine learning based anomaly detection
 
-  It uses logging and alerting to flag any anomalies and supports integration with SIEM tools.
+  It logs alerts and integrates with SIEM tools.
 
 Note:
   Administrative privileges are required for full functionality.
@@ -1167,8 +2104,12 @@ if __name__ == "__main__":
             
         elif command == "install":
             try:
+                # Ensure script path is absolute
+                script_path = os.path.abspath(__file__)
+                pythonpath = sys.executable
+                
                 win32serviceutil.InstallService(
-                    pythonClassString=f"{os.path.basename(__file__).replace('.py', '')}.PIMService",
+                    pythonClassString=f"{os.path.basename(__file__).replace('.py', '')}.ProcessMonitorService",
                     serviceName="MoniSecPIM",
                     displayName="MoniSec Process Integrity Monitor",
                     description="Monitors system processes for security integrity violations",
@@ -1209,13 +2150,12 @@ if __name__ == "__main__":
         elif command == "debug":
             # Special debug mode with extra logging
             print("[INFO] Starting in debug mode with extra logging...")
-            logging.basicConfig(level=logging.DEBUG)
+            logging.getLogger('').setLevel(logging.DEBUG)
             run_as_console()
         
-        # For service operation
         elif command in ["--service", "--foreground"]:
             # When the service manager executes the service
-            win32serviceutil.HandleCommandLine(PIMService)
+            win32serviceutil.HandleCommandLine(ProcessMonitorService)
             
         else:
             print(f"[ERROR] Unknown command: {command}")
@@ -1224,884 +2164,3 @@ if __name__ == "__main__":
     else:
         # Default: run in console mode
         run_as_console()
-1059", 
-                "technique_name": "Command and Scripting Interpreter",
-                "tactic": "Execution"
-            }],
-            "UNUSUAL_PORT_USE": [{
-                "technique_id": "T1571", 
-                "technique_name": "Non-Standard Port",
-                "tactic": "Command and Control"
-            }],
-            "PROCESS_MODIFIED": [{
-                "technique_id": "T1055", 
-                "technique_name": "Process Injection",
-                "tactic": "Defense Evasion"
-            }],
-            "SUSPICIOUS_MEMORY_REGION": [{
-                "technique_id": "T1055", 
-                "technique_name": "Process Injection",
-                "tactic": "Defense Evasion"
-            }],
-            "LINEAGE_DEVIATION": [{
-                "technique_id": "T1036", 
-                "technique_name": "Masquerading",
-                "tactic": "Defense Evasion"
-            }],
-            "ML_DETECTED_ANOMALY": [
-                {
-                    "technique_id": "T1036", 
-                    "technique_name": "Masquerading",
-                    "tactic": "Defense Evasion"
-                },
-                {
-                    "technique_id": "T1059", 
-                    "technique_name": "Command and Scripting Interpreter",
-                    "tactic": "Execution"
-                }
-            ],
-            "SUSPICIOUS_BEHAVIOR": [
-                {
-                    "technique_id": "T1059", 
-                    "technique_name": "Command and Scripting Interpreter",
-                    "tactic": "Execution"
-                }
-            ]
-        }
-    
-    # Context-based classification enhancements for Windows
-    process_name = process_info.get("process_name", "").lower()
-    cmdline = process_info.get("cmdline", "").lower()
-    user = process_info.get("user", "").lower()
-    
-    # Build contextual insights
-    context_insights = []
-    
-    # Special handling for SUSPICIOUS_BEHAVIOR events with pattern field
-    if event_type == "SUSPICIOUS_BEHAVIOR" and detection_details:
-        # Handle the patterns list format
-        if "suspicious_patterns" in detection_details:
-            patterns = detection_details.get("suspicious_patterns", [])
-            
-            for pattern in patterns:
-                pattern_lower = pattern.lower()
-                
-                if "unusual directory" in pattern_lower or "temp directory" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1074", 
-                        "technique_name": "Data Staged",
-                        "tactic": "Collection",
-                        "evidence": pattern
-                    })
-                    
-                elif "unusual port" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1571", 
-                        "technique_name": "Non-Standard Port",
-                        "tactic": "Command and Control",
-                        "evidence": pattern
-                    })
-                    
-                elif "encoded command" in pattern_lower or "powershell" in pattern_lower and ("encoded" in pattern_lower or "-enc" in pattern_lower):
-                    context_insights.append({
-                        "technique_id": "T1027", 
-                        "technique_name": "Obfuscated Files or Information",
-                        "tactic": "Defense Evasion",
-                        "evidence": pattern
-                    })
-                    
-                elif "webshell" in pattern_lower or "w3wp.exe" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1505.003", 
-                        "technique_name": "Server Software Component: Web Shell",
-                        "tactic": "Persistence",
-                        "evidence": pattern
-                    })
-                    
-                elif "lolbin" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1218", 
-                        "technique_name": "Signed Binary Proxy Execution",
-                        "tactic": "Defense Evasion",
-                        "evidence": pattern
-                    })
-    
-    # Windows-specific process name checks
-    if process_name in ["powershell.exe", "pwsh.exe"]:
-        context_insights.append({
-            "technique_id": "T1059.001",
-            "technique_name": "Command and Scripting Interpreter: PowerShell",
-            "tactic": "Execution"
-        })
-    elif process_name in ["cmd.exe"]:
-        context_insights.append({
-            "technique_id": "T# =============================================================================
-# FIMonsec Tool - File Integrity Monitoring Security Solution (Windows Version)
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
-#          system integrity monitoring with real-time alerting capabilities. It monitors
-#          critical system and application files for unauthorized modifications,
-#          supports baseline comparisons, and integrates with SIEM solutions.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
-import os
-import time
-import json
-import sys
-import subprocess
-import hashlib
-import signal
-import argparse
-import threading
-import traceback
-import win32api
-import win32con
-import win32service
-import win32serviceutil
-import win32process
-import win32security
-import win32file
-import wmi
-import psutil
-import socket
-import ctypes
-from pathlib import Path
-
-# New imports for ML and analysis
-# Optional: for better error handling with ML libraries
-try:
-    import numpy as np
-    import pandas as pd
-    from sklearn.ensemble import IsolationForest
-    ML_LIBRARIES_AVAILABLE = True
-except ImportError:
-    print("[WARNING] Machine learning libraries (numpy, pandas, scikit-learn) not found. ML-based detection will be disabled.")
-    ML_LIBRARIES_AVAILABLE = False
-
-# Define BASE_DIR for Windows
-BASE_DIR = os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), "FIMoniSec\\Windows-Client")
-
-# Update paths for Windows
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-LOG_FILE = os.path.join(LOG_DIR, "process_monitor.log")
-PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
-INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
-PID_FILE = os.path.join(OUTPUT_DIR, "pim.pid")
-FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
-KNOWN_PORTS_FILE = os.path.join(OUTPUT_DIR, "known_ports.json")
-KNOWN_LINEAGES_FILE = os.path.join(OUTPUT_DIR, "known_lineages.json")
-
-# Global WMI connection for better performance
-try:
-    WMI_CONNECTION = wmi.WMI()
-except Exception as e:
-    print(f"[ERROR] Failed to initialize WMI connection: {e}")
-    WMI_CONNECTION = None
-
-# Global flag to control service operation
-SERVICE_RUNNING = True
-
-def is_admin():
-    """Check if the script is running with administrator privileges"""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except:
-        return False
-
-def ensure_output_dir():
-    """Ensure that the output directory and necessary files exist."""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # Ensure process hashes file exists
-    if not os.path.exists(PROCESS_HASHES_FILE):
-        with open(PROCESS_HASHES_FILE, "w") as f:
-            f.write("")
-        # Set Windows file security (Admins only)
-        try:
-            sd = win32security.GetFileSecurity(
-                PROCESS_HASHES_FILE, 
-                win32security.DACL_SECURITY_INFORMATION
-            )
-            dacl = win32security.ACL()
-            
-            admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-            system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-            
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-            
-            sd.SetSecurityDescriptorDacl(1, dacl, 0)
-            win32security.SetFileSecurity(
-                PROCESS_HASHES_FILE, 
-                win32security.DACL_SECURITY_INFORMATION, 
-                sd
-            )
-        except Exception as e:
-            print(f"[ERROR] Failed to set secure permissions on {PROCESS_HASHES_FILE}: {e}")
-
-    # Ensure integrity state file exists
-    if not os.path.exists(INTEGRITY_PROCESS_FILE):
-        with open(INTEGRITY_PROCESS_FILE, "w") as f:
-            json.dump({}, f, indent=4)
-        # Set Windows file security
-        try:
-            sd = win32security.GetFileSecurity(
-                INTEGRITY_PROCESS_FILE, 
-                win32security.DACL_SECURITY_INFORMATION
-            )
-            dacl = win32security.ACL()
-            
-            admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-            system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-            
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-            
-            sd.SetSecurityDescriptorDacl(1, dacl, 0)
-            win32security.SetFileSecurity(
-                INTEGRITY_PROCESS_FILE, 
-                win32security.DACL_SECURITY_INFORMATION, 
-                sd
-            )
-        except Exception as e:
-            print(f"[ERROR] Failed to set secure permissions on {INTEGRITY_PROCESS_FILE}: {e}")
-
-def ensure_file_monitor_json():
-    """Ensure that the file_monitor.json file exists and create logs directory if needed."""
-    os.makedirs(LOG_DIR, exist_ok=True)
-
-    if not os.path.exists(FILE_MONITOR_JSON):
-        with open(FILE_MONITOR_JSON, "w") as f:
-            json.dump({}, f, indent=4)
-        # Set Windows file security
-        try:
-            sd = win32security.GetFileSecurity(
-                FILE_MONITOR_JSON, 
-                win32security.DACL_SECURITY_INFORMATION
-            )
-            dacl = win32security.ACL()
-            
-            admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-            system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-            
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-            
-            sd.SetSecurityDescriptorDacl(1, dacl, 0)
-            win32security.SetFileSecurity(
-                FILE_MONITOR_JSON, 
-                win32security.DACL_SECURITY_INFORMATION, 
-                sd
-            )
-        except Exception as e:
-            print(f"[ERROR] Failed to set secure permissions on {FILE_MONITOR_JSON}: {e}")
-
-# Initialize directories
-ensure_file_monitor_json()
-
-def load_process_hashes():
-    """Load stored process hashes from process_hashes.txt."""
-    if os.path.exists(PROCESS_HASHES_FILE):
-        with open(PROCESS_HASHES_FILE, "r") as f:
-            try:
-                return dict(line.strip().split(":", 1) for line in f if ":" in line)
-            except ValueError:
-                return {}
-    return {}
-
-def save_process_hashes(process_hashes):
-    """Save process hashes to process_hashes.txt safely."""
-    temp_file = f"{PROCESS_HASHES_FILE}.tmp"
-    with open(temp_file, "w") as f:
-        for exe_path, hash_value in process_hashes.items():
-            f.write(f"{exe_path}:{hash_value}\n")
-
-    os.replace(temp_file, PROCESS_HASHES_FILE)
-    # Set Windows file security
-    try:
-        sd = win32security.GetFileSecurity(
-            PROCESS_HASHES_FILE, 
-            win32security.DACL_SECURITY_INFORMATION
-        )
-        dacl = win32security.ACL()
-        
-        admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-        system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-        
-        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-        
-        sd.SetSecurityDescriptorDacl(1, dacl, 0)
-        win32security.SetFileSecurity(
-            PROCESS_HASHES_FILE, 
-            win32security.DACL_SECURITY_INFORMATION, 
-            sd
-        )
-    except Exception as e:
-        print(f"[ERROR] Failed to set secure permissions on {PROCESS_HASHES_FILE}: {e}")
-
-def load_process_metadata():
-    """Load stored process metadata from integrity_processes.json."""
-    if os.path.exists(INTEGRITY_PROCESS_FILE):
-        try:
-            with open(INTEGRITY_PROCESS_FILE, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return {}
-    return {}
-
-def save_process_metadata(processes):
-    """Save full process metadata to integrity_processes.json safely."""
-    temp_file = f"{INTEGRITY_PROCESS_FILE}.tmp"
-    try:
-        with open(temp_file, "w") as f:
-            json.dump(processes, f, indent=4)
-
-        os.replace(temp_file, INTEGRITY_PROCESS_FILE)
-        # Set Windows file security
-        try:
-            sd = win32security.GetFileSecurity(
-                INTEGRITY_PROCESS_FILE, 
-                win32security.DACL_SECURITY_INFORMATION
-            )
-            dacl = win32security.ACL()
-            
-            admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-            system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-            
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-            dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-            
-            sd.SetSecurityDescriptorDacl(1, dacl, 0)
-            win32security.SetFileSecurity(
-                INTEGRITY_PROCESS_FILE, 
-                win32security.DACL_SECURITY_INFORMATION, 
-                sd
-            )
-        except Exception as e:
-            print(f"[ERROR] Failed to set secure permissions on {INTEGRITY_PROCESS_FILE}: {e}")
-
-    except Exception as e:
-        print(f"[ERROR] Failed to write to {INTEGRITY_PROCESS_FILE}: {e}", file=sys.stderr)
-
-def get_process_hash(exe_path, cmdline=None):
-    """Generate SHA-256 hash of the process executable and optionally include cmdline."""
-    try:
-        hash_obj = hashlib.sha256()
-
-        # Hash the executable file
-        try:
-            with open(exe_path, "rb") as f:
-                hash_obj.update(f.read())
-        except PermissionError:
-            # Try to open with read sharing for Windows system files
-            try:
-                handle = win32file.CreateFile(
-                    exe_path,
-                    win32file.GENERIC_READ,
-                    win32file.FILE_SHARE_READ,
-                    None,
-                    win32file.OPEN_EXISTING,
-                    0,
-                    None
-                )
-                
-                try:
-                    # Read the file in chunks
-                    file_size = win32file.GetFileSize(handle)
-                    chunks_read = 0
-                    buffer_size = 1024 * 1024  # 1MB buffer
-                    
-                    while chunks_read < file_size:
-                        hr, data = win32file.ReadFile(handle, min(buffer_size, file_size - chunks_read))
-                        hash_obj.update(data)
-                        chunks_read += len(data)
-                        
-                finally:
-                    win32file.CloseHandle(handle)
-            except Exception as e:
-                print(f"[ERROR] Failed to hash file {exe_path}: {e}")
-                return "ERROR_HASHING"
-
-        # Optionally include command-line arguments in hashing
-        if cmdline:
-            hash_obj.update(cmdline.encode("utf-8"))
-
-        return hash_obj.hexdigest()
-
-    except Exception as e:
-        print(f"[ERROR] Failed to hash {exe_path}: {e}")
-        return "ERROR_HASHING"
-
-def get_listening_processes():
-    """Retrieve all listening processes and their metadata using Windows APIs."""
-    listening_processes = {}
-
-    try:
-        # Use netstat to get listening ports
-        netstat_output = subprocess.check_output("netstat -ano -p TCP", shell=True, text=True)
-        netstat_lines = netstat_output.splitlines()
-        
-        # Extract port and PID information
-        for line in netstat_lines:
-            if "LISTENING" not in line:
-                continue
-                
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
-                
-            # Extract local address and PID
-            local_address = parts[1]
-            pid = int(parts[4])
-            
-            # Extract port number
-            try:
-                port = int(local_address.split(":")[-1])
-            except (IndexError, ValueError):
-                port = "UNKNOWN"
-            
-            # Get process information using psutil
-            try:
-                proc = psutil.Process(pid)
-                
-                try:
-                    exe_path = proc.exe()
-                except (psutil.AccessDenied, FileNotFoundError):
-                    exe_path = "ACCESS_DENIED"
-                
-                try:
-                    cmdline = " ".join(proc.cmdline())
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    cmdline = "ACCESS_DENIED"
-                
-                try:
-                    start_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(proc.create_time()))
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    start_time = "UNKNOWN"
-                
-                try:
-                    username = proc.username()
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    username = "UNKNOWN"
-                
-                try:
-                    ppid = proc.ppid()
-                except (psutil.AccessDenied, psutil.NoSuchProcess):
-                    ppid = "UNKNOWN"
-                
-                # Get process hash
-                if exe_path != "ACCESS_DENIED":
-                    process_hash = get_process_hash(exe_path, cmdline)
-                else:
-                    process_hash = "ACCESS_DENIED"
-                
-                # Get process lineage
-                lineage = resolve_lineage(pid)
-                
-                # Store process information
-                listening_processes[pid] = {
-                    "pid": pid,
-                    "exe_path": exe_path,
-                    "process_name": os.path.basename(exe_path) if exe_path != "ACCESS_DENIED" else "UNKNOWN",
-                    "port": port,
-                    "user": username,
-                    "start_time": start_time,
-                    "cmdline": cmdline,
-                    "hash": process_hash,
-                    "ppid": ppid,
-                    "lineage": lineage
-                }
-                
-            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                print(f"[ERROR] Failed to get information for PID {pid}: {e}")
-    
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to execute netstat command: {e}")
-    
-    return listening_processes
-
-def load_known_ports():
-    """Load the known process-port mapping."""
-    if not os.path.exists(KNOWN_PORTS_FILE):
-        return {}
-    with open(KNOWN_PORTS_FILE, "r") as f:
-        return json.load(f)
-
-def save_known_ports(mapping):
-    """Save the process-port mapping to known_ports.json."""
-    with open(KNOWN_PORTS_FILE, "w") as f:
-        json.dump(mapping, f, indent=4)
-    # Set Windows file security
-    try:
-        sd = win32security.GetFileSecurity(
-            KNOWN_PORTS_FILE, 
-            win32security.DACL_SECURITY_INFORMATION
-        )
-        dacl = win32security.ACL()
-        
-        admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-        system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-        
-        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-        
-        sd.SetSecurityDescriptorDacl(1, dacl, 0)
-        win32security.SetFileSecurity(
-            KNOWN_PORTS_FILE, 
-            win32security.DACL_SECURITY_INFORMATION, 
-            sd
-        )
-    except Exception as e:
-        print(f"[ERROR] Failed to set secure permissions on {KNOWN_PORTS_FILE}: {e}")
-
-def build_known_ports_baseline(processes):
-    known_ports = {}
-
-    for proc in processes.values():
-        proc_name = proc.get("process_name", "UNKNOWN")
-        if proc_name == "UNKNOWN":
-            continue
-
-        if proc_name not in known_ports:
-            known_ports[proc_name] = {
-                "ports": [],
-                "metadata": proc  # store full metadata
-            }
-
-        port = proc.get("port")
-        if port not in known_ports[proc_name]["ports"]:
-            known_ports[proc_name]["ports"].append(port)
-
-    with open(KNOWN_PORTS_FILE, "w") as f:
-        json.dump(known_ports, f, indent=4)
-    # Set Windows file security
-    try:
-        sd = win32security.GetFileSecurity(
-            KNOWN_PORTS_FILE, 
-            win32security.DACL_SECURITY_INFORMATION
-        )
-        dacl = win32security.ACL()
-        
-        admin_sid = win32security.CreateWellKnownSid(win32security.WinBuiltinAdministratorsSid, None)
-        system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-        
-        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, admin_sid)
-        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.FILE_ALL_ACCESS, system_sid)
-        
-        sd.SetSecurityDescriptorDacl(1, dacl, 0)
-        win32security.SetFileSecurity(
-            KNOWN_PORTS_FILE, 
-            win32security.DACL_SECURITY_INFORMATION, 
-            sd
-        )
-    except Exception as e:
-        print(f"[ERROR] Failed to set secure permissions on {KNOWN_PORTS_FILE}: {e}")
-
-def check_for_unusual_port_use(process_info):
-    """Check if a process is listening on a non-standard port or has unexpected metadata."""
-    if not os.path.exists(KNOWN_PORTS_FILE):
-        return
-
-    try:
-        with open(KNOWN_PORTS_FILE, "r") as f:
-            known_ports = json.load(f)
-    except Exception as e:
-        print(f"[ERROR] Could not read known_ports.json: {e}")
-        return
-
-    from fim_client import log_event
-
-    proc_name = process_info.get("process_name")
-    proc_port = str(process_info.get("port"))
-
-    if proc_name not in known_ports:
-        return
-
-    expected_ports = list(map(str, known_ports[proc_name].get("ports", [])))
-    baseline_metadata = known_ports[proc_name].get("metadata", {})
-
-    if proc_port not in expected_ports:
-        print(f"[ALERT] {proc_name} listening on unexpected port {proc_port}. Expected: {expected_ports}")
-        log_event(
-            event_type="UNUSUAL_PORT_USE",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    # Individual alerts for specific metadata mismatches
-    if baseline_metadata.get("exe_path") != process_info.get("exe_path"):
-        print(f"[ALERT] Executable path mismatch for {proc_name}: expected '{baseline_metadata.get('exe_path')}', got '{process_info.get('exe_path')}'")
-        log_event(
-            event_type="EXECUTABLE_PATH_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    if baseline_metadata.get("cmdline") != process_info.get("cmdline"):
-        print(f"[ALERT] Command-line mismatch for {proc_name}: expected '{baseline_metadata.get('cmdline')}', got '{process_info.get('cmdline')}'")
-        log_event(
-            event_type="CMDLINE_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    if baseline_metadata.get("hash") != process_info.get("hash"):
-        print(f"[ALERT] Binary hash mismatch for {proc_name}: expected '{baseline_metadata.get('hash')}', got '{process_info.get('hash')}'")
-        log_event(
-            event_type="HASH_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    if baseline_metadata.get("user") != process_info.get("user"):
-        print(f"[ALERT] User mismatch for {proc_name}: expected '{baseline_metadata.get('user')}', got '{process_info.get('user')}'")
-        log_event(
-            event_type="USER_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-def monitor_listening_processes(interval=2):
-    """Enhanced monitoring loop with ML-based detection for Windows processes."""
-    known_lineages = load_known_lineages()
-    known_processes = get_listening_processes()
-    terminated_pids = set()
-    
-    # Initialize ML model if available
-    ml_model_info = None
-    if ML_LIBRARIES_AVAILABLE:
-        ml_model_info = implement_behavioral_baselining()
-    ml_retrain_counter = 0
-    
-    # Initialize detection history and already alerted processes
-    detection_history = {}
-    alerted_processes = set()
-    
-    print("[INFO] Starting enhanced process monitoring with ML-based detection...")
-    
-    while SERVICE_RUNNING:
-        try:
-            current_processes = get_listening_processes()
-            new_processes = {pid: info for pid, info in current_processes.items() if pid not in known_processes}
-            terminated_processes = {pid: info for pid, info in known_processes.items() if pid not in current_processes}
-            
-            from fim_client import log_event
-            
-            # Process all currently active processes
-            for pid, info in current_processes.items():
-                # Skip if we've already alerted on this process recently
-                if pid in alerted_processes:
-                    continue
-                
-                detection_events = []
-                
-                # 1. Memory analysis for code injection (Windows-specific)
-                suspicious_memory = scan_process_memory_windows(pid)
-                if suspicious_memory:
-                    print(f"[ALERT] Suspicious memory regions detected in PID {pid} ({info.get('process_name', 'unknown')})")
-                    detection_events.append({
-                        "event_type": "SUSPICIOUS_MEMORY_REGION",
-                        "details": suspicious_memory
-                    })
-                
-                # 1.5 Behavioral pattern detection
-                behavioral_patterns = analyze_process_for_windows_anomalies(pid, info)
-                if behavioral_patterns:
-                    print(f"[ALERT] Suspicious behavioral patterns detected in PID {pid} ({info.get('process_name', 'unknown')})")
-                    for pattern in behavioral_patterns.get("suspicious_patterns", []):
-                        print(f"  - {pattern}")
-                    
-                    detection_events.append({
-                        "event_type": "SUSPICIOUS_BEHAVIOR",
-                        "details": behavioral_patterns
-                    })
-                
-                # 2. ML-based anomaly detection if model exists
-                if ml_model_info and ml_model_info['model'] and len(current_processes) >= 5:
-                    model = ml_model_info['model']
-                    feature_names = ml_model_info['features']
-                    system_processes = ml_model_info.get('system_processes', [])
-                    
-                    # Skip ML detection for certain system processes
-                    process_name = info.get('process_name', '')
-                    if process_name.lower() in system_processes and pid <= 4:
-                        continue
-                    
-                    # Prepare features for this process
-                    process_features = {}
-                    try:
-                        process_features = {
-                            'port': int(info.get('port', 0)) if isinstance(info.get('port', 0), (int, str)) and str(info.get('port', 0)).isdigit() else 0,
-                            'lineage_length': len(info.get('lineage', [])),
-                            'cmdline_length': len(info.get('cmdline', '')),
-                            'user_is_admin': 1 if info.get('user', '').lower().endswith('administrator') else 0,
-                            'child_processes': get_child_process_count_windows(pid),
-                            'handle_count': get_handle_count_windows(pid) 
-                        }
-                        
-                        mem_usage = get_process_memory_usage_windows(pid)
-                        if mem_usage:
-                            process_features['memory_usage'] = mem_usage
-                    except Exception as e:
-                        print(f"[ERROR] Error extracting features for ML prediction on PID {pid}: {e}")
-                        continue
-                    
-                    # Create a DataFrame with proper feature names
-                    features_for_prediction = {}
-                    for feature in feature_names:
-                        features_for_prediction[feature] = process_features.get(feature, 0)
-                    
-                    import pandas as pd
-                    prediction = model.predict(pd.DataFrame([features_for_prediction]))[0]
-                    
-                    if prediction == -1:  # Anomaly
-                        # Calculate anomaly score
-                        anomaly_score = model.decision_function(pd.DataFrame([features_for_prediction]))[0]
-                        
-                        # Only alert on more significant anomalies
-                        if anomaly_score < -0.1:  # Threshold to reduce noise
-                            print(f"[ALERT] ML-detected anomaly in process behavior: PID {pid} ({info.get('process_name', 'unknown')})")
-                            print(f"  Anomaly score: {anomaly_score:.4f}")
-                            print(f"  Command: {info.get('cmdline', 'N/A')}")
-                            
-                            detection_events.append({
-                                "event_type": "ML_DETECTED_ANOMALY",
-                                "details": {
-                                    "anomaly_score": anomaly_score,
-                                    "features": process_features
-                                }
-                            })
-                
-                # Calculate threat score if we have any detection events
-                if detection_events:
-                    threat_assessment = calculate_threat_score_windows(info, detection_events)
-                    print(f"[THREAT SCORE] PID {pid} ({info.get('process_name', 'unknown')}): {threat_assessment['score']}/100")
-                    print(f"[THREAT SEVERITY] {threat_assessment['severity'].upper()}")
-                    for reason in threat_assessment['reasons']:
-                        print(f"  - {reason}")
-                    
-                    # Add threat score to all events
-                    for event in detection_events:
-                        event["threat_assessment"] = threat_assessment
-                
-                # 3. MITRE ATT&CK classification for any detections
-                for event in detection_events:
-                    details = event.get("details")
-                    mitre_info = classify_by_mitre_attck_windows(event["event_type"], info, details)
-                    if mitre_info:
-                        event["mitre"] = mitre_info
-                
-                # 4. Log all detection events
-                if detection_events:
-                    # Add to detection history and mark as alerted
-                    if pid not in detection_history:
-                        detection_history[pid] = []
-                    detection_history[pid].extend(detection_events)
-                    alerted_processes.add(pid)
-                    
-                    # Log each event
-                    for event in detection_events:
-                        log_event(
-                            event_type=event["event_type"],
-                            file_path=info.get("exe_path", "UNKNOWN"),
-                            previous_metadata=None,
-                            new_metadata={
-                                "process_info": info,
-                                "detection_details": event.get("details", {}),
-                                "mitre_mapping": event.get("mitre", {}),
-                                "threat_assessment": event.get("threat_assessment", {})
-                            },
-                            previous_hash=None,
-                            new_hash=info.get("hash", "UNKNOWN")
-                        )
-            
-            # Handle new processes
-            for pid, info in new_processes.items():
-                log_event(
-                    event_type="NEW_LISTENING_PROCESS",
-                    file_path=info["exe_path"],
-                    previous_metadata=None,
-                    new_metadata=info,
-                    previous_hash=None,
-                    new_hash=info.get("hash", "UNKNOWN")
-                )
-                update_process_tracking(info["exe_path"], info["hash"], info)
-                check_for_unusual_port_use(info)
-                check_lineage_baseline(info, known_lineages)
-            
-            # Handle terminated processes
-            for pid, info in terminated_processes.items():
-                if pid in terminated_pids:
-                    continue
-                
-                stored_info = load_process_metadata().get(str(pid), None)
-                log_event(
-                    event_type="PROCESS_TERMINATED",
-                    file_path=info["exe_path"] if stored_info else "UNKNOWN",
-                    previous_metadata=stored_info if stored_info else "UNKNOWN",
-                    new_metadata=None,
-                    previous_hash=stored_info["hash"] if stored_info else "UNKNOWN",
-                    new_hash=None
-                )
-                remove_process_tracking(str(pid))
-                terminated_pids.add(pid)
-                
-                # Remove from detection history when process terminates
-                if pid in detection_history:
-                    del detection_history[pid]
-                if pid in alerted_processes:
-                    alerted_processes.remove(pid)
-            
-            # Periodically clear the alerted_processes set and retrain model
-            ml_retrain_counter += 1
-            if ml_retrain_counter >= 60:  # Every ~2 minutes
-                print("[INFO] Retraining ML model and resetting alerts...")
-                if ML_LIBRARIES_AVAILABLE:
-                    ml_model_info = implement_behavioral_baselining()
-                ml_retrain_counter = 0
-                alerted_processes.clear()  # Allow processes to trigger alerts again
-            
-            known_processes = current_processes
-            time.sleep(interval)
-            
-        except Exception as e:
-            print(f"[ERROR] Exception in enhanced monitoring loop: {e}")
-            traceback.print_exc()
-            continue
