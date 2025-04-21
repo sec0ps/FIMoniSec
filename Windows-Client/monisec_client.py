@@ -36,8 +36,8 @@ import sys
 import threading
 import json
 import signal
-import remote
-import updater
+#import remote
+#import updater
 import socket
 import ctypes
 import win32api
