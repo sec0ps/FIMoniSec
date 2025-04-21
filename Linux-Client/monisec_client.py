@@ -34,16 +34,21 @@ import subprocess
 import logging
 import sys
 import signal
-import remote
 import threading
+import atexit
 import json
+import remote
 import updater
 #import yara
-from malscan_yara import ensure_rules_exist, update_rules, compile_rules, yara_scan_file
+#from malscan_yara import ensure_rules_exist, update_rules, compile_rules, yara_scan_file
 from pathlib import Path
+from utils.process_guardian import ProcessGuardian
 
 # Define BASE_DIR as a static path
+# In monisec_client.py
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+UTILS_DIR = os.path.join(BASE_DIR, "utils")
+sys.path.append(UTILS_DIR)
 
 # Define CONFIG_FILE using the BASE_DIR
 CONFIG_FILE = os.path.join(BASE_DIR, "fim.config")
@@ -215,6 +220,38 @@ def create_default_config():
     print(f"[INFO] Default configuration file created at {CONFIG_FILE}. Please update it as needed.")
     return default_config
 
+## Process Protection and Watchdog ###
+
+# Initialize process guardian at the beginning of execution
+def initialize_process_protection():
+    """Initialize process protection mechanisms."""
+    # Protected processes to monitor
+    protected_processes = [
+        "monisec_client.py",
+        "fim.py",
+        "lim.py",
+        "pim.py"
+    ]
+    
+    # Create and start the process guardian
+    guardian = ProcessGuardian(
+        process_names=protected_processes,
+        pid_file=os.path.join(BASE_DIR, "output", "monisec_client.pid"),
+        foreground_mode=True,
+        install_signals=False
+    )
+    
+    # Start monitoring for process termination
+    guardian.start_monitoring()
+    
+    # Set higher process priority to make it harder to terminate
+    guardian.set_process_priority(-10)
+    
+    # Prevent core dumps to avoid leaking sensitive information
+    guardian.prevent_core_dumps()
+    
+    return guardian
+
 def load_or_create_config():
     """
     Load the configuration file if it exists, otherwise create it with default settings.
@@ -250,8 +287,17 @@ config = load_or_create_config()
 
 def start_process(name):
     if name in PROCESSES:
-        if is_process_running(name):
-            logging.info(f"{name} is already running.")
+        # Check if the process is already running and how many instances exist
+        instances = is_process_running(name, count_instances=True)
+        
+        if instances > 0:
+            pid = is_process_running(name)
+            logging.info(f"{name} is already running with PID {pid}.")
+            
+            # If multiple instances are running, terminate the newer ones
+            if instances > 1:
+                logging.warning(f"Multiple {name} instances detected. Cleaning up duplicates...")
+                cleanup_duplicate_processes(name)
         else:
             logging.info(f"Starting {name}...")
             process = subprocess.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -323,12 +369,16 @@ def restart_process(name):
             logging.error(f"Failed to restart {name} after multiple attempts")
             return False
 
-def is_process_running(name):
+def is_process_running(name, count_instances=False):
     """
     Check if a specific process is running by comparing executable name.
-    Returns the PID if running, None otherwise.
+    By default returns the PID if running, None otherwise.
+    If count_instances=True, returns the count of running instances instead.
     """
-    for proc in psutil.process_iter(attrs=['pid', 'name', 'cmdline']):
+    instance_count = 0
+    found_pids = []
+    
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
             exe_name = proc.info['name']
             cmdline = " ".join(proc.info['cmdline']) if proc.info['cmdline'] else ""
@@ -340,9 +390,23 @@ def is_process_running(name):
                 f"/{name}.py" in cmdline,
                 f"./{name}.py" in cmdline
             ]):
-                return proc.info['pid']
+                instance_count += 1
+                found_pids.append(proc.info['pid'])
+                
+                # Log duplicate processes
+                if instance_count > 1:
+                    logging.warning(f"Duplicate {name} instance found with PID {proc.info['pid']}")
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
+    
+    if count_instances:
+        return instance_count
+    
+    if len(found_pids) > 1:
+        # Get the oldest process (lower PID typically started earlier)
+        return min(found_pids)
+    elif found_pids:
+        return found_pids[0]
     return None
     
 def force_stop_process(name):
@@ -358,6 +422,37 @@ def force_stop_process(name):
             logging.error(f"Error force stopping {name}: {e}")
             return False
     return True  # Already stopped
+
+def cleanup_duplicate_processes(name):
+    """Terminate duplicate instances of a process, keeping only the oldest one."""
+    process_list = []
+    
+    # Find all instances of the process
+    for proc in psutil.process_iter(['pid', 'cmdline', 'create_time']):
+        try:
+            if proc.info['cmdline'] and any(f"{name}.py" in cmd for cmd in proc.info['cmdline']):
+                process_list.append({
+                    'pid': proc.pid,
+                    'create_time': proc.create_time()
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    # Sort by creation time (oldest first)
+    process_list.sort(key=lambda x: x['create_time'])
+    
+    # Keep the oldest process, terminate others
+    if len(process_list) > 1:
+        kept_pid = process_list[0]['pid']
+        
+        for proc in process_list[1:]:
+            try:
+                logging.warning(f"Terminating duplicate {name} process with PID {proc['pid']}")
+                os.kill(proc['pid'], signal.SIGTERM)
+            except Exception as e:
+                logging.error(f"Failed to terminate process {proc['pid']}: {e}")
+                
+        logging.info(f"Kept oldest instance of {name} with PID {kept_pid}")
 
 def monitor_processes():
     """
@@ -390,7 +485,6 @@ def monitor_processes():
                 else:
                     logging.error(f"Failed to restart {name} after multiple attempts")
                     all_running = False
-            # Removed debug logging here
         
         # Adaptive sleep: shorter interval if there were issues, longer if stable
         if processes_checked > 0:  # Only sleep if we're monitoring at least one process
@@ -403,7 +497,32 @@ def monitor_processes():
 
 def stop_monisec_client_daemon():
     """Stop the MoniSec client running in daemon mode."""
-    pidfile = "/tmp/monisec_client.pid"
+    pidfile = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+    
+    # Create control file to stop ProcessGuardian monitoring
+    control_file = os.path.join(BASE_DIR, "output", "guardian_stop_monitoring")
+    try:
+        with open(control_file, 'w') as f:
+            f.write(str(os.getpid()))
+        logging.info("Signal sent to stop ProcessGuardian monitoring")
+    except Exception as e:
+        logging.error(f"Failed to create control file: {e}")
+    
+    # Allow a moment for ProcessGuardian to notice
+    time.sleep(1)
+    
+    # Find and stop all child processes first
+    for name in ["fim_client", "pim", "lim"]:
+        pid = is_process_running(name)
+        if pid:
+            logging.info(f"Stopping {name} with PID {pid}...")
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError as e:
+                logging.error(f"Error stopping {name}: {e}")
+                
+    # Wait briefly for children to exit         
+    time.sleep(1)
     
     try:
         if os.path.exists(pidfile):
@@ -412,7 +531,7 @@ def stop_monisec_client_daemon():
             
             # Check if process is actually running
             try:
-                os.kill(pid, 0)
+                os.kill(pid, 0)  # Signal 0 doesn't kill but checks if process exists
                 logging.info(f"Sending SIGTERM to MoniSec client daemon (PID: {pid})")
                 os.kill(pid, signal.SIGTERM)
                 
@@ -423,21 +542,33 @@ def stop_monisec_client_daemon():
                         time.sleep(1)
                     except OSError:
                         logging.info("MoniSec client daemon stopped successfully.")
-                        os.remove(pidfile)
+                        # Remove the control file
+                        if os.path.exists(control_file):
+                            os.remove(control_file)
+                        if os.path.exists(pidfile):
+                            os.remove(pidfile)
                         return True
                 
                 # Force kill if not terminated
                 os.kill(pid, signal.SIGKILL)
-                os.remove(pidfile)
+                if os.path.exists(pidfile):
+                    os.remove(pidfile)
+                if os.path.exists(control_file):
+                    os.remove(control_file)
                 logging.warning("MoniSec client daemon forcefully terminated.")
                 return True
             
             except OSError:
                 logging.warning("No running MoniSec client daemon found.")
-                os.remove(pidfile)
+                if os.path.exists(pidfile):
+                    os.remove(pidfile)
+                if os.path.exists(control_file):
+                    os.remove(control_file)
                 return False
         else:
             logging.warning("No PID file found. MoniSec client daemon might not be running.")
+            if os.path.exists(control_file):
+                os.remove(control_file)
             return False
     
     except Exception as e:
@@ -446,7 +577,7 @@ def stop_monisec_client_daemon():
 
 def start_daemon():
     """Start MoniSec client in daemon mode with PID file tracking."""
-    pidfile = "/tmp/monisec_client.pid"
+    pidfile = os.path.join(BASE_DIR, "output", "monisec_client.pid")
     
     pid = os.fork()
     if pid > 0:
@@ -465,32 +596,151 @@ def start_daemon():
     listener_thread.start()
 
     monitor_processes()
+
+def start_watchdog(delay=15):
+    """
+    Start the watchdog process as a separate process with a delay.
     
+    Args:
+        delay (int): Number of seconds to wait before starting the watchdog
+    """
+    watchdog_path = os.path.join(BASE_DIR, "utils", "watchdog.py")
+    
+    try:
+        # Create a thread to handle the delayed execution
+        def delayed_start():
+            logging.info(f"Waiting {delay} seconds before starting watchdog...")
+            time.sleep(delay)
+            
+            # Start the watchdog in daemon mode
+            process = subprocess.Popen(
+                ["python3", watchdog_path, "-d"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            logging.info(f"Started watchdog process after {delay} second delay with PID {process.pid}")
+        
+        # Start the delayed execution in a separate thread
+        start_thread = threading.Thread(target=delayed_start, daemon=True)
+        start_thread.start()
+        logging.info(f"Scheduled watchdog to start with {delay} second delay")
+        
+    except Exception as e:
+        logging.error(f"Failed to start watchdog process: {e}")
+
 # Handle graceful shutdown on keyboard interrupt
 def handle_exit(signum, frame):
-    logging.info("Keyboard interrupt received. Stopping MoniSec client and all related processes...")
+    """Handle graceful shutdown on keyboard interrupt or termination signal."""
+    logging.info(f"Signal {signum} received. Stopping MoniSec client and all related processes...")
 
     # Prevent double SIGINT behavior
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    
+    # Create control file to stop ProcessGuardian monitoring
+    control_file = os.path.join(BASE_DIR, "output", "guardian_stop_monitoring")
+    monisec_manages_file = os.path.join(BASE_DIR, "output", "monisec_manages_processes")
+    
+    try:
+        with open(control_file, 'w') as f:
+            f.write(str(os.getpid()))
+        logging.info("Signal sent to stop ProcessGuardian monitoring")
+        
+        # Remove the monisec manages file
+        if os.path.exists(monisec_manages_file):
+            os.remove(monisec_manages_file)
+    except Exception as e:
+        logging.error(f"Failed to create control file: {e}")
+    
+    # Give ProcessGuardian a moment to notice
+    time.sleep(1)
+    
+    # Get a list of all child process PIDs to terminate
+    child_processes = []
+    for name in ["fim_client", "pim", "lim"]:
+        pid = is_process_running(name)
+        if pid:
+            child_processes.append((name, pid))
+            logging.info(f"Stopping {name} with PID {pid}...")
+            try:
+                # Send SIGTERM first for graceful shutdown
+                os.kill(pid, signal.SIGTERM)
+            except OSError as e:
+                logging.error(f"Error stopping {name}: {e}")
 
-    stop_process("fim_client")
-    stop_process("pim")
-    stop_process("lim")  # Add this line
-
-    time.sleep(2)
+    # Wait for processes to terminate gracefully
+    max_wait = 5  # seconds
+    start_time = time.time()
+    while time.time() - start_time < max_wait and child_processes:
+        for name, pid in list(child_processes):  # Use list() to allow modifying during iteration
+            try:
+                # Check if process still exists
+                os.kill(pid, 0)  # Signal 0 doesn't kill but checks if process exists
+                # Process still running, continue waiting
+            except OSError:
+                # Process no longer exists
+                logging.info(f"{name} (PID {pid}) terminated.")
+                child_processes.remove((name, pid))
+        
+        if child_processes:
+            time.sleep(0.5)  # Short wait before checking again
+    
+    # Force kill any remaining processes
+    for name, pid in child_processes:
+        logging.warning(f"{name} (PID {pid}) did not terminate gracefully. Forcing...")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass  # Process might already be gone
+    
+    # Make sure all child processes are terminated
+    for name in ["fim_client", "pim", "lim"]:
+        pid = is_process_running(name)
+        if pid:
+            logging.warning(f"Process {name} still running with PID {pid}. Force killing...")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass  # Process might already be gone
+    
+    # Cleanup control file
+    if os.path.exists(control_file):
+        try:
+            os.remove(control_file)
+        except OSError:
+            pass
+    
+    # Cleanup pid file
+    pid_file = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+    if os.path.exists(pid_file):
+        try:
+            os.remove(pid_file)
+            logging.info(f"Removed PID file: {pid_file}")
+        except OSError:
+            pass
+    
+    time.sleep(1)  # Brief pause to allow final cleanups
+    
     logging.info("MoniSec client shutdown complete.")
     sys.exit(0)
-
+    
 # Register signal handler for graceful shutdown
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
 if __name__ == "__main__":
+    # Define flag to skip guardian initialization for stop/restart commands
+    no_guardian = len(sys.argv) > 1 and sys.argv[1] in ["stop", "restart"]
+    
+    # Only initialize guardian if not stopping or restarting
+    if not no_guardian:
+        guardian = initialize_process_protection()
+    
     # Process commands first
     if len(sys.argv) > 1:
         action = sys.argv[1]
 
-        # Commands that don't need YARA initialization
         if action == "import-psk":
             remote.import_psk()
             sys.exit(0)
@@ -508,30 +758,6 @@ if __name__ == "__main__":
             else:
                 print("[ERROR] Invalid command. Usage: monisec_client auth test")
                 sys.exit(1)
-        
-        # All other commands will continue and may need YARA initialization
-        
-        # Initialize YARA if needed for other commands
-        try:
-            from malscan_yara import YaraManager
-            # Create an instance of the YaraManager
-            yara_manager = YaraManager()
-            
-            try:
-                if not yara_manager.ensure_rules_exist():
-                    logging.warning("Failed to download YARA rules. Some detection capabilities may be limited.")
-            except Exception as e:
-                logging.error(f"Error ensuring YARA rules: {e}")
-        except ImportError:
-            logging.error("Could not import malscan_yara module. YARA scanning will be unavailable.")
-
-        # Check if we should run the updater
-        should_run_updater = action == "-d"
-        if should_run_updater:
-            try:
-                updater.check_for_updates()
-            except Exception as e:
-                logging.warning(f"Updater failed: {e}")
 
         # Command processing continues here
         if action == "restart":
@@ -541,6 +767,7 @@ if __name__ == "__main__":
 
         elif action == "stop":
             stop_monisec_client_daemon()
+            sys.exit(0)  # Exit immediately after stopping
 
         elif action in ["pim", "fim", "lim"]:
             if len(sys.argv) > 2 and sys.argv[2] in ["start", "stop", "restart"]:
@@ -556,49 +783,52 @@ if __name__ == "__main__":
                 print(f"[ERROR] Invalid command. Usage: monisec_client {action} start|stop|restart")
                 sys.exit(1)
                 
-        # Update YARA rules command
-        elif action == "update-yara":
-            print("[INFO] Updating YARA rules from GitHub...")
-            success = update_rules()
-            if success:
-                print("[SUCCESS] YARA rules updated successfully.")
-                sys.exit(0)
-            else:
-                print("[ERROR] Failed to update YARA rules.")
-                sys.exit(1)
-                
-        # Test YARA scan on a file
-        elif action == "yara-scan":
-            if len(sys.argv) > 2:
-                file_path = sys.argv[2]
-                print(f"[INFO] Scanning file {file_path} with YARA rules...")
-                
-                # Ensure rules are compiled
-                if not compile_rules():
-                    print("[ERROR] Failed to compile YARA rules.")
-                    sys.exit(1)
-                
-                # Scan the file
-                matches = yara_scan_file(file_path)
-                
-                if matches:
-                    print(f"[ALERT] Found {len(matches)} YARA rule matches:")
-                    for match in matches:
-                        print(f"  - Rule: {match.rule}")
-                        print(f"    Namespace: {match.namespace}")
-                        print(f"    Tags: {', '.join(match.tags) if match.tags else 'None'}")
-                        print(f"    Meta: {match.meta}")
-                        print("")
-                else:
-                    print("[INFO] No YARA rule matches found.")
-                
-                sys.exit(0)
-            else:
-                print("[ERROR] Invalid command. Usage: monisec_client yara-scan <file_path>")
-                sys.exit(1)
-                
         # Daemon mode
         elif action == "-d":
+            # Run updater in daemon mode
+            try:
+                updater.check_for_updates()
+            except Exception as e:
+                logging.warning(f"Updater failed: {e}")
+            
+            # Check if already running - with improved stale PID detection
+            pid_file = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+            
+            # Force remove any existing PID file regardless of content
+            if os.path.exists(pid_file):
+                try:
+                    os.remove(pid_file)
+                    logging.info(f"Removed existing PID file at startup")
+                except Exception as e:
+                    logging.error(f"Failed to remove existing PID file: {e}")
+            
+            # Scan for any potentially running processes
+            running_monisec_processes = []
+            for proc in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    cmdline = " ".join(proc.info['cmdline'] or [])
+                    # Only count it if it's not our current process
+                    if "monisec_client.py" in cmdline and "-d" in cmdline and proc.info['pid'] != os.getpid():
+                        running_monisec_processes.append(proc.info['pid'])
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            if running_monisec_processes:
+                print(f"MoniSec client is already running with PID {running_monisec_processes[0]}")
+                sys.exit(0)
+            
+            # Clean up any existing orphaned child processes
+            for name in ["fim_client", "pim", "lim"]:
+                instances = is_process_running(name, count_instances=True)
+                if instances > 0:
+                    logging.info(f"Found {instances} orphaned {name} processes. Cleaning up...")
+                    cleanup_duplicate_processes(name)
+            
+            # Create output directory if it doesn't exist
+            output_dir = os.path.join(BASE_DIR, "output")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Start the daemon process
             pid = os.fork()
             if pid > 0:
                 sys.exit(0)
@@ -606,22 +836,44 @@ if __name__ == "__main__":
             os.umask(0)
             sys.stdin = open(os.devnull, 'r')
         
-            # Write PID to file
-            with open("/tmp/monisec_client.pid", 'w') as f:
-                f.write(str(os.getpid()))
+            # Set path to PID file using absolute path
+            pid_file = os.path.abspath(os.path.join(output_dir, "monisec_client.pid"))
+            
+            # Write PID to file with error handling
+            try:
+                with open(pid_file, 'w') as f:
+                    f.write(str(os.getpid()))
+                logging.info(f"Created PID file with PID {os.getpid()}")
+            except Exception as e:
+                logging.error(f"Failed to create PID file: {e}")
+            
+            # Create a flag file to tell ProcessGuardian not to manage these processes
+            monisec_manages_file = os.path.join(output_dir, "monisec_manages_processes")
+            with open(monisec_manages_file, 'w') as f:
+                f.write("true")
+                
+            # Make sure the guardian stop monitoring file doesn't exist
+            control_file = os.path.join(output_dir, "guardian_stop_monitoring")
+            if os.path.exists(control_file):
+                os.remove(control_file)
         
             logging.info("MoniSec Endpoint Monitor started in daemon mode.")
         
-            # Add this line to start log transmission in daemon mode
+            # Start the watchdog BEFORE entering the monitoring loop
+            start_watchdog(delay=15)
+            
             # Check authentication first
             remote.check_auth_and_send_logs()
             
             # Let start_listener_if_authorized handle the listener starting
-            # This function will check auth token validity internally
             remote.start_listener_if_authorized()
             
+            # Register exit handler for the daemon process
+            atexit.register(lambda: os.path.exists(monisec_manages_file) and os.remove(monisec_manages_file))
+            
+            # This is an infinite loop that never returns
             monitor_processes()
-
+    
         # Invalid command
         else:
             print(
@@ -633,25 +885,14 @@ if __name__ == "__main__":
             monisec_client lim start|stop|restart   # Control LIM process
             monisec_client import-psk               # Import PSK for authentication
             monisec_client auth test                # Test authentication, then exit
-            monisec_client update-yara              # Update YARA rules from GitHub
-            monisec_client yara-scan <file_path>    # Scan a file with YARA rules"""
+"""
             )
             sys.exit(1)
 
     else:
-        # No command-line arguments, initialize YARA
-        try:
-            from malscan_yara import YaraManager
-            # Create an instance of the YaraManager
-            yara_manager = YaraManager()
-            
-            try:
-                if not yara_manager.ensure_rules_exist():
-                    logging.warning("Failed to download YARA rules. Some detection capabilities may be limited.")
-            except Exception as e:
-                logging.error(f"Error ensuring YARA rules: {e}")
-        except ImportError:
-            logging.error("Could not import malscan_yara module. YARA scanning will be unavailable.")
+        # Only initialize guardian for foreground mode
+        if not no_guardian and 'guardian' not in locals():
+            guardian = initialize_process_protection()
 
         # Run updater in foreground mode
         try:
@@ -683,4 +924,13 @@ if __name__ == "__main__":
             # Start WebSocket client (after authentication)
             remote.start_websocket_client()
             
+        # Create the flag file for foreground mode too
+        monisec_manages_file = os.path.join(BASE_DIR, "output", "monisec_manages_processes")
+        with open(monisec_manages_file, 'w') as f:
+            f.write("true")
+            
+        # Register cleanup on exit
+        atexit.register(lambda: os.path.exists(monisec_manages_file) and os.remove(monisec_manages_file))
+        
+        # Start monitoring
         monitor_processes()
