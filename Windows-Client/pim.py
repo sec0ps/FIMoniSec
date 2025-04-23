@@ -56,7 +56,6 @@ import wmi
 import psutil
 import signal
 
-# Optional ML imports with proper error handling
 try:
     import numpy as np
     import pandas as pd
@@ -66,7 +65,6 @@ except ImportError:
     print("[WARNING] Machine learning libraries not found. ML-based detection disabled.")
     ML_LIBRARIES_AVAILABLE = False
 
-# Define paths for Windows
 BASE_DIR = os.path.join(os.environ.get('PROGRAMFILES', 'C:\\Program Files'), "FIMoniSec\\Windows-Client")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -75,7 +73,6 @@ INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
 PID_FILE = os.path.join(OUTPUT_DIR, "pim.pid")
 FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
 
-# Global flags
 SERVICE_RUNNING = True
 MEMORY_SCAN_ENABLED = True
 MEMORY_SCAN_FAILURES = 0
@@ -287,7 +284,34 @@ def update_process_tracking(exe_path, process_hash, process_info):
     if cmdline:
         cmd_pattern = simplify_command_line(cmdline)
         if cmd_pattern and cmd_pattern not in process_group["command_line_patterns"]:
-            process_group["command_line_patterns"].append(cmd_pattern)
+            # Special handling for Chrome and other browsers to avoid pattern explosion
+            browser_processes = ["chrome.exe", "firefox.exe", "msedge.exe", "brave.exe"]
+            is_browser = process_name.lower() in [b.lower() for b in browser_processes]
+            
+            if is_browser:
+                # For browsers, limit the number of command line patterns
+                # to avoid excessive patterns from different tabs/extensions
+                if len(process_group["command_line_patterns"]) < 30:
+                    process_group["command_line_patterns"].append(cmd_pattern)
+                else:
+                    # For browsers, only replace patterns if this is significantly different
+                    # Find the most similar pattern to potentially replace
+                    most_similar_idx = -1
+                    most_similar_score = 0
+                    
+                    for i, pattern in enumerate(process_group["command_line_patterns"]):
+                        # Simple similarity score - count of common words
+                        common_words = len(set(pattern.split()).intersection(set(cmd_pattern.split())))
+                        if common_words > most_similar_score:
+                            most_similar_score = common_words
+                            most_similar_idx = i
+                    
+                    # Replace if significantly different from all existing patterns
+                    if most_similar_score < 5 and most_similar_idx >= 0:
+                        process_group["command_line_patterns"][most_similar_idx] = cmd_pattern
+            else:
+                # For non-browser processes, just add the pattern
+                process_group["command_line_patterns"].append(cmd_pattern)
     
     # Update lineage patterns - use existing check_lineage_baseline for comparison
     if lineage:
@@ -303,7 +327,17 @@ def update_process_tracking(exe_path, process_hash, process_info):
                 break
                 
         if not lineage_matched:
-            process_group["common_lineage_patterns"].append(lineage)
+            # Special handling for browser processes to avoid pattern explosion
+            browser_processes = ["chrome.exe", "firefox.exe", "msedge.exe", "brave.exe"]
+            is_browser = process_name.lower() in [b.lower() for b in browser_processes]
+            
+            if is_browser:
+                # For browsers, limit the number of lineage patterns
+                if len(process_group["common_lineage_patterns"]) < 10:
+                    process_group["common_lineage_patterns"].append(lineage)
+            else:
+                # For non-browser processes, just add the pattern
+                process_group["common_lineage_patterns"].append(lineage)
     # --- End Process Group Tracking Enhancement ---
 
     # Save updates
@@ -556,6 +590,15 @@ def check_lineage_baseline(process_info, integrity_state, allow_flexible_match=T
                 if "svchost.exe" in lineage[i].lower() and "svchost.exe" in baseline[i].lower():
                     continue
                 elif "services.exe" in lineage[i].lower() and "services.exe" in baseline[i].lower():
+                    continue
+                elif "explorer.exe" in lineage[i].lower() and "explorer.exe" in baseline[i].lower():
+                    continue
+                # Special case for browser sub-processes
+                elif any(b in lineage[i].lower() and b in baseline[i].lower() 
+                       for b in ["chrome.exe", "firefox.exe", "msedge.exe", "brave.exe"]):
+                    continue
+                # Special case for System vs Windows processes
+                elif lineage[i].lower() in ["system", "smss.exe", "wininit.exe"] and baseline[i].lower() in ["system", "smss.exe", "wininit.exe"]:
                     continue
                 
                 # Different process in important position - significant mismatch
@@ -1087,7 +1130,7 @@ def scan_process_memory(pid, process_info=None):
     return suspicious_regions
 
 def get_process_stats(pid):
-    """Get detailed statistics about a process for behavioral analysis."""
+    """Get detailed statistics about a process for enhanced behavioral analysis."""
     stats = {
         "memory_usage_kb": 0,
         "cpu_percent": 0,
@@ -1096,24 +1139,82 @@ def get_process_stats(pid):
         "child_process_count": 0,
         "io_read_bytes": 0,
         "io_write_bytes": 0,
-        "connection_count": 0
+        "connection_count": 0,
+        "working_set_size_kb": 0,
+        "virtual_memory_kb": 0,
+        "page_faults": 0,
+        "peak_memory_kb": 0,
+        "thread_details": [],
+        "cpu_times": {"user": 0, "system": 0, "idle": 0},
+        "active_window_count": 0,
+        "uptime_seconds": 0,
+        "memory_percent": 0
     }
     
     try:
         process = psutil.Process(pid)
         
-        # CPU and memory stats
-        stats["cpu_percent"] = process.cpu_percent(interval=0.1)
-        stats["memory_usage_kb"] = process.memory_info().rss // 1024
+        # CPU and memory stats with retries for better reliability
+        for _ in range(2):  # Try twice to get a better CPU sample
+            try:
+                stats["cpu_percent"] = process.cpu_percent(interval=0.1)
+                if stats["cpu_percent"] > 0:  # If we got a valid reading, stop
+                    break
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                break
+            
+        # Get detailed memory info
+        try:
+            mem_info = process.memory_info()
+            stats["memory_usage_kb"] = mem_info.rss // 1024
+            stats["working_set_size_kb"] = mem_info.rss // 1024
+            stats["virtual_memory_kb"] = mem_info.vms // 1024
+            # Use memory_full_info if available for more details
+            try:
+                mem_full = process.memory_full_info()
+                stats["peak_memory_kb"] = getattr(mem_full, 'peak', 0) // 1024
+                stats["page_faults"] = getattr(mem_full, 'num_page_faults', 0)
+            except (psutil.AccessDenied, AttributeError):
+                pass
+            # Calculate percentage of system memory
+            stats["memory_percent"] = process.memory_percent()
+        except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
+            pass
         
         # Resource usage
-        stats["handle_count"] = process.num_handles() if hasattr(process, 'num_handles') else 0
-        stats["thread_count"] = process.num_threads()
+        try:
+            stats["handle_count"] = process.num_handles() if hasattr(process, 'num_handles') else 0
+        except (psutil.AccessDenied, AttributeError):
+            pass
+            
+        # Thread details with error handling
+        try:
+            threads = process.threads()
+            stats["thread_count"] = len(threads)
+            
+            # Collect thread creation times and CPU usage for anomaly detection
+            thread_details = []
+            for thread in threads[:10]:  # Limit to first 10 threads to avoid overhead
+                thread_details.append({
+                    "id": thread.id,
+                    "user_time": thread.user_time,
+                    "system_time": thread.system_time
+                })
+            stats["thread_details"] = thread_details
+        except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
+            # Fallback thread count method
+            try:
+                stats["thread_count"] = process.num_threads()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
         
         # Child processes
-        stats["child_process_count"] = len(process.children())
+        try:
+            stats["child_process_count"] = len(process.children())
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
         
-        # IO stats
+        # IO stats with error handling
         try:
             io_counters = process.io_counters()
             stats["io_read_bytes"] = io_counters.read_bytes
@@ -1121,14 +1222,74 @@ def get_process_stats(pid):
         except (psutil.AccessDenied, AttributeError):
             pass
         
-        # Network connections - use net_connections() instead of connections()
+        # Network connections with better error handling
         try:
-            # Use the new net_connections() method
-            connections = process.net_connections()
+            # Use net_connections() with proper timeout
+            connections = []
+            try:
+                connections = process.net_connections(kind='all')
+            except psutil.AccessDenied:
+                # Try with just inet connections if all fails
+                try:
+                    connections = process.net_connections(kind='inet')
+                except:
+                    pass
+            
             stats["connection_count"] = len(connections)
-        except (psutil.AccessDenied, AttributeError) as e:
+            
+            # Enhanced network stats: count by connection status
+            status_counts = {"ESTABLISHED": 0, "LISTEN": 0, "CLOSE_WAIT": 0, "TIME_WAIT": 0, "NONE": 0}
+            
+            for conn in connections:
+                status = conn.status if hasattr(conn, 'status') else "NONE"
+                if status in status_counts:
+                    status_counts[status] += 1
+                else:
+                    status_counts["NONE"] += 1
+            
+            stats["connection_statuses"] = status_counts
+            
+        except (psutil.AccessDenied, AttributeError, psutil.NoSuchProcess) as e:
             logging.debug(f"Could not get network connections for PID {pid}: {e}")
-            stats["connection_count"] = 0
+        
+        # CPU times (user/system/idle)
+        try:
+            cpu_times = process.cpu_times()
+            stats["cpu_times"] = {
+                "user": cpu_times.user,
+                "system": cpu_times.system,
+                "idle": 0  # Not directly available per process
+            }
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+        
+        # Calculate process uptime
+        try:
+            stats["uptime_seconds"] = time.time() - process.create_time()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            pass
+            
+        # Windows-specific: try to get UI window count for GUI processes
+        try:
+            import ctypes
+            EnumWindows = ctypes.windll.user32.EnumWindows
+            EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+            GetWindowThreadProcessId = ctypes.windll.user32.GetWindowThreadProcessId
+            
+            windows = []
+            
+            def enum_windows_callback(hwnd, lParam):
+                window_pid = ctypes.c_int()
+                GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+                if window_pid.value == pid:
+                    windows.append(hwnd)
+                return True
+                
+            EnumWindows(EnumWindowsProc(enum_windows_callback), 0)
+            stats["active_window_count"] = len(windows)
+        except:
+            # Silently fail for non-Windows platforms or if the import fails
+            pass
             
     except (psutil.AccessDenied, psutil.NoSuchProcess) as e:
         logging.debug(f"Could not get complete stats for PID {pid}: {e}")
@@ -1196,8 +1357,8 @@ def is_process_whitelisted(process_name, process_path):
 
 def analyze_process_behavior(pid, process_info):
     """
-    Analyze a process for suspicious behavior patterns, including fileless malware indicators.
-    Returns a list of detected suspicious behaviors.
+    Analyze a process for suspicious behavior patterns using enhanced detection methods.
+    Returns a list of detected suspicious behaviors with confidence levels and MITRE ATT&CK mappings.
     """
     suspicious_patterns = []
     
@@ -1227,177 +1388,873 @@ def analyze_process_behavior(pid, process_info):
         port = process_info.get("port", 0)
         user = process_info.get("user", "").lower()
         
-        # Get process stats
+        # Get enhanced process stats
         process_stats = get_process_stats(pid)
         
-        # 1. Check for command shells in lineage of server processes
-        shell_in_lineage = any(shell.lower() in [p.lower() for p in lineage] 
-                            for shell in ['cmd.exe', 'powershell.exe', 'wscript.exe', 'cscript.exe'])
+        # Create a behavior detection context to track confidence levels
+        detection_context = {
+            "process_name": process_name,
+            "exe_path": exe_path,
+            "pid": pid,
+            "detections": {},
+            "total_score": 0
+        }
         
-        server_process = any(server in process_name 
-                          for server in ['w3wp', 'httpd', 'tomcat', 'nginx', 'iis'])
-                          
+        # 1. Command shell in lineage of server processes - now with confidence levels
+        shell_processes = ['cmd.exe', 'powershell.exe', 'wscript.exe', 'cscript.exe', 'mshta.exe', 'rundll32.exe']
+        server_processes = ['w3wp', 'httpd', 'tomcat', 'nginx', 'iis', 'apache', 'mysql', 'sqlservr']
+        
+        shell_in_lineage = any(shell.lower() in [p.lower() for p in lineage] for shell in shell_processes)
+        server_process = any(server in process_name for server in server_processes)
+        
         if shell_in_lineage and server_process:
-            suspicious_patterns.append(f"Unusual process ancestry: command shell in lineage of web server")
+            # Calculate a confidence score based on position in lineage
+            shell_positions = []
+            for i, proc in enumerate(lineage):
+                if any(shell.lower() in proc.lower() for shell in shell_processes):
+                    shell_positions.append(i)
+            
+            # Shells closer to the process are more suspicious
+            if shell_positions:
+                pos_score = 1.0 - (min(shell_positions) / max(1, len(lineage)))
+                confidence = 0.7 + (pos_score * 0.3)  # 70-100% confidence
+                
+                detection = {
+                    "type": "unusual_process_ancestry",
+                    "description": f"Unusual process ancestry: command shell in lineage of web server",
+                    "evidence": lineage,
+                    "confidence": confidence,
+                    "severity": "high",
+                    "mitre_techniques": ["T1059", "T1059.003"]
+                }
+                
+                suspicious_patterns.append(f"Unusual process ancestry: command shell in lineage of web server (confidence: {confidence:.1%})")
+                detection_context["detections"]["unusual_process_ancestry"] = detection
+                detection_context["total_score"] += confidence
         
-        # 2. Check if running from unusual directory
-        suspicious_dirs = ["\\temp\\", "\\windows\\temp\\", "\\appdata\\local\\temp\\", 
-                       "\\programdata\\temp\\", "\\users\\public\\", "\\downloads\\"]
-                       
-        for suspect_dir in suspicious_dirs:
+        # 2. Executing from suspicious locations - enhanced with risk weighting
+        suspicious_dirs = {
+            "\\temp\\": 0.8,
+            "\\windows\\temp\\": 0.85,
+            "\\appdata\\local\\temp\\": 0.75,
+            "\\programdata\\temp\\": 0.8,
+            "\\users\\public\\": 0.7,
+            "\\downloads\\": 0.6,
+            "\\recycle": 0.9
+        }
+        
+        # Check each suspicious directory with weighted confidence
+        for suspect_dir, base_confidence in suspicious_dirs.items():
             if suspect_dir in exe_path:
-                suspicious_patterns.append(f"Executing from suspicious location: {suspect_dir}")
-                break
+                # Adjust confidence based on process type
+                adjusted_confidence = base_confidence
+                
+                # Certain processes legitimately run from temp (installers, etc.)
+                if "install" in process_name or "setup" in process_name:
+                    adjusted_confidence *= 0.5  # Reduce confidence for installers
+                
+                # System processes in temp are more suspicious
+                if "svchost" in process_name or "lsass" in process_name or "winlogon" in process_name:
+                    adjusted_confidence = min(0.95, adjusted_confidence * 1.5)  # Increase confidence, max 95%
+                
+                detection = {
+                    "type": "suspicious_location",
+                    "description": f"Executing from suspicious location: {suspect_dir}",
+                    "evidence": exe_path,
+                    "confidence": adjusted_confidence,
+                    "severity": "medium" if adjusted_confidence < 0.8 else "high",
+                    "mitre_techniques": ["T1036", "T1574"]
+                }
+                
+                suspicious_patterns.append(f"Executing from suspicious location: {suspect_dir} (confidence: {adjusted_confidence:.1%})")
+                detection_context["detections"]["suspicious_location"] = detection
+                detection_context["total_score"] += adjusted_confidence
+                break  # Only report the most suspicious directory match
         
-        # 3. Check for unusual port (excluding common alternative ports)
-        common_high_ports = [8080, 8443, 3000, 3001, 5000, 5001, 8000, 8008, 8888]
-        if isinstance(port, int) and port > 1024 and port not in common_high_ports:
-            suspicious_patterns.append(f"Listening on unusual high port: {port}")
+        # 3. Advanced port analysis using statistical risk assessment
+        common_high_ports = [8080, 8443, 3000, 3001, 5000, 5001, 8000, 8008, 8888, 27017]
         
-        # 4. Windows-specific process relationship checks
+        known_malicious_ports = {
+            4444: 0.9,    # Metasploit default
+            1337: 0.8,    # Common hacker port
+            6666: 0.85,   # Common backdoor
+            6667: 0.7,    # IRC (often used in botnets)
+            31337: 0.85,  # Elite speak, historical backdoor port
+            12345: 0.75,  # NetBus backdoor
+            54321: 0.75   # Reverse NetBus
+        }
+        
+        # Port risk bands based on statistical analysis
+        ephemeral_ports = range(49152, 65536)  # Official IANA ephemeral port range
+        
+        if isinstance(port, int) and port > 0:
+            # Check known malicious port first
+            if port in known_malicious_ports:
+                confidence = known_malicious_ports[port]
+                detection = {
+                    "type": "known_malicious_port",
+                    "description": f"Listening on known malicious port: {port}",
+                    "evidence": f"Port {port}",
+                    "confidence": confidence,
+                    "severity": "high",
+                    "mitre_techniques": ["T1571"]
+                }
+                
+                suspicious_patterns.append(f"Listening on known malicious port: {port} (confidence: {confidence:.1%})")
+                detection_context["detections"]["known_malicious_port"] = detection
+                detection_context["total_score"] += confidence
+            
+            # Check for unusual high port (if not already flagged as malicious)
+            elif port > 1024 and port not in common_high_ports and port not in ephemeral_ports:
+                # Calculate confidence based on port range
+                port_confidence = 0.0
+                
+                if port < 10000:
+                    port_confidence = 0.6  # Ports 1025-9999, medium confidence
+                elif port >= 10000 and port < 20000:
+                    port_confidence = 0.4  # Ports 10000-19999, lower confidence
+                else:
+                    port_confidence = 0.3  # Ports 20000+, lowest confidence
+                
+                # Adjust for process type - some processes commonly use custom ports
+                if any(p in process_name for p in ["java", "tomcat", "node", "mongodb", "elastic"]):
+                    port_confidence *= 0.5  # Reduce confidence
+                
+                if port_confidence > 0.2:  # Only report if confidence is high enough
+                    detection = {
+                        "type": "unusual_port",
+                        "description": f"Listening on unusual port: {port}",
+                        "evidence": f"Port {port}",
+                        "confidence": port_confidence,
+                        "severity": "medium" if port_confidence < 0.5 else "high",
+                        "mitre_techniques": ["T1571"]
+                    }
+                    
+                    suspicious_patterns.append(f"Listening on unusual port: {port} (confidence: {port_confidence:.1%})")
+                    detection_context["detections"]["unusual_port"] = detection
+                    detection_context["total_score"] += port_confidence
+        
+        # 4. Enhanced process relationship analysis
+        # Windows-specific process relationship checks
         if "services.exe" not in lineage and process_name == "svchost.exe":
-            suspicious_patterns.append("svchost.exe running without services.exe as ancestor")
+            confidence = 0.85  # Very suspicious
+            
+            detection = {
+                "type": "service_ancestry_violation",
+                "description": "svchost.exe running without services.exe as ancestor",
+                "evidence": lineage,
+                "confidence": confidence,
+                "severity": "critical",
+                "mitre_techniques": ["T1036"]
+            }
+            
+            suspicious_patterns.append(f"svchost.exe running without services.exe as ancestor (confidence: {confidence:.1%})")
+            detection_context["detections"]["service_ancestry_violation"] = detection
+            detection_context["total_score"] += confidence
         
-        # 5. PowerShell encoded command detection
-        if "powershell" in exe_path and any(enc in cmdline 
-                                         for enc in ["-encodedcommand", "-enc", "-e", "frombase64string"]):
-            suspicious_patterns.append("PowerShell with encoded command detected")
+        # 5. Advanced PowerShell encoded command analysis
+        if "powershell" in process_name or "powershell" in cmdline:
+            encoded_cmd_confidence = 0.0
+            encoded_indicators = {
+                "-encodedcommand": 0.8,
+                "-enc ": 0.75,
+                "-e ": 0.6,  # Lower confidence due to ambiguity
+                "frombase64string": 0.85,
+                "convert::frombase64": 0.85,
+                "iex(new-object": 0.9  # PowerShell download cradle pattern
+            }
+            
+            # Look for the most suspicious encoded command pattern
+            for indicator, conf in encoded_indicators.items():
+                if indicator in cmdline:
+                    if conf > encoded_cmd_confidence:
+                        encoded_cmd_confidence = conf
+            
+            if encoded_cmd_confidence > 0:
+                # Calculate encoded command length to adjust confidence
+                # Longer encoded commands are more suspicious
+                enc_pattern = re.compile(r'(?:-e|-enc|-encodedcommand)\s+([A-Za-z0-9+/=]+)')
+                matches = enc_pattern.findall(cmdline)
+                
+                if matches:
+                    longest_enc = max(matches, key=len)
+                    # Adjust confidence based on encoded length
+                    if len(longest_enc) > 500:
+                        encoded_cmd_confidence = min(0.95, encoded_cmd_confidence * 1.2)
+                
+                detection = {
+                    "type": "powershell_encoded_command",
+                    "description": "PowerShell with encoded command detected",
+                    "evidence": cmdline[:200] + "..." if len(cmdline) > 200 else cmdline,
+                    "confidence": encoded_cmd_confidence,
+                    "severity": "high",
+                    "mitre_techniques": ["T1059.001", "T1027"]
+                }
+                
+                suspicious_patterns.append(f"PowerShell with encoded command detected (confidence: {encoded_cmd_confidence:.1%})")
+                detection_context["detections"]["powershell_encoded_command"] = detection
+                detection_context["total_score"] += encoded_cmd_confidence
         
-        # 6. LOLBins (Living Off The Land Binaries) detection
+        # 6. Advanced Living Off The Land Binaries (LOLBins) detection
         lolbins = {
-            "certutil.exe": ["/urlcache", "/verifyctl", "/decode"],
-            "regsvr32.exe": ["scrobj.dll", "/i:", "/u", "/s"],
-            "mshta.exe": ["javascript:", "vbscript:", ".hta"],
-            "rundll32.exe": ["advpack.dll", "setupapi.dll", "shdocvw.dll", "javascript:"],
-            "msiexec.exe": ["/y", "/z"],
-            "installutil.exe": ["/logfile=", "/u"],
-            "regasm.exe": ["/quiet"],
-            "regedt32.exe": ["/i"],
-            "wmic.exe": ["process call create", "shadowcopy"]
+            "certutil.exe": {
+                "patterns": ["/urlcache", "/verifyctl", "/decode"],
+                "base_confidence": 0.7,
+                "context_boost": {"http": 0.2, "https": 0.2, "decode": 0.15}
+            },
+            "regsvr32.exe": {
+                "patterns": ["scrobj.dll", "/i:", "/u", "/s"],
+                "base_confidence": 0.75,
+                "context_boost": {"http": 0.2, "scrobj.dll": 0.15}
+            },
+            "mshta.exe": {
+                "patterns": ["javascript:", "vbscript:", ".hta"],
+                "base_confidence": 0.8,
+                "context_boost": {"http": 0.2, "temp": 0.1}
+            },
+            "rundll32.exe": {
+                "patterns": ["advpack.dll", "setupapi.dll", "shdocvw.dll", "javascript:"],
+                "base_confidence": 0.7,
+                "context_boost": {"http": 0.2, "javascript": 0.2}
+            },
+            "msiexec.exe": {
+                "patterns": ["/y", "/z"],
+                "base_confidence": 0.5,
+                "context_boost": {"http": 0.3, "https": 0.3}
+            },
+            "installutil.exe": {
+                "patterns": ["/logfile=", "/u"],
+                "base_confidence": 0.7,
+                "context_boost": {"/u": 0.2}
+            },
+            "regasm.exe": {
+                "patterns": ["/quiet"],
+                "base_confidence": 0.7,
+                "context_boost": {}
+            },
+            "regedt32.exe": {
+                "patterns": ["/i"],
+                "base_confidence": 0.65,
+                "context_boost": {}
+            },
+            "wmic.exe": {
+                "patterns": ["process call create", "shadowcopy"],
+                "base_confidence": 0.7,
+                "context_boost": {"process": 0.1, "call": 0.1, "create": 0.1}
+            },
+            "bitsadmin.exe": {
+                "patterns": ["/transfer", "/addfile", "/download"],
+                "base_confidence": 0.8,
+                "context_boost": {"http": 0.1, "https": 0.1}
+            }
         }
         
-        for lolbin, flags in lolbins.items():
-            if lolbin.lower() == process_name:
-                for flag in flags:
-                    if flag.lower() in cmdline:
-                        suspicious_patterns.append(f"Potential LOLBin abuse: {lolbin} with {flag}")
-                        break
-        
-        # 7. Unusual parent-child relationships
+        for lolbin, config in lolbins.items():
+            if lolbin.lower() == process_name.lower():
+                # Check for suspicious flags with enhanced pattern recognition
+                for flag in config["patterns"]:
+                    if flag.lower() in cmdline.lower():
+                        # Start with base confidence
+                        lolbin_confidence = config["base_confidence"]
+                        
+                        # Check for context boosters that make this more suspicious
+                        for context, boost in config["context_boost"].items():
+                            if context.lower() in cmdline.lower():
+                                lolbin_confidence += boost
+                        
+                        # Cap at 95% confidence
+                        lolbin_confidence = min(0.95, lolbin_confidence)
+                        
+                        detection = {
+                            "type": "lolbin_abuse",
+                            "description": f"Potential LOLBin abuse: {lolbin} with {flag}",
+                            "evidence": cmdline[:200] + "..." if len(cmdline) > 200 else cmdline,
+                            "confidence": lolbin_confidence,
+                            "severity": "high",
+                            "mitre_techniques": ["T1218"]
+                        }
+                        
+                        suspicious_patterns.append(f"Potential LOLBin abuse: {lolbin} with {flag} (confidence: {lolbin_confidence:.1%})")
+                        detection_context["detections"]["lolbin_abuse"] = detection
+                        detection_context["total_score"] += lolbin_confidence
+                        break  # Only report the first matching flag
+                    
+        # 7. Enhanced parent-child relationship analysis using statistical approach
         unusual_parents = {
-            "lsass.exe": ["cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe"],
-            "svchost.exe": ["cmd.exe", "powershell.exe", "rundll32.exe"]
+            "lsass.exe": {
+                "suspicious_parents": ["cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe"],
+                "base_confidence": 0.85
+            },
+            "svchost.exe": {
+                "suspicious_parents": ["cmd.exe", "powershell.exe", "rundll32.exe"],
+                "base_confidence": 0.8
+            },
+            "csrss.exe": {
+                "suspicious_parents": ["cmd.exe", "powershell.exe", "explorer.exe"],
+                "base_confidence": 0.9
+            },
+            "winlogon.exe": {
+                "suspicious_parents": ["cmd.exe", "powershell.exe", "rundll32.exe"],
+                "base_confidence": 0.9
+            }
         }
         
-        for child, suspicious_parents in unusual_parents.items():
-            if process_name == child and lineage and lineage[0].lower() in [p.lower() for p in suspicious_parents]:
-                suspicious_patterns.append(f"Unusual parent process {lineage[0]} for {child}")
+        for child, parent_config in unusual_parents.items():
+            if process_name.lower() == child.lower() and lineage:
+                suspicious_parents = parent_config["suspicious_parents"]
+                if any(parent.lower() in lineage[0].lower() for parent in suspicious_parents):
+                    # Base confidence from configuration
+                    parent_confidence = parent_config["base_confidence"]
+                    
+                    # Additional detection for unusual parent PID
+                    try:
+                        ppid = int(process_info.get("ppid", 0))
+                        # If PPID is suspiciously low or a user-mode PID for a system process
+                        if ppid > 0 and ppid < 10 and child.lower() in ["lsass.exe", "csrss.exe", "winlogon.exe"]:
+                            parent_confidence = min(0.95, parent_confidence + 0.1)
+                    except (ValueError, TypeError):
+                        pass
+                    
+                    detection = {
+                        "type": "unusual_parent_process",
+                        "description": f"Unusual parent process {lineage[0]} for {child}",
+                        "evidence": f"Process lineage: {' -> '.join(lineage)}",
+                        "confidence": parent_confidence,
+                        "severity": "high",
+                        "mitre_techniques": ["T1036", "T1055"]
+                    }
+                    
+                    suspicious_patterns.append(f"Unusual parent process {lineage[0]} for {child} (confidence: {parent_confidence:.1%})")
+                    detection_context["detections"]["unusual_parent_process"] = detection
+                    detection_context["total_score"] += parent_confidence
         
-        # 8. High resource usage for certain processes
-        if process_stats["cpu_percent"] > 80 and process_name in ["svchost.exe", "lsass.exe", "csrss.exe"]:
-            suspicious_patterns.append(f"Unusually high CPU usage ({process_stats['cpu_percent']}%) for {process_name}")
+        # 8. Enhanced resource usage analysis with process type context
+        if process_stats["cpu_percent"] > 80:
+            # High CPU usage might be normal for some processes but suspicious for others
+            cpu_confidence = 0.0
+            
+            # System processes with high CPU are suspicious
+            if process_name in ["svchost.exe", "lsass.exe", "csrss.exe", "winlogon.exe", "services.exe"]:
+                cpu_confidence = 0.7
+            # Background services with high CPU might be suspicious
+            elif "service" in cmdline.lower() or process_name.endswith("d.exe") or process_name.endswith("srv.exe"):
+                cpu_confidence = 0.5
+            # Known CPU-intensive apps
+            elif any(app in process_name.lower() for app in ["chrome", "firefox", "video", "game", "compiler", "build"]):
+                cpu_confidence = 0.1  # Low confidence - likely legitimate
+            # Default case - medium suspicion
+            else:
+                cpu_confidence = 0.3
+            
+            # Only report if confidence is high enough
+            if cpu_confidence >= 0.5:
+                detection = {
+                    "type": "high_cpu_usage",
+                    "description": f"Unusually high CPU usage ({process_stats['cpu_percent']}%) for {process_name}",
+                    "evidence": f"CPU: {process_stats['cpu_percent']}%",
+                    "confidence": cpu_confidence,
+                    "severity": "medium",
+                    "mitre_techniques": ["T1496"]
+                }
+                
+                suspicious_patterns.append(f"Unusually high CPU usage ({process_stats['cpu_percent']}%) for {process_name} (confidence: {cpu_confidence:.1%})")
+                detection_context["detections"]["high_cpu_usage"] = detection
+                detection_context["total_score"] += cpu_confidence
         
-        # 9. Very high connection count for non-server processes
-        if (process_stats["connection_count"] > 50 and 
-            not any(server in process_name for server in ["iis", "apache", "nginx", "w3wp", "httpd", "tomcat"])):
-            suspicious_patterns.append(f"High connection count ({process_stats['connection_count']}) for non-server process")
-        
-        # 10. Game processes may have high memory usage or many DLLs loaded - reduce false positives
+        # 9. Advanced connection count analysis with process classification
+        if process_stats["connection_count"] > 20:
+            conn_confidence = 0.0
+            
+            # Check if this is expected to be a network-heavy process
+            network_intensive = any(net in process_name.lower() for net in 
+                                 ["iis", "apache", "nginx", "w3wp", "httpd", "tomcat", 
+                                  "browser", "chrome", "firefox", "edge", "opera", "safari"])
+            
+            if process_stats["connection_count"] > 50:
+                if network_intensive:
+                    # High connections for network processes might be normal
+                    if process_stats["connection_count"] > 200:
+                        conn_confidence = 0.4  # Even for network processes, extremely high counts are suspicious
+                    else:
+                        conn_confidence = 0.2  # Lower confidence for network-intensive processes
+                else:
+                    # High connection count for non-network process is very suspicious
+                    conn_confidence = 0.7
+                    
+                    # Even more suspicious if a system process
+                    if process_name in ["svchost.exe", "lsass.exe", "csrss.exe"]:
+                        conn_confidence = 0.85
+            elif process_stats["connection_count"] > 20:
+                # Medium connection count
+                if not network_intensive:
+                    conn_confidence = 0.5
+            
+            # Extra check for connection status distribution
+            connection_statuses = process_stats.get("connection_statuses", {})
+            established = connection_statuses.get("ESTABLISHED", 0)
+            listen = connection_statuses.get("LISTEN", 0)
+            
+            # Many established connections for a non-server process is suspicious
+            if established > 10 and not network_intensive:
+                conn_confidence = max(conn_confidence, 0.6)
+            
+            # Only report if confidence is high enough
+            if conn_confidence >= 0.5:
+                detection = {
+                    "type": "high_connection_count",
+                    "description": f"High connection count ({process_stats['connection_count']}) for non-server process",
+                    "evidence": f"Connections: {process_stats['connection_count']} (ESTABLISHED: {established}, LISTEN: {listen})",
+                    "confidence": conn_confidence,
+                    "severity": "medium" if conn_confidence < 0.7 else "high",
+                    "mitre_techniques": ["T1071"]
+                }
+                
+                suspicious_patterns.append(f"High connection count ({process_stats['connection_count']}) for non-server process (confidence: {conn_confidence:.1%})")
+                detection_context["detections"]["high_connection_count"] = detection
+                detection_context["total_score"] += conn_confidence
+                
+        # 10. Game processes and other high-resource apps - contextual analysis
         if "game" in process_name.lower() or "game" in exe_path.lower():
             # Filter out common game-related behaviors that might trigger alerts
             suspicious_patterns = [pattern for pattern in suspicious_patterns 
                                  if not ("high port" in pattern.lower() or 
-                                        "connection count" in pattern.lower())]
+                                        "connection count" in pattern.lower() or
+                                        "cpu usage" in pattern.lower())]
+            
+            # Also remove from detection context
+            if "high_connection_count" in detection_context["detections"]:
+                del detection_context["detections"]["high_connection_count"]
+                
+            if "high_cpu_usage" in detection_context["detections"]:
+                del detection_context["detections"]["high_cpu_usage"]
+                
+            if "unusual_port" in detection_context["detections"]:
+                del detection_context["detections"]["unusual_port"]
         
-        #-------------------------------------------------------------------------
-        # New Part: Enhanced fileless malware detection
-        #-------------------------------------------------------------------------
-        
-        # 11. Check for fileless execution techniques
-        # 11.1 Detect file not found but process exists (potential fileless process)
-        if not os.path.exists(exe_path) and exe_path != "ACCESS_DENIED":
-            suspicious_patterns.append("Fileless process detected: executable path doesn't exist")
-        
-        # 11.2 Windows Script Host execution with remote content
-        if process_name in ["wscript.exe", "cscript.exe"]:
-            if "http:" in cmdline or "https:" in cmdline:
-                suspicious_patterns.append("Windows Script Host executing remote script content")
-        
-        # 11.3 Evidence of reflective loading in .NET
-        if process_name in ["powershell.exe", "powershell_ise.exe"] or ".exe" not in process_name:
-            for reflective_term in ["reflection.assembly", "assembly.load", "loadfrom", "loadfile"]:
-                if reflective_term in cmdline:
-                    suspicious_patterns.append(f".NET reflection loading detected: {reflective_term}")
-                    break
-        
-        # 11.4 Memory analysis for fileless indicators if admin privileges available
-        if is_admin():
-            try:
-                # Only perform memory scanning if already found suspicious indicators
-                # or for processes with missing executable
-                if suspicious_patterns or not os.path.exists(exe_path):
-                    memory_regions = enumerate_process_memory_regions(pid)
+        # 11. Fileless Detection (added in original code)
+                # Detect file not found but process exists (potential fileless process)
+                if not os.path.exists(exe_path) and exe_path != "ACCESS_DENIED":
+                    fileless_confidence = 0.8  # High confidence
+                    detection = {
+                        "type": "fileless_process",
+                        "description": "Fileless process detected: executable path doesn't exist",
+                        "evidence": exe_path,
+                        "confidence": fileless_confidence,
+                        "severity": "high",
+                        "mitre_techniques": ["T1059.001", "T1036"]
+                    }
                     
-                    # Count suspicious memory regions
-                    rwx_regions = 0
-                    executable_private_regions = 0
+                    suspicious_patterns.append(f"Fileless process detected: executable path doesn't exist (confidence: {fileless_confidence:.1%})")
+                    detection_context["detections"]["fileless_process"] = detection
+                    detection_context["total_score"] += fileless_confidence
+                
+                # 11.2 Windows Script Host execution with remote content
+                if process_name in ["wscript.exe", "cscript.exe"]:
+                    if "http:" in cmdline or "https:" in cmdline:
+                        wsh_confidence = 0.85
+                        detection = {
+                            "type": "remote_script_execution",
+                            "description": "Windows Script Host executing remote script content",
+                            "evidence": cmdline[:200] + "..." if len(cmdline) > 200 else cmdline,
+                            "confidence": wsh_confidence,
+                            "severity": "high",
+                            "mitre_techniques": ["T1059.005", "T1105"]
+                        }
+                        
+                        suspicious_patterns.append(f"Windows Script Host executing remote script content (confidence: {wsh_confidence:.1%})")
+                        detection_context["detections"]["remote_script_execution"] = detection
+                        detection_context["total_score"] += wsh_confidence
+                
+                # 11.3 Enhanced detection of reflective loading in .NET
+                reflection_patterns = {
+                    "reflection.assembly": 0.8,
+                    "assembly.load": 0.75,
+                    "loadfrom": 0.7,
+                    "loadfile": 0.7,
+                    "iex": 0.7,
+                    "invoke-expression": 0.8,
+                    "gettypes": 0.6,
+                    "getmethods": 0.6
+                }
+                
+                if process_name in ["powershell.exe", "powershell_ise.exe"] or ".exe" not in process_name:
+                    max_reflection_confidence = 0.0
+                    detected_pattern = ""
                     
-                    for region in memory_regions:
-                        if region["protection"]["executable"] and region["type"] == "Private":
-                            executable_private_regions += 1
+                    for pattern, confidence in reflection_patterns.items():
+                        if pattern in cmdline.lower():
+                            if confidence > max_reflection_confidence:
+                                max_reflection_confidence = confidence
+                                detected_pattern = pattern
+                    
+                    if max_reflection_confidence > 0.0:
+                        # Boost confidence if multiple patterns found
+                        pattern_count = sum(1 for p in reflection_patterns if p in cmdline.lower())
+                        if pattern_count > 1:
+                            max_reflection_confidence = min(0.95, max_reflection_confidence + (0.05 * (pattern_count - 1)))
+                        
+                        detection = {
+                            "type": "reflection_loading",
+                            "description": f".NET reflection loading detected: {detected_pattern}",
+                            "evidence": cmdline[:200] + "..." if len(cmdline) > 200 else cmdline,
+                            "confidence": max_reflection_confidence,
+                            "severity": "high",
+                            "mitre_techniques": ["T1127", "T1059.001"]
+                        }
+                        
+                        suspicious_patterns.append(f".NET reflection loading detected: {detected_pattern} (confidence: {max_reflection_confidence:.1%})")
+                        detection_context["detections"]["reflection_loading"] = detection
+                        detection_context["total_score"] += max_reflection_confidence
+                
+                # 11.4 Enhanced memory analysis for fileless indicators with progressive depth
+                if is_admin():
+                    try:
+                        # Only perform memory scanning if already found suspicious indicators
+                        # or for processes with missing executable (optimize resource usage)
+                        if suspicious_patterns or not os.path.exists(exe_path):
+                            memory_regions = enumerate_process_memory_regions(pid)
                             
-                            if region["protection"]["writable"]:
-                                rwx_regions += 1
+                            # Count suspicious memory regions with better classification
+                            rwx_regions = 0
+                            rx_regions = 0
+                            executable_private_regions = 0
+                            large_exec_allocs = 0
+                            
+                            for region in memory_regions:
+                                if region["protection"]["executable"] and region["type"] == "Private":
+                                    executable_private_regions += 1
+                                    
+                                    # Check for RWX permissions (highly suspicious)
+                                    if region["protection"]["writable"]:
+                                        rwx_regions += 1
+                                    else:
+                                        rx_regions += 1
+                                    
+                                    # Check for large executable allocations
+                                    if region["size_kb"] > 1024:  # >1MB
+                                        large_exec_allocs += 1
+                            
+                            # Alert on excessive RWX memory regions with severity based on count
+                            if rwx_regions > 0:
+                                rwx_confidence = min(0.95, 0.7 + (rwx_regions * 0.05))  # More regions = higher confidence
+                                
+                                detection = {
+                                    "type": "rwx_memory",
+                                    "description": f"Excessive RWX memory regions: {rwx_regions} - potential shellcode",
+                                    "evidence": f"{rwx_regions} RWX memory regions",
+                                    "confidence": rwx_confidence,
+                                    "severity": "high",
+                                    "mitre_techniques": ["T1055"]
+                                }
+                                
+                                suspicious_patterns.append(f"Excessive RWX memory regions: {rwx_regions} - potential shellcode (confidence: {rwx_confidence:.1%})")
+                                detection_context["detections"]["rwx_memory"] = detection
+                                detection_context["total_score"] += rwx_confidence
+                            
+                            # Alert on excessive executable private memory
+                            if executable_private_regions > 5:
+                                exe_confidence = min(0.9, 0.6 + (executable_private_regions * 0.03))
+                                
+                                detection = {
+                                    "type": "excessive_executable_memory",
+                                    "description": f"Excessive executable allocations: {executable_private_regions} - potential code injection",
+                                    "evidence": f"{executable_private_regions} executable private memory regions",
+                                    "confidence": exe_confidence,
+                                    "severity": "medium",
+                                    "mitre_techniques": ["T1055"]
+                                }
+                                
+                                suspicious_patterns.append(f"Excessive executable allocations: {executable_private_regions} - potential code injection (confidence: {exe_confidence:.1%})")
+                                detection_context["detections"]["excessive_executable_memory"] = detection
+                                detection_context["total_score"] += exe_confidence
+                            
+                            # Alert on large executable allocations (often used for unpacked code)
+                            if large_exec_allocs > 0:
+                                large_confidence = min(0.85, 0.7 + (large_exec_allocs * 0.05))
+                                
+                                detection = {
+                                    "type": "large_executable_allocations",
+                                    "description": f"Large executable memory allocations: {large_exec_allocs} - potential unpacked code",
+                                    "evidence": f"{large_exec_allocs} large (>1MB) executable allocations",
+                                    "confidence": large_confidence,
+                                    "severity": "medium",
+                                    "mitre_techniques": ["T1055", "T1027.002"]
+                                }
+                                
+                                suspicious_patterns.append(f"Large executable memory allocations: {large_exec_allocs} - potential unpacked code (confidence: {large_confidence:.1%})")
+                                detection_context["detections"]["large_executable_allocations"] = detection
+                                detection_context["total_score"] += large_confidence
+                    except Exception as e:
+                        logging.debug(f"Error scanning memory for fileless indicators: {e}")
+                
+                # 11.5 Enhanced detection of memory-only execution tricks in command line
+                memory_exec_indicators = {
+                    "virtualalloc": 0.8, 
+                    "heapalloc": 0.7, 
+                    "memoryapi": 0.75, 
+                    "writeprocessmemory": 0.85,
+                    "createremotethread": 0.9, 
+                    "ntwritevirtualmemory": 0.9, 
+                    "shellcode": 0.9,
+                    "winapi": 0.5,
+                    "allocatememory": 0.6,
+                    "memcpy": 0.6,
+                    "marshal": 0.6,
+                    "function ptr": 0.7,
+                    "memset": 0.5,
+                    "runtime.interopservices": 0.7
+                }
+                
+                # Check for memory API indicators with progressive confidence
+                max_memory_confidence = 0.0
+                detected_indicators = []
+                
+                for indicator, confidence in memory_exec_indicators.items():
+                    if indicator in cmdline.lower():
+                        if confidence >= 0.7:  # Only collect significant indicators
+                            detected_indicators.append(indicator)
+                            
+                        if confidence > max_memory_confidence:
+                            max_memory_confidence = confidence
+                
+                # Adjust confidence based on number of indicators found
+                if len(detected_indicators) > 1:
+                    # Multiple indicators found - increase confidence
+                    max_memory_confidence = min(0.95, max_memory_confidence + (0.05 * (len(detected_indicators) - 1)))
+                
+                if max_memory_confidence >= 0.7:  # Only report if confidence is high enough
+                    indicators_str = ", ".join(detected_indicators)
                     
-                    # Alert on excessive RWX memory regions
-                    if rwx_regions > 3:
-                        suspicious_patterns.append(f"Excessive RWX memory regions: {rwx_regions} - potential shellcode")
+                    detection = {
+                        "type": "memory_manipulation_apis",
+                        "description": f"Memory manipulation API in command line: {indicators_str}",
+                        "evidence": cmdline[:200] + "..." if len(cmdline) > 200 else cmdline,
+                        "confidence": max_memory_confidence,
+                        "severity": "high",
+                        "mitre_techniques": ["T1055", "T1106"]
+                    }
                     
-                    # Alert on excessive executable private memory
-                    if executable_private_regions > 5:
-                        suspicious_patterns.append(f"Excessive executable allocations: {executable_private_regions} - potential code injection")
-            except Exception as e:
-                logging.debug(f"Error scanning memory for fileless indicators: {e}")
+                    suspicious_patterns.append(f"Memory manipulation API in command line: {indicators_str} (confidence: {max_memory_confidence:.1%})")
+                    detection_context["detections"]["memory_manipulation_apis"] = detection
+                    detection_context["total_score"] += max_memory_confidence
+                
+                # 11.6 Enhanced WMI process execution detection
+                if "wmic" in cmdline and "process call create" in cmdline:
+                    wmi_confidence = 0.8
+                    
+                    # Check for additional suspicious elements to adjust confidence
+                    if "cmd" in cmdline or "powershell" in cmdline:
+                        wmi_confidence = min(0.95, wmi_confidence + 0.1)
+                    
+                    if "http" in cmdline or "ftp" in cmdline:
+                        wmi_confidence = min(0.95, wmi_confidence + 0.1)
+                    
+                    detection = {
+                        "type": "wmi_process_creation",
+                        "description": "WMI used to create process - potential living off the land technique",
+                        "evidence": cmdline[:200] + "..." if len(cmdline) > 200 else cmdline,
+                        "confidence": wmi_confidence,
+                        "severity": "high",
+                        "mitre_techniques": ["T1047", "T1059"]
+                    }
+                    
+                    suspicious_patterns.append(f"WMI used to create process - potential living off the land technique (confidence: {wmi_confidence:.1%})")
+                    detection_context["detections"]["wmi_process_creation"] = detection
+                    detection_context["total_score"] += wmi_confidence
+                
+                # 11.7 Enhanced DLL hijacking detection
+                if pid > 0:
+                    try:
+                        dll_indicators = detect_dll_search_order_hijacking(pid, process_info)
+                        if dll_indicators:
+                            # Use the most severe indicator
+                            max_severity_indicator = max(
+                                dll_indicators, 
+                                key=lambda x: 0 if 'severity' not in x else 
+                                              (2 if x['severity'] == 'high' else 
+                                               1 if x['severity'] == 'medium' else 0)
+                            )
+                            
+                            dll_confidence = 0.7  # Base confidence
+                            
+                            # Adjust based on severity
+                            if max_severity_indicator.get('severity') == 'high':
+                                dll_confidence = 0.85
+                            elif max_severity_indicator.get('severity') == 'critical':
+                                dll_confidence = 0.95
+                                
+                            detection = {
+                                "type": "dll_hijacking",
+                                "description": max_severity_indicator.get('description', 'DLL hijacking detected'),
+                                "evidence": max_severity_indicator.get('dll_path', 'Unknown DLL path'),
+                                "confidence": dll_confidence,
+                                "severity": max_severity_indicator.get('severity', 'medium'),
+                                "mitre_techniques": ["T1574.001", "T1574.002"]
+                            }
+                            
+                            suspicious_patterns.append(f"{max_severity_indicator.get('description', 'DLL hijacking detected')} (confidence: {dll_confidence:.1%})")
+                            detection_context["detections"]["dll_hijacking"] = detection
+                            detection_context["total_score"] += dll_confidence
+                    except Exception as e:
+                        logging.debug(f"Error checking for DLL hijacking: {e}")
+                        
+                # 12. NEW: Context-aware behavioral analysis
+                # Check behavioral patterns specific to process type
+                
+                # 12.1 Classification-based detection (different process types have different baselines)
+                process_category = "unknown"
+                
+                # Classify the process
+                if "svchost" in process_name or "services" in process_name or "lsass" in process_name:
+                    process_category = "system"
+                elif "chrome" in process_name or "firefox" in process_name or "edge" in process_name:
+                    process_category = "browser"
+                elif "w3wp" in process_name or "httpd" in process_name or "nginx" in process_name:
+                    process_category = "webserver"
+                elif "sqlservr" in process_name or "oracle" in process_name or "mysql" in process_name:
+                    process_category = "database"
+                elif "cmd" in process_name or "powershell" in process_name or "wscript" in process_name:
+                    process_category = "shell"
+                elif "devenv" in process_name or "visual studio" in exe_path or "intellij" in exe_path:
+                    process_category = "development"
+                elif "explorer" in process_name or "desktop" in process_name:
+                    process_category = "user_interface"
+                    
+                # Apply category-specific detection rules
+                if process_category == "system":
+                    # System processes shouldn't have many open network connections
+                    if process_stats["connection_count"] > 5:
+                        sys_net_confidence = 0.8
+                        
+                        detection = {
+                            "type": "system_process_network_activity",
+                            "description": f"System process with unusual network activity: {process_stats['connection_count']} connections",
+                            "evidence": f"{process_stats['connection_count']} network connections",
+                            "confidence": sys_net_confidence,
+                            "severity": "high",
+                            "mitre_techniques": ["T1071"]
+                        }
+                        
+                        suspicious_patterns.append(f"System process with unusual network activity: {process_stats['connection_count']} connections (confidence: {sys_net_confidence:.1%})")
+                        detection_context["detections"]["system_process_network_activity"] = detection
+                        detection_context["total_score"] += sys_net_confidence
+                
+                elif process_category == "browser":
+                    # Browser shouldn't host many child processes unless it's the main process
+                    if process_stats["child_process_count"] > 20 and "svchost" not in lineage:
+                        browser_child_confidence = 0.7
+                        
+                        detection = {
+                            "type": "browser_excessive_child_processes",
+                            "description": f"Browser process with excessive child processes: {process_stats['child_process_count']}",
+                            "evidence": f"{process_stats['child_process_count']} child processes",
+                            "confidence": browser_child_confidence,
+                            "severity": "medium",
+                            "mitre_techniques": ["T1203"]
+                        }
+                        
+                        suspicious_patterns.append(f"Browser process with excessive child processes: {process_stats['child_process_count']} (confidence: {browser_child_confidence:.1%})")
+                        detection_context["detections"]["browser_excessive_child_processes"] = detection
+                        detection_context["total_score"] += browser_child_confidence
+                
+                # 12.2 Derived metrics - analyze ratios and rates for more accurate detection
+                # Handles-per-thread ratio (high values might indicate resource leaks or handle table injection)
+                if process_stats["thread_count"] > 0:
+                    handles_per_thread = process_stats["handle_count"] / process_stats["thread_count"]
+                    
+                    # Different thresholds for different process types
+                    handles_threshold = 200  # Default
+                    if process_category == "system":
+                        handles_threshold = 100
+                    elif process_category == "database":
+                        handles_threshold = 300
+                    elif process_category == "development":
+                        handles_threshold = 400
+                        
+                    if handles_per_thread > handles_threshold:
+                        handle_ratio_confidence = min(0.8, 0.5 + ((handles_per_thread - handles_threshold) / handles_threshold) * 0.3)
+                        
+                        if handle_ratio_confidence >= 0.6:  # Only report if significant
+                            detection = {
+                                "type": "excessive_handle_ratio",
+                                "description": f"Excessive handles per thread: {handles_per_thread:.1f} (threshold: {handles_threshold})",
+                                "evidence": f"Handles: {process_stats['handle_count']}, Threads: {process_stats['thread_count']}",
+                                "confidence": handle_ratio_confidence,
+                                "severity": "medium",
+                                "mitre_techniques": ["T1134"]
+                            }
+                            
+                            suspicious_patterns.append(f"Excessive handles per thread: {handles_per_thread:.1f} (threshold: {handles_threshold}) (confidence: {handle_ratio_confidence:.1%})")
+                            detection_context["detections"]["excessive_handle_ratio"] = detection
+                            detection_context["total_score"] += handle_ratio_confidence
+                
+                # 12.3 Calculate final threat score based on all detections
+        total_weighted_score = 0
+        detection_count = len(detection_context["detections"])
         
-        # 11.5 Detect memory-only execution tricks in command line
-        memory_exec_indicators = [
-            "virtualalloc", "heapalloc", "memoryapi", "writeprocessmemory",
-            "createremotethread", "ntwritevirtualmemory", "shellcode"
-        ]
+        # Apply severity multipliers
+        severity_weights = {
+            "critical": 1.5,
+            "high": 1.2,
+            "medium": 1.0,
+            "low": 0.7
+        }
         
-        for indicator in memory_exec_indicators:
-            if indicator in cmdline:
-                suspicious_patterns.append(f"Memory manipulation API in command line: {indicator}")
-                break
+        for detection_type, detection in detection_context["detections"].items():
+            severity = detection.get("severity", "medium")
+            confidence = detection.get("confidence", 0.5)
+            
+            # Calculate weighted score
+            weight = severity_weights.get(severity, 1.0)
+            weighted_score = confidence * weight
+            
+            # Add to total
+            total_weighted_score += weighted_score
         
-        # 11.6 Additional WMI process execution detection
-        if "wmic" in cmdline and "process call create" in cmdline:
-            suspicious_patterns.append("WMI used to create process - potential living off the land technique")
-        
-        # 11.7 Check for DLL hijacking (process running with unexpected DLLs)
-        if pid > 0:
-            try:
-                dll_indicators = detect_dll_search_order_hijacking(pid, process_info)
-                if dll_indicators:
-                    for indicator in dll_indicators:
-                        if "description" in indicator:
-                            suspicious_patterns.append(indicator["description"])
-            except Exception as e:
-                logging.debug(f"Error checking for DLL hijacking: {e}")
-        
+        # Normalize final score to 0-1 range with diminishing returns for many detections
+        if detection_count > 0:
+            # Base score from weighted average
+            avg_weighted_score = total_weighted_score / detection_count
+            
+            # Add bonus for multiple detections (with diminishing returns)
+            multiple_detection_bonus = 1.0 + (min(5, detection_count - 1) * 0.1)
+            
+            # Calculate final score
+            detection_context["normalized_score"] = min(1.0, avg_weighted_score * multiple_detection_bonus)
+            
+            # Add MITRE ATT&CK mapping to detection context
+            mitre_techniques = set()
+            for detection in detection_context["detections"].values():
+                if "mitre_techniques" in detection:
+                    for technique in detection["mitre_techniques"]:
+                        mitre_techniques.add(technique)
+            
+            detection_context["mitre_techniques"] = list(mitre_techniques)
+            
+            # Add to logging
+            if detection_context["normalized_score"] >= 0.7:
+                logging.warning(f"High threat score {detection_context['normalized_score']:.2f} for process {process_name} (PID: {pid})")
+            elif detection_context["normalized_score"] >= 0.4:
+                logging.info(f"Medium threat score {detection_context['normalized_score']:.2f} for process {process_name} (PID: {pid})")
+    
     except Exception as e:
         logging.error(f"Error analyzing process behavior for PID {pid}: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
     
     return suspicious_patterns
 
 def implement_behavioral_baselining():
-    """Train an ML model for process behavior anomaly detection if libraries are available."""
+    """Train more advanced ML models for process behavior anomaly detection with ensemble approach."""
     if not ML_LIBRARIES_AVAILABLE:
         logging.warning("ML libraries not available - skipping behavioral baselining")
         return None
         
     try:
-        from sklearn.ensemble import IsolationForest
+        from sklearn.ensemble import IsolationForest, RandomForestClassifier
+        from sklearn.cluster import DBSCAN
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
         import numpy as np
         import pandas as pd
         
@@ -1410,6 +2267,10 @@ def implement_behavioral_baselining():
         integrity_state = load_process_metadata()
         
         for hash_key, process in integrity_state.items():
+            # Skip process_groups metadata
+            if hash_key == "process_groups":
+                continue
+                
             # Get PID as int, with error handling for when it's stored as a string
             try:
                 pid = int(process.get("pid", 0))
@@ -1433,7 +2294,9 @@ def implement_behavioral_baselining():
                         "handle_count": 0, 
                         "thread_count": 0,
                         "child_process_count": 0,
-                        "connection_count": 0
+                        "connection_count": 0,
+                        "io_read_bytes": 0,
+                        "io_write_bytes": 0
                     }
                 except:
                     current_stats = {
@@ -1442,7 +2305,9 @@ def implement_behavioral_baselining():
                         "handle_count": 0, 
                         "thread_count": 0,
                         "child_process_count": 0,
-                        "connection_count": 0
+                        "connection_count": 0,
+                        "io_read_bytes": 0,
+                        "io_write_bytes": 0
                     }
                 
                 # Get port with proper error handling
@@ -1451,7 +2316,7 @@ def implement_behavioral_baselining():
                 except (ValueError, TypeError):
                     port = 0
                 
-                # Basic features from stored metadata
+                # Enhanced feature set for better behavioral profiling
                 features = {
                     'pid': pid,
                     'port': port,
@@ -1463,8 +2328,32 @@ def implement_behavioral_baselining():
                     'handle_count': current_stats.get('handle_count', 0),
                     'thread_count': current_stats.get('thread_count', 0),
                     'memory_usage_mb': current_stats.get('memory_usage_kb', 0) / 1024,
-                    'connection_count': current_stats.get('connection_count', 0)
+                    'connection_count': current_stats.get('connection_count', 0),
+                    'cpu_percent': current_stats.get('cpu_percent', 0),
+                    'io_read_mb': current_stats.get('io_read_bytes', 0) / (1024 * 1024),
+                    'io_write_mb': current_stats.get('io_write_bytes', 0) / (1024 * 1024),
+                    # Derived features - ratios often better capture anomalies
+                    'memory_per_thread': (current_stats.get('memory_usage_kb', 0) / 1024) / 
+                                         max(current_stats.get('thread_count', 1), 1),
+                    'handles_per_thread': current_stats.get('handle_count', 0) / 
+                                         max(current_stats.get('thread_count', 1), 1),
+                    'connections_per_thread': current_stats.get('connection_count', 0) / 
+                                             max(current_stats.get('thread_count', 1), 1)
                 }
+                
+                # Add process category for clustering algorithms
+                category = "system"
+                if process_name.endswith(".exe"):
+                    if any(browser in process_name for browser in ["chrome", "firefox", "edge", "opera"]):
+                        category = "browser"
+                    elif any(server in process_name for server in ["httpd", "nginx", "apache", "iis", "w3wp"]):
+                        category = "webserver"
+                    elif any(db in process_name for db in ["sql", "oracle", "mysql", "postgres"]):
+                        category = "database"
+                    elif any(utility in process_name for utility in ["cmd", "powershell", "explorer"]):
+                        category = "utility"
+                
+                features['category'] = category
                 
                 processes_data.append(features)
             except Exception as e:
@@ -1474,55 +2363,248 @@ def implement_behavioral_baselining():
         if len(processes_data) < 5:
             logging.warning("Not enough process data for ML model training")
             return {
-                'model': None,
+                'models': None,
                 'features': [],
                 'system_processes': system_processes
             }
         
-        # Create dataframe and train model
+        # Create dataframe and preprocess data
         df = pd.DataFrame(processes_data)
-        numerical_features = [col for col in df.columns if col != 'pid' and 
+        
+        # Extract categorical features before numerical processing
+        categorical_features = ['category']
+        categorical_data = df[categorical_features].copy() if 'category' in df.columns else None
+        
+        # Handle numerical features
+        numerical_features = [col for col in df.columns if col != 'pid' and col not in categorical_features and 
                             df[col].dtype in [np.int64, np.float64, np.bool_]]
         
-        # Train isolation forest with auto contamination
-        contamination = min(0.1, 1/len(df))  # At most 10% anomalies, or 1 if few samples
-        model = IsolationForest(contamination=contamination, random_state=42)
-        model.fit(df[numerical_features])
+        # Perform scaling for better model performance
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(df[numerical_features])
+        scaled_df = pd.DataFrame(scaled_data, columns=numerical_features)
         
-        logging.info(f"Trained ML model on {len(df)} processes with {len(numerical_features)} features")
+        # Apply dimension reduction for clustering algorithms
+        # Only use PCA if we have enough features and samples
+        use_pca = len(numerical_features) > 5 and len(df) > 10
+        pca = None
+        pca_components = None
+        
+        if use_pca:
+            n_components = min(5, len(numerical_features))
+            pca = PCA(n_components=n_components)
+            # Convert to numpy array without feature names to avoid the warning
+            scaled_data_for_pca = scaled_df[numerical_features].values
+            pca_components = pca.fit_transform(scaled_data_for_pca)
+            pca_df = pd.DataFrame(
+                pca_components, 
+                columns=[f'pc{i+1}' for i in range(n_components)]
+            )
+            logging.info(f"PCA reduced dimensions from {len(numerical_features)} to {n_components} "
+                        f"explaining {sum(pca.explained_variance_ratio_) * 100:.2f}% of variance")
+        
+        # Train multiple models for ensemble approach
+        models = {}
+        
+        # 1. Isolation Forest with auto contamination
+        contamination = min(0.1, 1/len(df))  # At most 10% anomalies, or 1 if few samples
+        iforest = IsolationForest(
+            contamination=contamination, 
+            random_state=42,
+            n_estimators=100,  # More trees for better performance
+            max_samples='auto'
+        )
+        iforest.fit(scaled_df[numerical_features])
+        models['iforest'] = iforest
+        
+        # 2. DBSCAN for density-based clustering
+        # Automatically estimate eps parameter based on data
+        from sklearn.neighbors import NearestNeighbors
+        nn_data = pca_components if use_pca else scaled_data
+        n_neighbors = min(5, len(nn_data) - 1) if len(nn_data) > 5 else 2
+        
+        if len(nn_data) > n_neighbors:
+            try:
+                nn = NearestNeighbors(n_neighbors=n_neighbors)
+                nn.fit(nn_data)
+                distances, _ = nn.kneighbors(nn_data)
+                distances = np.sort(distances[:, n_neighbors-1])
+                knee_locator = KneeLocator(
+                    range(len(distances)), 
+                    distances, 
+                    curve='convex', 
+                    direction='increasing'
+                )
+                eps = distances[knee_locator.knee] if knee_locator.knee else np.percentile(distances, 90)
+                
+                # Train DBSCAN
+                dbscan = DBSCAN(eps=eps, min_samples=n_neighbors)
+                if use_pca:
+                    dbscan.fit(pca_df)
+                else:
+                    dbscan.fit(scaled_df[numerical_features])
+                models['dbscan'] = dbscan
+                logging.info(f"DBSCAN clustering with eps={eps:.4f}, min_samples={n_neighbors}")
+            except Exception as e:
+                logging.warning(f"Could not train DBSCAN model: {e}")
+        
+        # 3. Initialize per-category models for more precise detection
+        if categorical_data is not None and 'category' in categorical_data.columns:
+            category_models = {}
+            categories = categorical_data['category'].unique()
+            
+            for category in categories:
+                try:
+                    # Get indices for this category
+                    category_indices = categorical_data.index[categorical_data['category'] == category].tolist()
+                    if len(category_indices) >= 5:  # Need enough samples
+                        category_data = scaled_df.iloc[category_indices]
+                        
+                        # Train category-specific Isolation Forest
+                        cat_iforest = IsolationForest(
+                            contamination=min(0.1, 1/len(category_data)),
+                            random_state=42,
+                            n_estimators=100
+                        )
+                        cat_iforest.fit(category_data[numerical_features])
+                        category_models[category] = cat_iforest
+                        logging.info(f"Trained category-specific model for '{category}' with {len(category_data)} samples")
+                except Exception as e:
+                    logging.warning(f"Error training category model for '{category}': {e}")
+            
+            models['category_models'] = category_models
+        
+        # Create stats for baseline model
+        baseline_stats = {}
+        for feature in numerical_features:
+            baseline_stats[feature] = {
+                'mean': df[feature].mean(),
+                'std': df[feature].std(),
+                'min': df[feature].min(),
+                'max': df[feature].max(),
+                'p25': df[feature].quantile(0.25),
+                'median': df[feature].quantile(0.5),
+                'p75': df[feature].quantile(0.75),
+                'p95': df[feature].quantile(0.95)
+            }
         
         # Store model info
         model_info = {
-            'model': model,
+            'models': models,
             'features': numerical_features,
+            'categorical_features': categorical_features if categorical_data is not None else [],
             'system_processes': system_processes,
-            'training_size': len(df)
+            'scaler': scaler,
+            'pca': pca if use_pca else None,
+            'pca_components': pca_components if use_pca else None,
+            'baseline_stats': baseline_stats,
+            'training_size': len(df),
+            'categories': categorical_data['category'].unique().tolist() if categorical_data is not None and 'category' in categorical_data.columns else []
         }
+        
+        logging.info(f"Trained ensemble ML models on {len(df)} processes with {len(numerical_features)} features")
         
         return model_info
         
     except Exception as e:
-        logging.error(f"Error training ML model: {e}")
+        logging.error(f"Error training ML models: {e}")
+        # Add this import to the top of the file or inside this function
+        import traceback
+        logging.error(traceback.format_exc())
         return None
 
 def detect_anomalies_ml(process_info, ml_model_info):
-    """Detect process anomalies using the trained ML model."""
-    if not ml_model_info or not ml_model_info.get('model'):
+    """
+    Detect process anomalies using ensemble ML models for more accurate detection.
+    Returns detailed anomaly information with scores from multiple models and features.
+    """
+    if not ml_model_info or not ml_model_info.get('models'):
         return None
         
     try:
         import pandas as pd
+        import numpy as np
+        import time
         
         pid = process_info.get('pid')
         process_name = process_info.get('process_name', '').lower()
         
-        # Skip system processes
-        if (process_name in ml_model_info.get('system_processes', []) and 
-            (pid <= 4 or process_name == 'system')):
+        # Skip system processes with PIDs below 5
+        if pid <= 4 or process_name == 'system':
             return None
+        
+        # Get or initialize learning state
+        learning_state = ml_model_info.get('learning_state', {
+            'start_time': time.time(),
+            'observation_period': 3600,  # 1 hour initial learning period
+            'processes_seen': {},
+            'learning_complete': False
+        })
+        
+        # Update learning state in the model info
+        ml_model_info['learning_state'] = learning_state
+        
+        # Check if we're still in the initial learning period
+        current_time = time.time()
+        in_learning_period = not learning_state['learning_complete'] and \
+                           (current_time - learning_state['start_time'] < learning_state['observation_period'])
+        
+        # Track this process in our learning state
+        if process_name not in learning_state['processes_seen']:
+            learning_state['processes_seen'][process_name] = {
+                'first_seen': current_time,
+                'observations': 1
+            }
+        else:
+            learning_state['processes_seen'][process_name]['observations'] += 1
+        
+        # Set baseline anomaly threshold
+        baseline_threshold = 0.35
+        
+        # Initialize process-specific stats if needed
+        process_specific_stats = ml_model_info.get('process_specific_stats', {})
+        
+        # If we have process-specific statistics from historical data, use them
+        if process_name in process_specific_stats:
+            proc_stats = process_specific_stats[process_name]
+            
+            # Calculate dynamic threshold based on historical data volatility
+            # More volatile processes get higher thresholds to reduce false positives
+            if 'volatility' in proc_stats:
+                volatility = proc_stats['volatility']
+                # Adjust threshold based on observed volatility (0.0-1.0 scale)
+                dynamic_threshold = baseline_threshold + (volatility * 0.4)  # Max +0.4 adjustment
+                anomaly_threshold = dynamic_threshold
+            else:
+                # No volatility data yet, use baseline
+                anomaly_threshold = baseline_threshold
+                
+            # Track number of previous detections to identify repeat offenders
+            # Processes that frequently trigger low-level alerts may need investigation
+            if 'detection_count' in proc_stats and proc_stats['detection_count'] > 5:
+                # For frequently alerting processes, slightly lower the threshold
+                # This ensures we don't completely tune out recurring suspicious behavior
+                anomaly_threshold = max(0.3, anomaly_threshold - 0.05)
+        else:
+            # No historical data for this process yet, use baseline
+            anomaly_threshold = baseline_threshold
         
         # Get process stats
         process_stats = get_process_stats(pid)
+        
+        # Determine process category
+        category = "system"
+        if process_name.endswith(".exe"):
+            if any(browser in process_name.lower() for browser in ["chrome", "firefox", "edge", "opera"]):
+                category = "browser"
+            elif any(server in process_name.lower() for server in ["httpd", "nginx", "apache", "iis", "w3wp"]):
+                category = "webserver"
+            elif any(db in process_name.lower() for db in ["sql", "oracle", "mysql", "postgres"]):
+                category = "database"
+            elif any(utility in process_name.lower() for utility in ["cmd", "powershell", "explorer"]):
+                category = "utility"
+            elif any(game in process_name.lower() for game in ["steam", "game", "uplay", "origin", "epic"]):
+                category = "gaming"
         
         # Prepare features matching the trained model's feature set
         features = {
@@ -1536,34 +2618,401 @@ def detect_anomalies_ml(process_info, ml_model_info):
             'handle_count': process_stats.get('handle_count', 0),
             'thread_count': process_stats.get('thread_count', 0),
             'memory_usage_mb': process_stats.get('memory_usage_kb', 0) / 1024,
-            'connection_count': process_stats.get('connection_count', 0)
+            'connection_count': process_stats.get('connection_count', 0),
+            'cpu_percent': process_stats.get('cpu_percent', 0),
+            'io_read_mb': process_stats.get('io_read_bytes', 0) / (1024 * 1024),
+            'io_write_mb': process_stats.get('io_write_bytes', 0) / (1024 * 1024),
+            # Derived features
+            'memory_per_thread': (process_stats.get('memory_usage_kb', 0) / 1024) / 
+                               max(process_stats.get('thread_count', 1), 1),
+            'handles_per_thread': process_stats.get('handle_count', 0) / 
+                                max(process_stats.get('thread_count', 1), 1),
+            'connections_per_thread': process_stats.get('connection_count', 0) / 
+                                    max(process_stats.get('thread_count', 1), 1)
         }
         
+        # Add categorical features
+        features['category'] = category
+        
         # Ensure we only use features available in the model
-        prediction_features = {}
-        for feature in ml_model_info['features']:
-            prediction_features[feature] = features.get(feature, 0)
+        numerical_features = ml_model_info.get('features', [])
+        categorical_features = ml_model_info.get('categorical_features', [])
         
-        # Make prediction and get anomaly score
-        model = ml_model_info['model']
-        prediction = model.predict(pd.DataFrame([prediction_features]))[0]
+        # Create prediction data frames
+        num_prediction_features = {}
+        for feature in numerical_features:
+            if feature in features:
+                num_prediction_features[feature] = features.get(feature, 0)
+            else:
+                num_prediction_features[feature] = 0
         
-        if prediction == -1:  # Anomaly detected
-            score = model.decision_function(pd.DataFrame([prediction_features]))[0]
+        cat_prediction_features = {}
+        for feature in categorical_features:
+            if feature in features:
+                cat_prediction_features[feature] = features.get(feature, '')
+            else:
+                cat_prediction_features[feature] = ''
+        
+        # Apply preprocessing
+        scaler = ml_model_info.get('scaler')
+        if scaler:
+            scaled_data = scaler.transform(pd.DataFrame([num_prediction_features]))
+            scaled_df = pd.DataFrame(scaled_data, columns=numerical_features)
+        else:
+            scaled_df = pd.DataFrame([num_prediction_features])
+        
+        # Apply PCA if available
+        pca = ml_model_info.get('pca')
+        if pca:
+            # Convert to numpy array without feature names to avoid the warning
+            scaled_data_for_pca = scaled_df.values
+            pca_components = pca.transform(scaled_data_for_pca)
+            pca_df = pd.DataFrame(
+                pca_components, 
+                columns=[f'pc{i+1}' for i in range(pca_components.shape[1])]
+            )
+        
+        # Initialize ensemble results
+        ensemble_results = {
+            'anomaly_scores': {},
+            'is_anomaly': False,
+            'combined_score': 0,
+            'anomalous_features': [],
+            'detection_methods': []
+        }
+        
+        # Apply each model
+        models = ml_model_info.get('models', {})
+        baseline_stats = ml_model_info.get('baseline_stats', {})
+        
+        # 1. Isolation Forest
+        if 'iforest' in models:
+            iforest = models['iforest']
+            iforest_pred = iforest.predict(scaled_df)[0]
+            iforest_score = iforest.decision_function(scaled_df)[0]
             
-            # Filter out weak anomalies to reduce noise
-            if score < -0.1:
-                return {
-                    'is_anomaly': True,
-                    'score': score,
-                    'features': features
+            # More negative score = more anomalous
+            normalized_score = -iforest_score  # Convert to positive = more anomalous
+            ensemble_results['anomaly_scores']['iforest'] = normalized_score
+            
+            if iforest_pred == -1 and normalized_score > 0.1:  # -1 is anomaly, but add threshold
+                ensemble_results['is_anomaly'] = True
+                ensemble_results['detection_methods'].append('isolation_forest')
+        
+        # 2. DBSCAN
+        if 'dbscan' in models:
+            dbscan = models['dbscan']
+            
+            # Predict using the same data used for training
+            if pca and ml_model_info.get('pca_components') is not None:
+                dbscan_input = pca_df
+            else:
+                dbscan_input = scaled_df
+                
+            try:
+                # For DBSCAN, predict returns cluster label (-1 for outliers)
+                dbscan_label = dbscan.fit_predict(dbscan_input)[0]
+                
+                # If it's an outlier
+                if dbscan_label == -1:
+                    ensemble_results['is_anomaly'] = True
+                    ensemble_results['detection_methods'].append('dbscan')
+                    ensemble_results['anomaly_scores']['dbscan'] = 1.0  # Max score for outliers
+                else:
+                    ensemble_results['anomaly_scores']['dbscan'] = 0.0
+            except Exception as e:
+                logging.debug(f"Error applying DBSCAN to process {pid}: {e}")
+        
+        # 3. Category-specific model if available
+        if 'category_models' in models and category in models['category_models']:
+            try:
+                cat_model = models['category_models'][category]
+                cat_pred = cat_model.predict(scaled_df)[0]
+                cat_score = cat_model.decision_function(scaled_df)[0]
+                
+                # Normalize score
+                normalized_cat_score = -cat_score
+                ensemble_results['anomaly_scores']['category_model'] = normalized_cat_score
+                
+                if cat_pred == -1 and normalized_cat_score > 0.1:
+                    ensemble_results['is_anomaly'] = True
+                    ensemble_results['detection_methods'].append(f'category_{category}')
+            except Exception as e:
+                logging.debug(f"Error applying category model for {category}: {e}")
+        
+        # 4. Statistical outlier detection (Z-score method)
+        significant_deviations = []
+        
+        for feature in numerical_features:
+            if feature in features and feature in baseline_stats:
+                feature_value = features[feature]
+                mean = baseline_stats[feature]['mean']
+                std = baseline_stats[feature]['std']
+                p95 = baseline_stats[feature]['p95']
+                
+                # Avoid division by zero
+                if std > 0:
+                    z_score = abs((feature_value - mean) / std)
+                    
+                    # Check for extreme values (Z-score > 3 or beyond 95th percentile)
+                    if z_score > 3 or feature_value > p95:
+                        # More weight to important metrics
+                        importance_weight = 1.0
+                        if feature in ['memory_usage_mb', 'cpu_percent', 'thread_count', 'connection_count']:
+                            importance_weight = 2.0  # Double importance
+                        
+                        significant_deviations.append({
+                            'feature': feature,
+                            'value': feature_value,
+                            'z_score': z_score,
+                            'percentile': 95 if feature_value > p95 else 50,
+                            'weight': importance_weight
+                        })
+        
+        # If we found significant statistical deviations
+        if significant_deviations:
+            # Sort by z-score (highest first)
+            significant_deviations.sort(key=lambda x: x['z_score'] * x['weight'], reverse=True)
+            
+            # Calculate weighted score based on deviations
+            stat_score = sum(dev['z_score'] * dev['weight'] for dev in significant_deviations) / \
+                        sum(dev['weight'] for dev in significant_deviations)
+            
+            ensemble_results['anomaly_scores']['statistical'] = min(stat_score / 10, 1.0)  # Normalize to 0-1
+            ensemble_results['anomalous_features'] = significant_deviations
+            
+            # If statistical deviation is very high
+            if stat_score > 5 or len(significant_deviations) >= 3:
+                ensemble_results['is_anomaly'] = True
+                ensemble_results['detection_methods'].append('statistical')
+        
+        # Calculate combined anomaly score
+        all_scores = [score for score in ensemble_results['anomaly_scores'].values() if score > 0]
+        if all_scores:
+            # Average score from all active methods
+            ensemble_results['combined_score'] = sum(all_scores) / len(all_scores)
+        
+        # If we're in learning period, just record the data but don't generate alerts
+        if in_learning_period:
+            # Record observations for this process in the learning state
+            proc_learning = learning_state['processes_seen'].get(process_name, {})
+            
+            # Store feature observations for later analysis
+            if 'feature_observations' not in proc_learning:
+                proc_learning['feature_observations'] = {}
+                
+            for feature, value in features.items():
+                if feature not in proc_learning['feature_observations']:
+                    proc_learning['feature_observations'][feature] = []
+                
+                # Store only the last 10 observations to conserve memory
+                observations = proc_learning['feature_observations'][feature]
+                observations.append(value)
+                if len(observations) > 10:
+                    proc_learning['feature_observations'][feature] = observations[-10:]
+            
+            # Store anomaly score observations
+            if 'anomaly_scores' not in proc_learning:
+                proc_learning['anomaly_scores'] = []
+                
+            if ensemble_results['combined_score'] > 0:
+                proc_learning['anomaly_scores'].append(ensemble_results['combined_score'])
+                if len(proc_learning['anomaly_scores']) > 10:
+                    proc_learning['anomaly_scores'] = proc_learning['anomaly_scores'][-10:]
+            
+            # Update the learning state
+            learning_state['processes_seen'][process_name] = proc_learning
+            
+            # Check if it's time to finalize the learning period
+            if current_time - learning_state['start_time'] >= learning_state['observation_period']:
+                # Calculate process-specific stats from learning period
+                for proc_name, proc_data in learning_state['processes_seen'].items():
+                    if 'feature_observations' in proc_data and 'anomaly_scores' in proc_data:
+                        # Initialize process-specific stats if needed
+                        if proc_name not in process_specific_stats:
+                            process_specific_stats[proc_name] = {
+                                'first_seen': proc_data.get('first_seen', current_time),
+                                'observations': proc_data.get('observations', 0),
+                                'detection_count': 0,
+                                'scores': []
+                            }
+                        
+                        # Calculate initial volatility if we have enough data
+                        anomaly_scores = proc_data.get('anomaly_scores', [])
+                        if len(anomaly_scores) >= 3:
+                            volatility = np.std(anomaly_scores) / max(np.mean(anomaly_scores), 0.01)
+                            process_specific_stats[proc_name]['volatility'] = min(1.0, volatility)
+                
+                # Mark learning as complete
+                learning_state['learning_complete'] = True
+                logging.info("ML anomaly detection learning period complete, enabling alerts")
+            
+            # Don't generate alerts during learning period
+            return None
+            
+        # Final decision - if any method detected an anomaly and score is high enough
+        if ensemble_results['is_anomaly'] and ensemble_results['combined_score'] > anomaly_threshold:
+            # Add process info to result for context
+            ensemble_results['features'] = features
+            ensemble_results['pid'] = pid
+            ensemble_results['process_name'] = process_name
+            ensemble_results['category'] = category
+            
+            # Classify the type of anomaly based on features
+            ensemble_results['anomaly_type'] = classify_anomaly_type(ensemble_results)
+            
+            # Build a detailed explanation of why this is anomalous
+            anomaly_explanation = []
+            
+            # Explain which detection methods triggered
+            methods = ensemble_results['detection_methods']
+            if methods:
+                method_explanations = {
+                    'isolation_forest': "unusual compared to baseline process behavior",
+                    'dbscan': "forms an outlier cluster separate from normal processes",
+                    'statistical': "shows statistically significant deviations in key metrics",
+                    'category_model': f"unusual behavior for {category} processes"
                 }
+                
+                # Add method-specific explanations
+                for method in methods:
+                    if method.startswith('category_'):
+                        anomaly_explanation.append(method_explanations['category_model'])
+                    elif method in method_explanations:
+                        anomaly_explanation.append(method_explanations[method])
+            
+            # Add feature-specific anomaly explanations
+            if ensemble_results['anomalous_features']:
+                # Take the top 3 most significant anomalous features
+                top_features = ensemble_results['anomalous_features'][:3]
+                for feature in top_features:
+                    feature_name = feature['feature']
+                    feature_value = feature['value']
+                    z_score = feature['z_score']
+                    
+                    # Create human-readable feature names
+                    readable_names = {
+                        'memory_usage_mb': 'memory usage',
+                        'cpu_percent': 'CPU usage',
+                        'thread_count': 'number of threads',
+                        'connection_count': 'network connections',
+                        'handle_count': 'handle count',
+                        'child_processes': 'child processes',
+                        'io_read_mb': 'disk read activity',
+                        'io_write_mb': 'disk write activity',
+                        'memory_per_thread': 'memory per thread ratio',
+                        'handles_per_thread': 'handles per thread ratio'
+                    }
+                    
+                    readable_name = readable_names.get(feature_name, feature_name)
+                    
+                    # Add contextual explanation based on feature
+                    if feature_name == 'memory_usage_mb':
+                        anomaly_explanation.append(f"unusual {readable_name} of {feature_value:.1f}MB ({z_score:.1f}x higher than normal)")
+                    elif feature_name == 'cpu_percent':
+                        anomaly_explanation.append(f"unusual {readable_name} of {feature_value:.1f}% ({z_score:.1f}x higher than normal)")
+                    elif feature_name in ['thread_count', 'connection_count', 'handle_count', 'child_processes']:
+                        anomaly_explanation.append(f"unusual {readable_name} of {int(feature_value)} ({z_score:.1f}x higher than normal)")
+                    else:
+                        anomaly_explanation.append(f"unusual {readable_name} ({z_score:.1f}x deviation from normal)")
+            
+            # Add anomaly type context
+            anomaly_type = ensemble_results['anomaly_type']
+            type_context = {
+                'memory_abnormality': "may indicate memory leak or resource abuse",
+                'excessive_threads': "could suggest parallel processing abuse or thread injection",
+                'network_abnormality': "unusual network activity that could indicate command & control",
+                'handle_leak': "possible resource leak or handle table manipulation",
+                'potential_injection': "pattern consistent with code injection techniques",
+                'privileged_network_activity': "privileged process with unusual network activity",
+                'cpu_abnormality': "excessive CPU usage for this process type",
+                'disk_io_abnormality': "unusual disk activity that could indicate data exfiltration"
+            }
+            
+            if anomaly_type in type_context:
+                anomaly_explanation.append(type_context[anomaly_type])
+            
+            # Combine explanations into a single detailed description
+            ensemble_results['explanation'] = "; ".join(anomaly_explanation)
+            
+            # Create properly structured description for logging
+            description = f"Anomaly type: {anomaly_type}; Confidence: {ensemble_results['combined_score']:.2f}; {ensemble_results['explanation']}"
+            
+            # Enhanced logging with detailed explanation
+            logging.warning(f"ML detected anomaly in process {process_name} (PID: {pid}) - Score: {ensemble_results['combined_score']:.2f} - {ensemble_results['anomaly_type']}")
+            logging.info(f"Anomaly details for {process_name} (PID: {pid}): {ensemble_results['explanation']}")
+            
+            # Add description to return value for use in alerts
+            ensemble_results['description'] = description
+            
+            # Track this detection for future threshold adjustment
+            if process_name not in process_specific_stats:
+                process_specific_stats[process_name] = {
+                    'detection_count': 1,
+                    'last_detection_time': time.time(),
+                    'scores': [ensemble_results['combined_score']]
+                }
+            else:
+                process_specific_stats[process_name]['detection_count'] += 1
+                process_specific_stats[process_name]['last_detection_time'] = time.time()
+                
+                # Keep only the last 10 scores to avoid unbounded growth
+                scores = process_specific_stats[process_name].get('scores', [])
+                scores.append(ensemble_results['combined_score'])
+                if len(scores) > 10:
+                    scores = scores[-10:]
+                process_specific_stats[process_name]['scores'] = scores
+                
+                # Calculate volatility if we have enough data points
+                if len(scores) >= 3:
+                    # Standard deviation as a measure of volatility
+                    volatility = np.std(scores) / max(np.mean(scores), 0.01)  # Normalized volatility
+                    process_specific_stats[process_name]['volatility'] = min(1.0, volatility)
+            
+            # Update the model info with new statistics
+            ml_model_info['process_specific_stats'] = process_specific_stats
+            
+            return ensemble_results
         
         return None
         
     except Exception as e:
         logging.error(f"Error detecting ML anomalies for PID {process_info.get('pid')}: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
         return None
+
+def classify_anomaly_type(anomaly_result):
+    """Classify the type of anomaly based on the anomalous features."""
+    anomaly_type = "unknown"
+    
+    # Extract anomalous features
+    anomalous_features = [feat['feature'] for feat in anomaly_result.get('anomalous_features', [])]
+    features = anomaly_result.get('features', {})
+    
+    # Classify based on patterns
+    if 'thread_count' in anomalous_features and features.get('thread_count', 0) > 20:
+        anomaly_type = "excessive_threads"
+    elif 'memory_usage_mb' in anomalous_features and features.get('memory_usage_mb', 0) > 500:
+        anomaly_type = "memory_abnormality"
+    elif 'connection_count' in anomalous_features and features.get('connection_count', 0) > 20:
+        anomaly_type = "network_abnormality"
+    elif 'cpu_percent' in anomalous_features and features.get('cpu_percent', 0) > 70:
+        anomaly_type = "cpu_abnormality"
+    elif 'handle_count' in anomalous_features and features.get('handle_count', 0) > 1000:
+        anomaly_type = "handle_leak"
+    elif 'io_write_mb' in anomalous_features or 'io_read_mb' in anomalous_features:
+        anomaly_type = "disk_io_abnormality"
+    
+    # More complex patterns
+    if 'memory_per_thread' in anomalous_features and 'thread_count' in anomalous_features:
+        if features.get('thread_count', 0) > 10:
+            anomaly_type = "potential_injection"
+    
+    if 'is_admin' in features and features['is_admin'] == 1 and 'connection_count' in anomalous_features:
+        anomaly_type = "privileged_network_activity"
+    
+    return anomaly_type
 
 def load_mitre_mapping():
     """Load MITRE ATT&CK technique mappings."""
@@ -2292,22 +3741,75 @@ def maintain_process_groups(integrity_state, max_age_days=30):
     
     # 1. Clean old hashes
     for group_id, group in integrity_state["process_groups"].items():
-        for hash_id in list(group["known_hashes"].keys()):
-            hash_data = group["known_hashes"][hash_id]
-            last_seen_str = hash_data.get("last_seen")
+        # Special handling for browsers and other multi-process applications
+        browser_processes = ["chrome.exe", "firefox.exe", "msedge.exe", "brave.exe"]
+        is_browser = any(browser in group_id.lower() for browser in browser_processes)
+        
+        # Different retention policies based on process type
+        group_cutoff = cutoff_date
+        if is_browser:
+            # Browsers can have many short-lived processes, use shorter retention
+            # But keep at least the most recent 5 hashes regardless of age
+            recent_hashes = sorted(
+                [(h, d.get("last_seen", "")) for h, d in group["known_hashes"].items()],
+                key=lambda x: x[1],
+                reverse=True
+            )
             
-            if not last_seen_str:
-                continue
+            # Keep the 5 most recent hashes regardless of age
+            hashes_to_keep = set([h for h, _ in recent_hashes[:5]])
+            
+            # Use a shorter cutoff for browsers (15 days)
+            browser_cutoff = now - timedelta(days=15)
+            
+            # Remove old hashes except the 5 most recent
+            for hash_id in list(group["known_hashes"].keys()):
+                if hash_id in hashes_to_keep:
+                    continue
+                    
+                hash_data = group["known_hashes"][hash_id]
+                last_seen_str = hash_data.get("last_seen")
                 
-            try:
-                last_seen = datetime.fromisoformat(last_seen_str)
-                if last_seen < cutoff_date:
-                    # This hash hasn't been seen in a long time, remove it
-                    del group["known_hashes"][hash_id]
-                    modified = True
-            except (ValueError, TypeError):
-                # Invalid date format, skip
-                continue
+                if not last_seen_str:
+                    continue
+                    
+                try:
+                    last_seen = datetime.fromisoformat(last_seen_str)
+                    if last_seen < browser_cutoff:
+                        # This hash hasn't been seen recently, remove it
+                        del group["known_hashes"][hash_id]
+                        modified = True
+                        logging.info(f"Removed old browser hash {hash_id} from {group_id}")
+                except (ValueError, TypeError):
+                    # Invalid date format, skip
+                    continue
+        else:
+            # Standard retention policy for non-browser processes
+            for hash_id in list(group["known_hashes"].keys()):
+                hash_data = group["known_hashes"][hash_id]
+                last_seen_str = hash_data.get("last_seen")
+                
+                if not last_seen_str:
+                    continue
+                    
+                try:
+                    last_seen = datetime.fromisoformat(last_seen_str)
+                    if last_seen < cutoff_date:
+                        # This hash hasn't been seen in a long time, remove it
+                        del group["known_hashes"][hash_id]
+                        modified = True
+                        logging.info(f"Removed old hash {hash_id} from {group_id}")
+                except (ValueError, TypeError):
+                    # Invalid date format, skip
+                    continue
+        
+        # Clean up command line patterns for browsers
+        # They can accumulate many different patterns with random data
+        if is_browser and len(group["command_line_patterns"]) > 30:
+            # Keep only the 30 most representative patterns
+            group["command_line_patterns"] = group["command_line_patterns"][:30]
+            modified = True
+            logging.info(f"Trimmed excess command line patterns for {group_id}")
     
     # 2. Find and merge similar groups
     # Group process groups by process name
@@ -2375,6 +3877,31 @@ def maintain_process_groups(integrity_state, max_age_days=30):
                     # Remove the merged group
                     del integrity_state["process_groups"][group2_id]
                     modified = True
+    
+    # 3. Clean up any individual process entries that no longer have executable files
+    # First identify process entries to remove (not in process_groups)
+    processes_to_remove = []
+    for process_hash, process_info in integrity_state.items():
+        # Skip process_groups and non-dictionary entries
+        if process_hash == "process_groups" or not isinstance(process_info, dict):
+            continue
+            
+        exe_path = process_info.get("exe_path", "")
+        
+        # If exe_path is provided and file doesn't exist, mark for removal
+        if exe_path and exe_path != "ACCESS_DENIED" and not os.path.exists(exe_path):
+            processes_to_remove.append(process_hash)
+    
+    # Remove the identified processes
+    for process_hash in processes_to_remove:
+        if process_hash in integrity_state:
+            process_info = integrity_state[process_hash]
+            logging.info(f"Removing process entry with missing executable: {process_info.get('process_name', '')} at {process_info.get('exe_path', '')}")
+            del integrity_state[process_hash]
+            modified = True
+    
+    if modified:
+        logging.info(f"Process group maintenance completed with {len(integrity_state['process_groups'])} groups")
     
     return modified
 
@@ -2711,6 +4238,10 @@ def periodic_integrity_scan(interval=120):
     
     logging.info("Starting periodic integrity scan...")
     
+    # For tracking rapid termination and creation of processes (like browser tabs)
+    recently_terminated_pids = {}  # Map PID to hash and timestamp
+    suppression_timeout = 60  # Seconds to suppress alerts for same process type
+    
     while SERVICE_RUNNING:
         try:
             logging.info("Running integrity check on listening processes...")
@@ -2740,15 +4271,36 @@ def periodic_integrity_scan(interval=120):
                 if process_hash not in integrity_state:
                     process_name = current_info.get("process_name", "UNKNOWN")
                     if process_name != "UNKNOWN":  # Only log for valid processes
-                        logging.warning(f"Untracked process detected: {process_name} (PID: {pid})")
-                        log_event_to_pim(
-                            event_type="NEW_UNTRACKED_PROCESS",
-                            file_path=current_info.get("exe_path", ""),
-                            previous_metadata=None,
-                            new_metadata=current_info,
-                            previous_hash=None,
-                            new_hash=process_hash
-                        )
+                        # Check if this is a browser or similar multi-process application
+                        browser_processes = ["chrome.exe", "firefox.exe", "msedge.exe", "brave.exe"]
+                        is_browser = process_name.lower() in [b.lower() for b in browser_processes]
+                        
+                        # Suppress excessive notifications for browsers with multiple processes
+                        # Check if we recently terminated a similar process name
+                        suppress_alert = False
+                        if is_browser:
+                            current_time = time.time()
+                            for term_pid, (term_hash, term_time, term_name) in list(recently_terminated_pids.items()):
+                                # If this is a similar process and was terminated recently
+                                if (term_name.lower() == process_name.lower() and
+                                    current_time - term_time < suppression_timeout):
+                                    suppress_alert = True
+                                    logging.debug(f"Suppressing alert for new browser process {process_name} (PID: {pid}) - similar process recently terminated")
+                                    break
+                                # Clean up old entries
+                                elif current_time - term_time > suppression_timeout:
+                                    del recently_terminated_pids[term_pid]
+                        
+                        if not suppress_alert:
+                            logging.warning(f"Untracked process detected: {process_name} (PID: {pid})")
+                            log_event_to_pim(
+                                event_type="NEW_UNTRACKED_PROCESS",
+                                file_path=current_info.get("exe_path", ""),
+                                previous_metadata=None,
+                                new_metadata=current_info,
+                                previous_hash=None,
+                                new_hash=process_hash
+                            )
                     continue
                 
                 # Get stored metadata
@@ -2761,10 +4313,23 @@ def periodic_integrity_scan(interval=120):
                 
                 for field in key_fields:
                     if stored_info.get(field) != current_info.get(field):
-                        changed_fields[field] = {
-                            "previous": stored_info.get(field),
-                            "current": current_info.get(field)
-                        }
+                        # For browsers, don't treat every cmdline change as significant
+                        if field == "cmdline" and is_browser_process(current_info.get("process_name", "")):
+                            # Compare patterns instead of raw command lines
+                            stored_pattern = simplify_command_line(stored_info.get(field, ""))
+                            current_pattern = simplify_command_line(current_info.get(field, ""))
+                            
+                            # Only consider it changed if patterns differ significantly
+                            if stored_pattern != current_pattern:
+                                changed_fields[field] = {
+                                    "previous": stored_info.get(field),
+                                    "current": current_info.get(field)
+                                }
+                        else:
+                            changed_fields[field] = {
+                                "previous": stored_info.get(field),
+                                "current": current_info.get(field)
+                            }
                 
                 if changed_fields:
                     logging.warning(
@@ -2815,40 +4380,79 @@ def detect_process_hollowing(pid, process_info):
         # Check for unmapped main module - a sign of hollowing
         main_module_found = False
         image_base_address = None
+        has_unmapped_exec = False
+        
+        # Store regions by type for analysis
+        image_regions = []
+        private_regions = []
         
         for region in memory_regions:
             if region["type"] == "Image" and "0x" in region["address"]:
                 # Convert to int for address comparison
                 addr = int(region["address"].replace("0x", ""), 16)
+                image_regions.append(region)
                 
                 # Store the lowest image base address (likely the main module)
                 if image_base_address is None or addr < image_base_address:
                     image_base_address = addr
                     main_module_found = True
+            elif region["type"] == "Private":
+                private_regions.append(region)
+                
+                # Check for executable private memory
+                if region["protection"]["executable"]:
+                    has_unmapped_exec = True
         
-        if not main_module_found:
+        if not main_module_found and has_unmapped_exec:
             suspicious_indicators.append({
-                "indicator": "Missing main module",
-                "description": "Process lacks expected main module memory mapping",
-                "severity": "high"
+                "indicator": "Classic process hollowing",
+                "description": "Process lacks main module mapping but has executable memory",
+                "severity": "critical",
+                "region": {"address": "N/A", "size_kb": 0}
             })
             
-        # Check for executable memory not part of the main module
-        for region in memory_regions:
+        # Check for PE header at beginning of private executable regions
+        # This is a common pattern in process hollowing
+        for region in private_regions:
             if (region["protection"]["executable"] and 
-                region["type"] == "Private" and 
-                "0x" in region["address"]):
+                region["size_kb"] > 10):  # Minimum size for a reasonable PE
                 
-                addr = int(region["address"].replace("0x", ""), 16)
+                region_addr = int(region["address"].replace("0x", ""), 16) if "0x" in region["address"] else 0
                 
-                # If executable memory outside main module base
-                if addr != image_base_address:
+                # Check if this region is NOT at the image base but is executable
+                if image_base_address and region_addr != image_base_address and region["protection"]["executable"]:
                     suspicious_indicators.append({
-                        "indicator": "Executable memory outside main module",
-                        "description": f"Executable memory at {region['address']} not part of main module",
-                        "severity": "medium"
+                        "indicator": "Potential hollowed region",
+                        "description": f"Executable memory at {region['address']} outside main module",
+                        "severity": "high",
+                        "region": region
                     })
-                    
+        
+        # Look for suspicious protection changes on Image regions
+        for region in image_regions:
+            # Process hollowing often changes protections of original sections
+            if region["protection"]["writable"] and region["protection"]["executable"]:
+                suspicious_indicators.append({
+                    "indicator": "Suspicious image protection",
+                    "description": f"Image at {region['address']} has RWX protection (unusual for legitimate code)",
+                    "severity": "high",
+                    "region": region
+                })
+            
+        # Check for memory discrepancies in main executable
+        # Process hollowing typically involves a process that has remarkably small memory usage
+        # compared to what would be expected for the claimed executable
+        process_size_total = sum(region["size_kb"] for region in memory_regions)
+        typical_min_size = 1000  # Most legit processes have at least 1MB memory usage
+        
+        if process_size_total < typical_min_size and process_info.get("process_name", "").lower() not in ["cmd.exe", "notepad.exe"]:
+            suspicious_indicators.append({
+                "indicator": "Unusually small process size",
+                "description": f"Process claims to be {process_info.get('process_name')} but only uses {process_size_total}KB of memory",
+                "severity": "medium",
+                "region": {"address": "N/A", "size_kb": process_size_total}
+            })
+            
     except Exception as e:
         logging.error(f"Error detecting process hollowing for PID {pid}: {e}")
     
@@ -2865,25 +4469,90 @@ def detect_reflective_dll_injection(pid, process_info):
         # Get memory regions for the process
         memory_regions = enumerate_process_memory_regions(pid)
         
-        # Look for PE signatures in private memory regions
+        # Get process stats to check for anomalies
+        process_stats = get_process_stats(pid)
+        
+        # Look for key indicators of reflective loading
         for region in memory_regions:
             if (region["protection"]["executable"] and 
                 region["type"] == "Private" and
-                region["size_kb"] > 10):  # Minimum size for a DLL
+                region["size_kb"] > 20):  # Minimum reasonable size for a DLL
+                
+                # Key pattern: Executable & writable private memory
+                if region["protection"]["writable"]:
+                    suspicious_indicators.append({
+                        "indicator": "RWX memory region",
+                        "description": f"Memory at {region['address']} has RWX protection - typical for reflective loading",
+                        "severity": "high",
+                        "region": region
+                    })
+                else:
+                    # Lower severity for RX-only memory, still suspicious if large enough
+                    if region["size_kb"] > 100:
+                        suspicious_indicators.append({
+                            "indicator": "Large executable private memory",
+                            "description": f"Large executable allocation at {region['address']} ({region['size_kb']}KB) - possible loaded code",
+                            "severity": "medium",
+                            "region": region
+                        })
+        
+        # Look for suspicious allocations that don't align with typical module boundaries
+        # Most legitimate modules are loaded at addresses aligned to 64K boundaries (0x10000)
+        for region in memory_regions:
+            if region["protection"]["executable"] and region["type"] == "Private" and "0x" in region["address"]:
+                region_addr = int(region["address"].replace("0x", ""), 16)
+                
+                # Check for non-aligned executable memory allocations
+                if region_addr % 0x10000 != 0 and region["size_kb"] > 40:
+                    suspicious_indicators.append({
+                        "indicator": "Non-standard memory alignment",
+                        "description": f"Executable region at {region['address']} is not aligned to standard module boundaries",
+                        "severity": "medium",
+                        "region": region
+                    })
+        
+        # Additional check: drastic increase in thread count often accompanies reflective injection
+        if process_stats["thread_count"] > 40:
+            suspicious_indicators.append({
+                "indicator": "High thread count",
+                "description": f"Process has {process_stats['thread_count']} threads which is unusually high",
+                "severity": "medium",
+                "region": {"address": "N/A", "size_kb": 0}
+            })
+        
+        # Check for regions with suspiciously close proximity to stack/heap allocations
+        # Reflective loaders often allocate memory near stack/heap to avoid detection
+        regions_by_addr = []
+        for region in memory_regions:
+            if "0x" in region["address"]:
+                addr = int(region["address"].replace("0x", ""), 16)
+                regions_by_addr.append((addr, region))
+        
+        # Sort regions by address
+        regions_by_addr.sort(key=lambda x: x[0])
+        
+        # Check for unusual groupings of regions
+        for i in range(1, len(regions_by_addr)):
+            prev_addr, prev_region = regions_by_addr[i-1]
+            curr_addr, curr_region = regions_by_addr[i]
+            
+            # Check if we have executable memory right after stack/heap
+            if (prev_region["type"] in ["Private"] and 
+                not prev_region["protection"]["executable"] and
+                curr_region["protection"]["executable"] and
+                curr_addr - (prev_addr + prev_region["size_kb"] * 1024) < 4096):  # Close proximity threshold (4KB)
                 
                 suspicious_indicators.append({
-                    "indicator": "Potential reflective DLL",
-                    "description": f"Executable private memory at {region['address']} with size {region['size_kb']}KB",
-                    "severity": "high" if region["protection"]["writable"] else "medium"
+                    "indicator": "Suspicious memory layout",
+                    "description": f"Executable memory at {curr_region['address']} located suspiciously close to non-executable region",
+                    "severity": "high",
+                    "region": curr_region
                 })
         
     except Exception as e:
         logging.error(f"Error detecting reflective DLL injection for PID {pid}: {e}")
     
     return suspicious_indicators
-
-# Global dictionary to store baseline DLL information for processes
-PROCESS_DLL_BASELINE = {}
 
 def initialize_dll_baseline(pid, process_info):
     """Initialize baseline of loaded DLLs for a process."""
@@ -2951,6 +4620,11 @@ def detect_dll_search_order_hijacking(pid, process_info):
     # Get process directory
     process_dir = os.path.dirname(exe_path)
     
+    # Get system directories for comparison
+    system_dir = os.path.join(os.environ.get('SYSTEMROOT', 'C:\\Windows'), 'System32')
+    syswow64_dir = os.path.join(os.environ.get('SYSTEMROOT', 'C:\\Windows'), 'SysWOW64')
+    windows_dir = os.environ.get('SYSTEMROOT', 'C:\\Windows')
+    
     # Initialize baseline if not already done
     if pid not in PROCESS_DLL_BASELINE:
         initialize_dll_baseline(pid, process_info)
@@ -2959,26 +4633,142 @@ def detect_dll_search_order_hijacking(pid, process_info):
     baseline = PROCESS_DLL_BASELINE[pid]
     
     try:
-        # Check for known DLLs in suspicious locations
-        # List of commonly hijacked DLLs
+        # List of commonly hijacked system DLLs
         common_hijacked_dlls = [
             "kernel32.dll", "user32.dll", "advapi32.dll", "shell32.dll",
             "version.dll", "wininet.dll", "cryptsp.dll", "urlmon.dll",
-            "netapi32.dll", "secur32.dll", "oleaut32.dll", "msvcp140.dll"
+            "netapi32.dll", "secur32.dll", "oleaut32.dll", "msvcp140.dll",
+            "ucrtbase.dll", "comctl32.dll", "ws2_32.dll", "ntdll.dll",
+            "msvcp120.dll", "vcruntime140.dll", "msvcr100.dll", "api-ms-win-crt-runtime-l1-1-0.dll"
         ]
         
-        # Check for these DLLs in application directory
+        # List of commonly hijacked application DLLs
+        common_app_hijacked_dlls = [
+            "sqlite3.dll", "libcurl.dll", "python*.dll", "java*.dll",
+            "boost_*.dll", "openssl*.dll", "libeay32.dll", "ssleay32.dll"
+        ]
+        
+        # Enhanced search order hijacking detection
+        
+        # 1. Check for system DLLs in non-system locations
         for dll_name in common_hijacked_dlls:
             potential_hijack_path = os.path.join(process_dir, dll_name)
             if os.path.exists(potential_hijack_path):
                 # This is a red flag - system DLL in application directory
                 suspicious_indicators.append({
-                    "indicator": "Potential DLL search order hijacking",
+                    "indicator": "System DLL in application directory",
                     "description": f"System DLL '{dll_name}' found in application directory: {process_dir}",
                     "severity": "high",
                     "dll_path": potential_hijack_path
                 })
                 
+                # Also check for forged digital signatures
+                try:
+                    # Use Windows API to check signatures
+                    import ctypes
+                    from ctypes import wintypes
+                    
+                    wintrust = ctypes.WinDLL('wintrust.dll')
+                    # Structure declarations for WinVerifyTrust
+                    class GUID(ctypes.Structure):
+                        _fields_ = [
+                            ('Data1', wintypes.DWORD),
+                            ('Data2', wintypes.WORD),
+                            ('Data3', wintypes.WORD),
+                            ('Data4', wintypes.BYTE * 8)
+                        ]
+                        
+                    class WINTRUST_FILE_INFO(ctypes.Structure):
+                        _fields_ = [
+                            ('cbStruct', wintypes.DWORD),
+                            ('pcwszFilePath', wintypes.LPCWSTR),
+                            ('hFile', wintypes.HANDLE),
+                            ('pgKnownSubject', ctypes.POINTER(GUID))
+                        ]
+                        
+                    class WINTRUST_DATA(ctypes.Structure):
+                        _fields_ = [
+                            ('cbStruct', wintypes.DWORD),
+                            ('pPolicyCallbackData', wintypes.LPVOID),
+                            ('pSIPClientData', wintypes.LPVOID),
+                            ('dwUIChoice', wintypes.DWORD),
+                            ('fdwRevocationChecks', wintypes.DWORD),
+                            ('dwUnionChoice', wintypes.DWORD),
+                            ('pFile', ctypes.POINTER(WINTRUST_FILE_INFO)),
+                            ('dwStateAction', wintypes.DWORD),
+                            ('hWVTStateData', wintypes.HANDLE),
+                            ('pwszURLReference', wintypes.LPCWSTR),
+                            ('dwProvFlags', wintypes.DWORD),
+                            ('dwUIContext', wintypes.DWORD)
+                        ]
+                        
+                    # Constants for WinVerifyTrust
+                    WTD_UI_NONE = 2
+                    WTD_REVOKE_NONE = 0
+                    WTD_CHOICE_FILE = 1
+                    WTD_STATEACTION_VERIFY = 1
+                    WTD_STATEACTION_CLOSE = 2
+                    
+                    # GUID for WinVerifyTrust
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2 = GUID()
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.Data1 = 0x00AAC56B
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.Data2 = 0xCD44
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.Data3 = 0x11D0
+                    WINTRUST_ACTION_GENERIC_VERIFY_V2.Data4 = (0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE)
+                    
+                    # Check the digital signature
+                    file_info = WINTRUST_FILE_INFO()
+                    file_info.cbStruct = ctypes.sizeof(file_info)
+                    file_info.pcwszFilePath = potential_hijack_path
+                    file_info.hFile = None
+                    file_info.pgKnownSubject = None
+                    
+                    trust_data = WINTRUST_DATA()
+                    trust_data.cbStruct = ctypes.sizeof(trust_data)
+                    trust_data.pPolicyCallbackData = None
+                    trust_data.pSIPClientData = None
+                    trust_data.dwUIChoice = WTD_UI_NONE
+                    trust_data.fdwRevocationChecks = WTD_REVOKE_NONE
+                    trust_data.dwUnionChoice = WTD_CHOICE_FILE
+                    trust_data.pFile = ctypes.pointer(file_info)
+                    trust_data.dwStateAction = WTD_STATEACTION_VERIFY
+                    trust_data.hWVTStateData = None
+                    trust_data.pwszURLReference = None
+                    trust_data.dwProvFlags = 0
+                    trust_data.dwUIContext = 0
+                    
+                    result = wintrust.WinVerifyTrust(
+                        None,
+                        ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY_V2),
+                        ctypes.byref(trust_data)
+                    )
+                    
+                    # Clean up
+                    trust_data.dwStateAction = WTD_STATEACTION_CLOSE
+                    wintrust.WinVerifyTrust(
+                        None,
+                        ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY_V2),
+                        ctypes.byref(trust_data)
+                    )
+                    
+                    # Process result
+                    if result != 0:
+                        suspicious_indicators.append({
+                            "indicator": "Unsigned system DLL in application directory",
+                            "description": f"System DLL '{dll_name}' in app directory is unsigned or has invalid signature",
+                            "severity": "critical",
+                            "dll_path": potential_hijack_path
+                        })
+                except Exception as sig_err:
+                    logging.debug(f"Error checking signature for {potential_hijack_path}: {sig_err}")
+        
+        # 2. Check for unorthodox DLL locations
+        temp_dirs = [
+            os.environ.get('TEMP', ''),
+            os.environ.get('TMP', ''),
+            os.path.join(os.environ.get('USERPROFILE', ''), 'AppData', 'Local', 'Temp')
+        ]
+        
         # Get current loaded DLLs
         current_dlls = []
         try:
@@ -3003,31 +4793,66 @@ def detect_dll_search_order_hijacking(pid, process_info):
             dll_path = dll["path"].lower()
             dll_name = os.path.basename(dll_path)
             
-            # Check if this is a new DLL not in baseline
-            if dll_path not in baseline_dll_paths:
-                # Check if DLL is loaded from suspicious location
-                if dll_name.lower() in [d.lower() for d in common_hijacked_dlls]:
-                    # System DLL loaded from non-system directory
-                    if "system32" not in dll_path.lower() and "syswow64" not in dll_path.lower():
+            # 3. Check for DLLs loaded from temp directories
+            if any(temp_dir.lower() in dll_path.lower() for temp_dir in temp_dirs if temp_dir):
+                suspicious_indicators.append({
+                    "indicator": "DLL loaded from temp directory",
+                    "description": f"DLL '{dll_name}' loaded from temporary location: {dll_path}",
+                    "severity": "high",
+                    "dll_path": dll_path
+                })
+            
+            # 4. Check for DLLs with same names as system DLLs but in wrong locations
+            if dll_name.lower() in [d.lower() for d in common_hijacked_dlls]:
+                # Check if this DLL is not in system directories
+                if (system_dir.lower() not in dll_path.lower() and 
+                    syswow64_dir.lower() not in dll_path.lower() and
+                    windows_dir.lower() not in dll_path.lower()):
+                    suspicious_indicators.append({
+                        "indicator": "System DLL loaded from non-system location",
+                        "description": f"System DLL '{dll_name}' loaded from non-standard location: {dll_path}",
+                        "severity": "high",
+                        "dll_path": dll_path
+                    })
+            
+            # 5. Check if this is a new DLL not in baseline with wildcard matching
+            if not any(dll_path == baseline_path for baseline_path in baseline_dll_paths):
+                # Check if matches any application DLL patterns
+                for pattern in common_app_hijacked_dlls:
+                    if '*' in pattern and pattern.replace('*', '') in dll_name.lower():
+                        # This is a commonly hijacked application DLL, check its location
+                        if not dll_path.lower().startswith(process_dir.lower()):
+                            suspicious_indicators.append({
+                                "indicator": "Application DLL loaded from unusual location",
+                                "description": f"Application DLL '{dll_name}' loaded from outside application directory: {dll_path}",
+                                "severity": "medium",
+                                "dll_path": dll_path
+                            })
+                
+                # 6. Check for user profile location DLLs (common in fileless malware)
+                profile_dirs = [
+                    os.environ.get('USERPROFILE', ''),
+                    os.environ.get('APPDATA', ''),
+                    os.environ.get('LOCALAPPDATA', '')
+                ]
+                
+                if any(profile_dir.lower() in dll_path.lower() for profile_dir in profile_dirs if profile_dir):
+                    # DLL loaded from user profile - typically suspicious for system processes
+                    if process_name.lower() in ["svchost.exe", "lsass.exe", "services.exe", "winlogon.exe"]:
                         suspicious_indicators.append({
-                            "indicator": "System DLL loaded from non-system directory",
-                            "description": f"System DLL '{dll_name}' loaded from {os.path.dirname(dll_path)}",
-                            "severity": "high",
+                            "indicator": "System process loading user profile DLL",
+                            "description": f"System process '{process_name}' loaded DLL from user profile: {dll_path}",
+                            "severity": "critical",
+                            "dll_path": dll_path
+                        })
+                    else:
+                        suspicious_indicators.append({
+                            "indicator": "DLL loaded from user profile",
+                            "description": f"Process loaded DLL from user profile location: {dll_path}",
+                            "severity": "medium",
                             "dll_path": dll_path
                         })
                 
-                # Check for DLLs in temp directories or user profile
-                suspicious_dirs = ["\\temp\\", "\\tmp\\", "\\appdata\\local\\temp\\", "\\downloads\\"]
-                for sus_dir in suspicious_dirs:
-                    if sus_dir in dll_path.lower():
-                        suspicious_indicators.append({
-                            "indicator": "DLL loaded from suspicious location",
-                            "description": f"DLL '{dll_name}' loaded from suspicious location: {os.path.dirname(dll_path)}",
-                            "severity": "high",
-                            "dll_path": dll_path
-                        })
-                        break
-                        
                 # Add this DLL to baseline for future comparisons
                 baseline["loaded_dlls"].append({
                     "path": dll_path,
@@ -3035,6 +4860,26 @@ def detect_dll_search_order_hijacking(pid, process_info):
                     "size": dll["size"],
                     "first_seen": datetime.now().isoformat()
                 })
+        
+        # 7. Check for unexpected proxy DLLs
+        # These are DLLs that might be used for API hooking or redirection
+        proxy_dlls = ["winhttp.dll", "wininet.dll", "ws2_32.dll", "urlmon.dll", "nspr4.dll"]
+        
+        for dll in current_dlls:
+            dll_path = dll["path"].lower()
+            dll_name = os.path.basename(dll_path)
+            
+            if dll_name.lower() in proxy_dlls:
+                expected_path = os.path.join(system_dir, dll_name)
+                expected_path_wow64 = os.path.join(syswow64_dir, dll_name)
+                
+                if dll_path.lower() != expected_path.lower() and dll_path.lower() != expected_path_wow64.lower():
+                    suspicious_indicators.append({
+                        "indicator": "Network proxy DLL hijacking",
+                        "description": f"Network-related DLL '{dll_name}' loaded from unexpected location: {dll_path}",
+                        "severity": "high",
+                        "dll_path": dll_path
+                    })
                 
     except Exception as e:
         logging.error(f"Error detecting DLL search order hijacking for PID {pid}: {e}")
@@ -3052,28 +4897,136 @@ def detect_thread_hijacking(pid, process_info):
         # Get memory regions for the process
         memory_regions = enumerate_process_memory_regions(pid)
         
+        # Get process stats
+        process_stats = get_process_stats(pid)
+        
+        # Get process name and exe_path for context
+        process_name = process_info.get("process_name", "").lower()
+        exe_path = process_info.get("exe_path", "").lower()
+        
         # Check for small executable allocations that might be used for thread injection
         for region in memory_regions:
             if (region["protection"]["executable"] and 
                 region["type"] == "Private" and
-                4 <= region["size_kb"] <= 16):  # Thread shellcode is often small
+                4 <= region["size_kb"] <= 32):  # Thread shellcode is often small to medium size
+                
+                # Higher severity if also writable (RWX)
+                if region["protection"]["writable"]:
+                    suspicious_indicators.append({
+                        "indicator": "Small RWX memory region",
+                        "description": f"Small RWX memory at {region['address']} ({region['size_kb']}KB) - common shellcode size",
+                        "severity": "high",
+                        "region": region
+                    })
+                else:
+                    suspicious_indicators.append({
+                        "indicator": "Small executable region",
+                        "description": f"Small executable memory at {region['address']} ({region['size_kb']}KB) - potential shellcode",
+                        "severity": "medium",
+                        "region": region
+                    })
+        
+        # Thread count analysis - check for anomalous thread patterns
+        # Adjust threshold based on the process type
+        thread_count = process_stats["thread_count"]
+        
+        # Define known thread-intensive applications
+        high_thread_apps = [
+            "chrome.exe", "firefox.exe", "msedge.exe", "iexplore.exe",  # Browsers
+            "w3wp.exe", "httpd.exe", "nginx.exe",  # Web servers
+            "sqlservr.exe", "oracle.exe", "mysqld.exe",  # Databases
+            "outlook.exe", "thunderbird.exe",  # Email clients
+            "explorer.exe",  # File Explorer
+            "winlogon.exe", "lsass.exe", "services.exe"  # System services
+        ]
+        
+        # Determine expected thread count range based on process type
+        if any(app in process_name for app in high_thread_apps):
+            # Higher threshold for apps known to use many threads
+            thread_threshold = 80
+        else:
+            # Lower threshold for regular applications
+            thread_threshold = 25
+        
+        # Alert on excessive thread count
+        if thread_count > thread_threshold:
+            suspicious_indicators.append({
+                "indicator": "Excessive thread count",
+                "description": f"Process has {thread_count} threads which exceeds expected threshold ({thread_threshold})",
+                "severity": "medium",
+                "region": {"address": "N/A", "size_kb": 0}
+            })
+        
+        # Check for suspicious memory patterns that suggest thread redirection
+        # Thread hijacking often hooks important APIs or patches memory
+        for region in memory_regions:
+            # Look for suspicious memory around key system DLL regions
+            if (region["protection"]["writable"] and 
+                region["protection"]["executable"] and
+                region["type"] == "Mapped" and
+                region["size_kb"] < 64):  # Small mapped RWX regions are very suspicious
                 
                 suspicious_indicators.append({
-                    "indicator": "Potential thread injection target",
-                    "description": f"Small executable memory region at {region['address']} ({region['size_kb']}KB)",
-                    "severity": "medium"
+                    "indicator": "Suspicious mapped RWX memory",
+                    "description": f"Small mapped RWX region at {region['address']} - potential API hook",
+                    "severity": "high",
+                    "region": region
                 })
+            
+            # Look for suspicious protection changes around image regions
+            # (indicating potential inline hooks)
+            if (region["type"] == "Image" and
+                region["protection"]["writable"] and
+                region["protection"]["executable"]):
                 
-        # Get process stats
-        process_stats = get_process_stats(pid)
+                suspicious_indicators.append({
+                    "indicator": "Writable executable image",
+                    "description": f"Image region at {region['address']} has writable+executable protection - likely hook point",
+                    "severity": "high",
+                    "region": region
+                })
         
-        # Unusual thread count could indicate hijacking
-        if process_stats["thread_count"] > 20:  # Adjust threshold as needed
-            suspicious_indicators.append({
-                "indicator": "High thread count",
-                "description": f"Process has {process_stats['thread_count']} threads which is unusual",
-                "severity": "low"
-            })
+        # Check for the existence of small isolated memory allocations
+        # Thread hijackers often create small trampolines to redirect execution
+        private_regions = [r for r in memory_regions if r["type"] == "Private"]
+        
+        # Sort regions by address for adjacency analysis
+        if len(private_regions) > 0:
+            # Convert addresses to integers for sorting
+            private_regions_sorted = []
+            for region in private_regions:
+                if "0x" in region["address"]:
+                    addr = int(region["address"].replace("0x", ""), 16)
+                    private_regions_sorted.append((addr, region))
+            
+            # Sort by address
+            private_regions_sorted.sort(key=lambda x: x[0])
+            
+            # Look for isolated small executable regions
+            for i, (addr, region) in enumerate(private_regions_sorted):
+                if region["protection"]["executable"] and region["size_kb"] < 16:
+                    # Check if this region is isolated from other regions
+                    isolated = True
+                    
+                    # Check previous region
+                    if i > 0:
+                        prev_addr, _ = private_regions_sorted[i-1]
+                        if addr - prev_addr < 1024*1024:  # Within 1MB
+                            isolated = False
+                    
+                    # Check next region
+                    if i < len(private_regions_sorted) - 1:
+                        next_addr, _ = private_regions_sorted[i+1]
+                        if next_addr - addr < 1024*1024:  # Within 1MB
+                            isolated = False
+                    
+                    if isolated:
+                        suspicious_indicators.append({
+                            "indicator": "Isolated small executable region",
+                            "description": f"Small isolated executable region at {region['address']} - potential trampoline",
+                            "severity": "high",
+                            "region": region
+                        })
                 
     except Exception as e:
         logging.error(f"Error detecting thread hijacking for PID {pid}: {e}")
@@ -3419,25 +5372,11 @@ def monitor_listening_processes(interval=3):
         integrity_state["process_groups"] = {}
         save_process_metadata(integrity_state)
     
-    # *** CHANGE HERE: First populate known_processes from integrity_state ***
-    for process_hash, process_info in integrity_state.items():
-        # Skip process_groups entry
-        if process_hash == "process_groups":
-            continue
-            
-        try:
-            pid = int(process_info.get("pid", 0))
-            if pid > 0:
-                known_pids[pid] = process_hash
-                known_processes[process_hash] = process_info
-        except (ValueError, TypeError):
-            continue
-    
     # Start the cleanup thread
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
     cleanup_thread.start()
     
-    # *** CHANGE HERE: Flag for first iteration - no process termination alerts on first run ***
+    # Flag for first iteration - no process termination alerts on first run
     first_run = True
     
     while SERVICE_RUNNING:
@@ -3457,34 +5396,114 @@ def monitor_listening_processes(interval=3):
                     current_hash_to_process[process_hash] = process_info
                     current_pids[pid] = process_hash
             
-            # Detect terminated processes by PID
-            # *** CHANGE HERE: Skip this check on first iteration to avoid false termination alerts ***
-            if not first_run:
-                for pid in list(known_pids.keys()):
-                    if pid not in current_pids:
-                        process_hash = known_pids[pid]
+            # For first run, initialize known_pids from current processes
+            # This avoids false termination alerts on startup
+            if first_run:
+                for pid, process_hash in current_pids.items():
+                    process_info = current_hash_to_process[process_hash]
+                    
+                    # Check if process exists in integrity state
+                    if process_hash in integrity_state:
+                        # Process exists in integrity state, update with current PID
+                        stored_info = integrity_state[process_hash]
+                        stored_info["pid"] = pid
+                        stored_info["start_time"] = process_info.get("start_time")
                         
-                        # Get process info from integrity_state
-                        if process_hash in integrity_state:
-                            term_process = integrity_state[process_hash]
-                            process_name = term_process.get("process_name", "UNKNOWN")
-                            port = term_process.get("port", "UNKNOWN")
-                            
-                            logging.warning(f"Process terminated: {process_name} (PID: {pid}) on port {port}")
-                            
-                            # Generate alert for terminated process
-                            log_event_to_pim(
-                                event_type="PROCESS_TERMINATED",
-                                file_path=term_process.get("exe_path", ""),
-                                previous_metadata=term_process,
-                                new_metadata=None,
-                                previous_hash=process_hash,
-                                new_hash=None
+                        # Log that we're updating an existing process silently
+                        logging.debug(f"Silently updating existing process: {process_info.get('process_name', 'UNKNOWN')} (PID: {pid})")
+                        
+                        # Update in integrity state without generating logs
+                        update_process_tracking(
+                            process_info.get("exe_path"),
+                            process_hash,
+                            stored_info
+                        )
+                    else:
+                        # Process doesn't exist in integrity state
+                        # Compare by name, path and lineage with existing entries
+                        process_name = process_info.get("process_name", "")
+                        exe_path = process_info.get("exe_path", "")
+                        lineage = process_info.get("lineage", [])
+                        
+                        matching_entry = False
+                        
+                        # Check if any process in integrity state matches by name, path, and has similar lineage
+                        for stored_hash, stored_info in integrity_state.items():
+                            # Skip process_groups entry
+                            if stored_hash == "process_groups":
+                                continue
+                                
+                            # Check if name and path match
+                            if (stored_info.get("process_name") == process_name and
+                                stored_info.get("exe_path") == exe_path):
+                                
+                                # Check lineage similarity
+                                stored_lineage = stored_info.get("lineage", [])
+                                if check_lineage_baseline(
+                                    {"process_name": process_name, "lineage": lineage},
+                                    {"temp_key": {"process_name": process_name, "lineage": stored_lineage}},
+                                    allow_flexible_match=True
+                                ):
+                                    matching_entry = True
+                                    
+                                    # Update stored entry with new hash and PID
+                                    stored_info["hash"] = process_hash
+                                    stored_info["pid"] = pid
+                                    stored_info["start_time"] = process_info.get("start_time")
+                                    
+                                    # Log silently updating matching process
+                                    logging.debug(f"Silently updating matching process by name/path/lineage: {process_name} (PID: {pid})")
+                                    
+                                    # Remove old entry and add new one
+                                    del integrity_state[stored_hash]
+                                    integrity_state[process_hash] = stored_info
+                                    save_process_metadata(integrity_state)
+                                    break
+                        
+                        # If no matching entry found, this is a genuinely new process
+                        if not matching_entry:
+                            logging.info(f"New listening process: {process_name} (PID: {pid}) on port {process_info.get('port', 'UNKNOWN')}")
+                            # Add to integrity state
+                            update_process_tracking(
+                                exe_path,
+                                process_hash,
+                                process_info
                             )
-                            
-                            # Remove pid from known_pids but KEEP in integrity_state
-                            # for legitimate processes
-                            del known_pids[pid]
+                    
+                    # Add to known_pids
+                    known_pids[pid] = process_hash
+                
+                # Set first_run to False after initial processing
+                first_run = False
+                # Skip the rest of the loop
+                continue
+            
+            # For subsequent runs, detect terminated processes by PID
+            for pid in list(known_pids.keys()):
+                if pid not in current_pids:
+                    process_hash = known_pids[pid]
+                    
+                    # Get process info from integrity_state
+                    if process_hash in integrity_state:
+                        term_process = integrity_state[process_hash]
+                        process_name = term_process.get("process_name", "UNKNOWN")
+                        port = term_process.get("port", "UNKNOWN")
+                        
+                        logging.warning(f"Process terminated: {process_name} (PID: {pid}) on port {port}")
+                        
+                        # Generate alert for terminated process
+                        log_event_to_pim(
+                            event_type="PROCESS_TERMINATED",
+                            file_path=term_process.get("exe_path", ""),
+                            previous_metadata=term_process,
+                            new_metadata=None,
+                            previous_hash=process_hash,
+                            new_hash=None
+                        )
+                        
+                        # Remove pid from known_pids but KEEP in integrity_state
+                        # for legitimate processes
+                        del known_pids[pid]
             
             # Process new or restarted processes
             for pid, process_hash in current_pids.items():
@@ -3548,7 +5567,7 @@ def monitor_listening_processes(interval=3):
                     if pid in alerted_processes:
                         continue
                     
-                    # Check process group legitimacy (new)
+                    # Check process group legitimacy
                     group_alerts = check_process_group_legitimacy(process_info, integrity_state)
                     
                     if group_alerts:
@@ -3759,8 +5778,6 @@ def monitor_listening_processes(interval=3):
                     if pid not in alerted_processes:
                         known_pids[pid] = process_hash
             
-            first_run = False
-            
             # Reload integrity state after updates
             integrity_state = load_process_metadata()
             
@@ -3773,6 +5790,67 @@ def monitor_listening_processes(interval=3):
             
             # Sleep a bit longer on error to avoid error loops
             time.sleep(max(interval, 5))
+
+class KneeLocator:
+    """
+    Knee-point detection in a curve.
+    Implements kneedle algorithm for detecting knee points in a curve.
+    """
+    def __init__(self, x, y, curve='concave', direction='increasing'):
+        self.x = x
+        self.y = y
+        self.curve = curve
+        self.direction = direction
+        self.knee = self._find_knee()
+        
+    def _find_knee(self):
+        """Find knee point using kneedle algorithm."""
+        n_points = len(self.x)
+        if n_points <= 2:
+            return None
+            
+        # Normalize data
+        x_norm = [float(i)/max(self.x) for i in self.x]
+        y_norm = [float(i)/max(self.y) for i in self.y]
+        
+        # Calculate difference curve
+        if self.curve == 'concave' and self.direction == 'increasing':
+            # Find point of maximum curvature
+            diffs = []
+            for i in range(n_points):
+                # Calculate distance from point to line
+                x1, y1 = 0, 0  # First point
+                x2, y2 = 1, 1  # Last point
+                
+                # Distance from point to line formula
+                numer = abs((y2-y1)*x_norm[i] - (x2-x1)*y_norm[i] + x2*y1 - y2*x1)
+                denom = ((y2-y1)**2 + (x2-x1)**2)**0.5
+                
+                # Store distances
+                diffs.append(numer/denom)
+            
+            # Find the point with maximum difference
+            knee_idx = diffs.index(max(diffs))
+            return knee_idx
+        elif self.curve == 'convex' and self.direction == 'increasing':
+            # For convex increasing curve, find point of minimum second derivative
+            # or maximum first derivative
+            diffs = [y_norm[i+1] - y_norm[i] for i in range(n_points-1)]
+            if len(diffs) <= 1:
+                return None
+                
+            # Find largest change in first derivative
+            sec_diffs = [diffs[i+1] - diffs[i] for i in range(len(diffs)-1)]
+            if not sec_diffs:
+                return None
+                
+            # Find the elbow as the point with max rate of change
+            # Add 1 because we used differences
+            knee_idx = sec_diffs.index(min(sec_diffs)) + 1
+            return knee_idx
+        else:
+            # Other cases (convex decreasing, concave decreasing) would be implemented here
+            return None
 
 def save_process_metadata(processes):
     """Save full process metadata to integrity_processes.json safely."""
@@ -4140,6 +6218,127 @@ class ProcessMonitorService(win32serviceutil.ServiceFramework):
             logging.debug(traceback.format_exc())
             self.SvcStop()
 
+def force_cleanup(max_age_days=30, verbose=True):
+    """
+    Force a cleanup of the integrity_processes.json file.
+    Removes old entries and consolidates process groups.
+    
+    Args:
+        max_age_days: Maximum age of entries to keep (in days)
+        verbose: Whether to print detailed logs
+        
+    Returns:
+        dict: Stats about the cleanup operation
+    """
+    # Import datetime and timedelta
+    from datetime import datetime, timedelta
+    
+    stats = {
+        "old_hashes_removed": 0,
+        "empty_groups_removed": 0,
+        "missing_executables_removed": 0,
+        "groups_merged": 0,
+        "total_before": 0,
+        "total_after": 0
+    }
+    
+    try:
+        # Load integrity state
+        integrity_state = load_process_metadata()
+        
+        # Count initial entries
+        process_entries = 0
+        group_entries = 0
+        
+        for key in integrity_state:
+            if key == "process_groups":
+                if isinstance(integrity_state[key], dict):
+                    group_entries = len(integrity_state[key])
+            else:
+                process_entries += 1
+                
+        stats["total_before"] = process_entries
+        
+        # Perform cleanup of process groups
+        if "process_groups" in integrity_state:
+            if verbose:
+                logging.info(f"Cleaning up process groups (max age: {max_age_days} days)...")
+            
+            # Track groups and hashes before cleanup
+            groups_before = len(integrity_state["process_groups"])
+            total_hashes_before = sum(
+                len(group.get("known_hashes", {})) 
+                for group in integrity_state["process_groups"].values()
+            )
+            
+            # Clean process groups
+            maintain_process_groups(integrity_state, max_age_days)
+            
+            # Track groups and hashes after cleanup
+            groups_after = len(integrity_state["process_groups"])
+            total_hashes_after = sum(
+                len(group.get("known_hashes", {})) 
+                for group in integrity_state["process_groups"].values()
+            )
+            
+            # Update stats
+            stats["groups_merged"] = groups_before - groups_after
+            stats["old_hashes_removed"] = total_hashes_before - total_hashes_after
+            
+            # Remove empty groups
+            empty_groups = []
+            for group_id, group in integrity_state["process_groups"].items():
+                if not group.get("known_hashes", {}):
+                    empty_groups.append(group_id)
+            
+            for group_id in empty_groups:
+                del integrity_state["process_groups"][group_id]
+                if verbose:
+                    logging.info(f"Removed empty process group: {group_id}")
+            
+            stats["empty_groups_removed"] = len(empty_groups)
+        
+        # Remove individual process entries with missing executables
+        process_to_remove = []
+        for process_hash, process_info in integrity_state.items():
+            if process_hash == "process_groups" or not isinstance(process_info, dict):
+                continue
+                
+            exe_path = process_info.get("exe_path", "")
+            if exe_path and exe_path != "ACCESS_DENIED" and not os.path.exists(exe_path):
+                process_to_remove.append(process_hash)
+                if verbose:
+                    process_name = process_info.get("process_name", "UNKNOWN")
+                    logging.info(f"Removing process with missing executable: {process_name} ({exe_path})")
+        
+        for process_hash in process_to_remove:
+            del integrity_state[process_hash]
+            
+        stats["missing_executables_removed"] = len(process_to_remove)
+        
+        # Save changes
+        save_process_metadata(integrity_state)
+        
+        # Count final entries
+        process_entries = 0
+        for key in integrity_state:
+            if key != "process_groups":
+                process_entries += 1
+                
+        stats["total_after"] = process_entries
+        
+        if verbose:
+            logging.info(f"Cleanup complete. Removed {stats['old_hashes_removed']} old hashes, "
+                        f"{stats['empty_groups_removed']} empty groups, and "
+                        f"{stats['missing_executables_removed']} entries with missing executables.")
+        
+        return stats
+        
+    except Exception as e:
+        logging.error(f"Error during forced cleanup: {e}")
+        logging.debug(traceback.format_exc())
+        return stats
+
 def safe_write_text(file_path, data):
     """Safely write text data to a file with proper error handling and ACL checks."""
     temp_file = f"{file_path}.tmp"
@@ -4383,25 +6582,10 @@ Usage:
   python pim.py start         Start the installed PIM service
   python pim.py stop          Stop the PIM service
   python pim.py restart       Restart the PIM service
+  python pim.py cleanup       Clean up old entries in the integrity file
   python pim.py debug         Run in debug mode with extra logging
   python pim.py help          Show this help message
 
-Description:
-  The Process Integrity Monitor continuously monitors system processes for:
-    - New or terminated listening processes
-    - All system processes (not just those with network connections)
-    - Fileless process detection and behavioral analysis
-    - Non-standard port use by known binaries
-    - Unexpected changes in process metadata (user, hash, command line, etc.)
-    - Suspicious memory regions (e.g., shellcode injection or unsigned code)
-    - Windows-specific behavioral anomalies
-    - Machine learning based anomaly detection
-    - Process runtime changes (command line, memory usage, thread count)
-
-  It logs alerts and integrates with SIEM tools.
-
-Note:
-  Administrative privileges are required for full functionality.
 """
     print(help_text.strip())
 
@@ -4464,11 +6648,83 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[ERROR] Failed to restart service: {e}")
                 
+        elif command == "cleanup":
+            print("[INFO] Running integrity file cleanup...")
+            try:
+                # Setup logging for cleanup operation
+                log_file = os.path.join(LOG_DIR, "pim_cleanup.log")
+                os.makedirs(LOG_DIR, exist_ok=True)
+                
+                logging.basicConfig(
+                    level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[
+                        logging.FileHandler(log_file),
+                        logging.StreamHandler()
+                    ]
+                )
+                
+                # Load integrity state
+                integrity_state = load_process_metadata()
+                
+                # Perform cleanup
+                if maintain_process_groups(integrity_state, max_age_days=30):
+                    # Check application existence
+                    application_changes = check_application_existence()
+                    
+                    # Save changes
+                    save_process_metadata(integrity_state)
+                    
+                    print(f"[SUCCESS] Integrity file cleanup completed. See {log_file} for details.")
+                else:
+                    print("[INFO] No cleanup needed - integrity file is up-to-date.")
+            except Exception as e:
+                print(f"[ERROR] Cleanup failed: {e}")
+                
         elif command == "debug":
             # Special debug mode with extra logging
             print("[INFO] Starting in debug mode with extra logging...")
             logging.getLogger('').setLevel(logging.DEBUG)
             run_as_console()
+        
+        elif command == "cleanup":
+            print("[INFO] Running integrity file cleanup...")
+            try:
+                # Setup logging for cleanup operation
+                log_file = os.path.join(LOG_DIR, "pim_cleanup.log")
+                os.makedirs(LOG_DIR, exist_ok=True)
+                
+                logging.basicConfig(
+                    level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[
+                        logging.FileHandler(log_file),
+                        logging.StreamHandler()
+                    ]
+                )
+                
+                # Parse additional arguments
+                max_age = 30  # Default
+                if len(sys.argv) > 2:
+                    try:
+                        max_age = int(sys.argv[2])
+                    except ValueError:
+                        print(f"[WARNING] Invalid max age value: {sys.argv[2]}. Using default of 30 days.")
+                
+                # Run the cleanup
+                stats = force_cleanup(max_age_days=max_age, verbose=True)
+                
+                # Print summary
+                print(f"[SUCCESS] Integrity file cleanup completed. See {log_file} for details.")
+                print(f"Summary:")
+                print(f"  - Removed {stats['old_hashes_removed']} old hashes")
+                print(f"  - Removed {stats['empty_groups_removed']} empty groups")
+                print(f"  - Removed {stats['missing_executables_removed']} entries with missing executables")
+                print(f"  - Merged {stats['groups_merged']} similar groups")
+                print(f"  - Total entries before: {stats['total_before']}")
+                print(f"  - Total entries after: {stats['total_after']}")
+            except Exception as e:
+                print(f"[ERROR] Cleanup failed: {e}")
         
         elif command in ["--service", "--foreground"]:
             # When the service manager executes the service
