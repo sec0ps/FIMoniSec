@@ -37,6 +37,7 @@ import threading
 import traceback
 import logging
 import ctypes
+import re
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -148,7 +149,7 @@ def ensure_file_exists(file_path, default_content="", is_json=False):
         logging.debug(f"Created and secured file: {file_path}")
     return True
 
-def get_process_hash(exe_path, cmdline=None):
+def get_process_hash(exe_path, cmdline=None, include_cmdline=False):
     """Generate SHA-256 hash of the process executable and optionally include cmdline."""
     try:
         # Check if the file exists first
@@ -195,9 +196,13 @@ def get_process_hash(exe_path, cmdline=None):
                 logging.error(f"Windows API file access failed for {exe_path}: {e}")
                 return "ERROR_HASHING_PERMISSION"
 
-        # Optionally include command-line arguments in hashing
-        if cmdline and isinstance(cmdline, str):
-            hash_obj.update(cmdline.encode("utf-8"))
+        # Only include command-line arguments in hashing if explicitly requested
+        # This should typically be False for process identity tracking!
+        if include_cmdline and cmdline and isinstance(cmdline, str):
+            # Instead of using raw cmdline which can contain variable data,
+            # use the simplified pattern that strips out dynamic elements
+            cmdline_pattern = simplify_command_line(cmdline)
+            hash_obj.update(cmdline_pattern.encode("utf-8"))
 
         return hash_obj.hexdigest()
 
@@ -222,11 +227,7 @@ def load_process_metadata():
             return {}
     return {}
 
-def save_process_metadata(processes):
-    """Save full process metadata to integrity_processes.json safely."""
-    return safe_write_json(INTEGRITY_PROCESS_FILE, processes)
-
-def update_process_tracking(exe_path, process_hash, metadata):
+def update_process_tracking(exe_path, process_hash, process_info):
     """Update process tracking files with new or modified processes, using hash as primary key."""
     # Load existing data
     integrity_state = load_process_metadata()
@@ -234,11 +235,194 @@ def update_process_tracking(exe_path, process_hash, metadata):
     # Use hash as the primary key instead of PID
     if process_hash != "ERROR_HASHING_PERMISSION" and process_hash != "ERROR_FILE_NOT_FOUND":
         # Store metadata by hash
-        integrity_state[process_hash] = metadata
+        integrity_state[process_hash] = process_info
+
+    # --- Begin Process Group Tracking Enhancement ---
+    process_name = process_info.get("process_name", "")
+    cmdline = process_info.get("cmdline", "")
+    lineage = process_info.get("lineage", [])
+    
+    # Skip invalid processes
+    if process_hash in ["ERROR_HASHING_PERMISSION", "ERROR_FILE_NOT_FOUND"] or not process_name:
+        # Save updates for the individual process
+        success = save_process_metadata(integrity_state)
+        return success
+    
+    # Create a unique identifier for the process group based on path & name
+    process_group_id = f"{exe_path}|{process_name}".lower()
+    
+    # Check if we have a groups section
+    if "process_groups" not in integrity_state:
+        integrity_state["process_groups"] = {}
+    
+    # Initialize the group if it's new
+    if process_group_id not in integrity_state["process_groups"]:
+        integrity_state["process_groups"][process_group_id] = {
+            "exe_path": exe_path,
+            "process_name": process_name,
+            "known_hashes": {},
+            "common_lineage_patterns": [],
+            "command_line_patterns": []
+        }
+    
+    # Get the group
+    process_group = integrity_state["process_groups"][process_group_id]
+    
+    # Add this hash to the known hashes with timestamp
+    hash_entry = {
+        "first_seen": datetime.now().isoformat(),
+        "last_seen": datetime.now().isoformat(),
+        "detection_count": 1
+    }
+    
+    # Update hash record if it already exists
+    if process_hash in process_group["known_hashes"]:
+        hash_entry = process_group["known_hashes"][process_hash]
+        hash_entry["last_seen"] = datetime.now().isoformat()
+        hash_entry["detection_count"] += 1
+    
+    process_group["known_hashes"][process_hash] = hash_entry
+    
+    # Extract command line pattern
+    if cmdline:
+        cmd_pattern = simplify_command_line(cmdline)
+        if cmd_pattern and cmd_pattern not in process_group["command_line_patterns"]:
+            process_group["command_line_patterns"].append(cmd_pattern)
+    
+    # Update lineage patterns - use existing check_lineage_baseline for comparison
+    if lineage:
+        # Create temporary process info and state for checking
+        lineage_matched = False
+        
+        for pattern in process_group["common_lineage_patterns"]:
+            temp_proc_info = {"process_name": process_name, "lineage": lineage}
+            temp_state = {"temp_key": {"process_name": process_name, "lineage": pattern}}
+            
+            if check_lineage_baseline(temp_proc_info, temp_state, allow_flexible_match=True):
+                lineage_matched = True
+                break
+                
+        if not lineage_matched:
+            process_group["common_lineage_patterns"].append(lineage)
+    # --- End Process Group Tracking Enhancement ---
 
     # Save updates
     success = save_process_metadata(integrity_state)
     return success
+
+def simplify_command_line(cmdline):
+    """
+    Convert a command line to a simplified pattern by removing variable parts
+    like process IDs, timestamps, and UUIDs, but keeping the structure.
+    """
+    if not cmdline:
+        return ""
+    
+    # Extract the basic command structure
+    parts = cmdline.split()
+    if not parts:
+        return ""
+    
+    # Keep the executable and option flags, replace variable values with placeholders
+    pattern_parts = []
+    for part in parts:
+        # If it's a flag, keep it exactly
+        if part.startswith("--") or part.startswith("-"):
+            pattern_parts.append(part)
+        # If it has an equals sign, keep the parameter name but replace the value
+        elif "=" in part:
+            param_name, param_value = part.split("=", 1)
+            pattern_parts.append(f"{param_name}=*")
+        # If it looks like a number, UUID, or timestamp, replace with placeholder
+        elif re.match(r'^[0-9]+$', part) or re.match(r'^[0-9a-f-]{36}$', part):
+            continue  # Skip numeric IDs and UUIDs
+        # If it's a file path, keep just the extension
+        elif part.endswith(".exe") or part.endswith(".dll"):
+            pattern_parts.append("*" + os.path.splitext(part)[1])
+        else:
+            pattern_parts.append(part)
+    
+    return " ".join(pattern_parts)
+
+def check_process_group_legitimacy(process_info, integrity_state):
+    """
+    Check if a process is legitimate based on process group tracking.
+    This specifically looks at:
+    1. If the hash is known for this process group
+    2. If the command line pattern matches known patterns
+    
+    Returns a list of alerts, empty if no issues found.
+    """
+    alerts = []
+    
+    # Skip if process_groups tracking not enabled
+    if "process_groups" not in integrity_state:
+        return alerts
+    
+    # Get process information
+    exe_path = process_info.get("exe_path", "")
+    process_name = process_info.get("process_name", "")
+    process_hash = process_info.get("hash", "")
+    cmdline = process_info.get("cmdline", "")
+    
+    # Skip invalid processes
+    if not exe_path or not process_name or not process_hash:
+        return alerts
+    
+    # Create process group ID
+    process_group_id = f"{exe_path}|{process_name}".lower()
+    
+    # If we haven't seen this process group before, it's new but not necessarily illegitimate
+    if process_group_id not in integrity_state["process_groups"]:
+        return alerts  # No alerts for new process groups
+    
+    # Get the process group
+    process_group = integrity_state["process_groups"][process_group_id]
+    
+    # Check if hash is known
+    if process_hash not in process_group["known_hashes"]:
+        # New hash for a known process - could be an update or tampering
+        if os.path.exists(exe_path):
+            # The file exists - likely an update
+            alerts.append({
+                "type": "NEW_PROCESS_HASH",
+                "details": {
+                    "process": process_name,
+                    "exe_path": exe_path,
+                    "hash": process_hash,
+                    "severity": "medium",
+                    "description": f"New hash detected for known process {process_name}"
+                }
+            })
+        else:
+            # The file doesn't exist but claims to be from this path - highly suspicious
+            alerts.append({
+                "type": "HASH_MISMATCH_MISSING_FILE",
+                "details": {
+                    "process": process_name,
+                    "exe_path": exe_path,
+                    "hash": process_hash,
+                    "severity": "high",
+                    "description": f"Process {process_name} claims to be from {exe_path} but file doesn't exist"
+                }
+            })
+    
+    # Check command line pattern
+    if "command_line_patterns" in process_group and cmdline:
+        cmd_pattern = simplify_command_line(cmdline)
+        if cmd_pattern and cmd_pattern not in process_group["command_line_patterns"]:
+            alerts.append({
+                "type": "UNUSUAL_COMMAND_LINE",
+                "details": {
+                    "process": process_name,
+                    "exe_path": exe_path,
+                    "command_pattern": cmd_pattern,
+                    "severity": "medium",
+                    "description": f"Process {process_name} launched with unusual command line pattern"
+                }
+            })
+    
+    return alerts
 
 def remove_process_tracking(pid, process_hash=None):
     """Remove process metadata from integrity_processes.json."""
@@ -307,8 +491,19 @@ def resolve_lineage(pid):
     
     return lineage
 
-def check_lineage_baseline(process_info, integrity_state):
-    """Check if a process's lineage matches the baseline, using integrity_state."""
+def check_lineage_baseline(process_info, integrity_state, allow_flexible_match=True):
+    """
+    Check if a process's lineage matches the baseline, using integrity_state.
+    Enhanced to support flexible matching for multi-process applications.
+    
+    Args:
+        process_info: Dictionary containing process metadata including lineage
+        integrity_state: The loaded integrity state with process tracking data
+        allow_flexible_match: Whether to allow partial matches for improved accuracy
+        
+    Returns:
+        True if lineage is valid, False if significant deviation detected
+    """
     proc_name = process_info["process_name"]
     lineage = process_info.get("lineage", [])
 
@@ -318,6 +513,10 @@ def check_lineage_baseline(process_info, integrity_state):
     # Find baseline lineage from existing processes
     baseline = None
     for hash_key, existing_proc in integrity_state.items():
+        # Skip process_groups entry if it exists
+        if hash_key == "process_groups":
+            continue
+            
         if existing_proc.get("process_name") == proc_name and existing_proc.get("lineage"):
             # Found a matching process name with established lineage
             baseline = existing_proc.get("lineage")
@@ -327,14 +526,52 @@ def check_lineage_baseline(process_info, integrity_state):
         # First time seeing this process - return true (no deviation)
         logging.info(f"Baseline lineage established for {proc_name}: {lineage}")
         return True
-    elif lineage != baseline:
-        # Lineage deviation detected
-        logging.warning(f"Lineage deviation for {proc_name}:")
-        logging.warning(f"  Expected: {baseline}")
-        logging.warning(f"  Found:    {lineage}")
-        return False
     
-    return True
+    # Original exact matching behavior
+    if lineage == baseline:
+        return True
+        
+    # Enhanced flexible matching if enabled
+    if allow_flexible_match:
+        # Only check if we have enough data
+        if not lineage or not baseline:
+            return False
+        
+        # Allow similar length
+        if abs(len(lineage) - len(baseline)) > 1:  # Off-by-one difference
+            # Length too different - likely significant deviation
+            logging.warning(f"Lineage length mismatch for {proc_name}:")
+            logging.warning(f"  Expected: {baseline}")
+            logging.warning(f"  Found:    {lineage}")
+            return False
+        
+        # Get the minimum length to compare
+        min_length = min(len(lineage), len(baseline))
+        
+        # Check key processes (first processes in lineage are most important)
+        # Check for process similarity considering service hosting variances
+        for i in range(min_length):
+            if lineage[i].lower() != baseline[i].lower():
+                # Special case for service host processes
+                if "svchost.exe" in lineage[i].lower() and "svchost.exe" in baseline[i].lower():
+                    continue
+                elif "services.exe" in lineage[i].lower() and "services.exe" in baseline[i].lower():
+                    continue
+                
+                # Different process in important position - significant mismatch
+                logging.warning(f"Lineage deviation for {proc_name}:")
+                logging.warning(f"  Expected: {baseline}")
+                logging.warning(f"  Found:    {lineage}")
+                return False
+        
+        # If we got here, core lineage matches
+        return True
+    
+    # If flexible matching is disabled and exact match failed, report deviation
+    logging.warning(f"Lineage deviation for {proc_name}:")
+    logging.warning(f"  Expected: {baseline}")
+    logging.warning(f"  Found:    {lineage}")
+    return False
 
 def check_for_unusual_port_use(process_info, integrity_state):
     """Check if a process is listening on a non-standard port using integrity_state."""
@@ -828,7 +1065,7 @@ def scan_process_memory(pid, process_info=None):
                             region["mitre_techniques"] = technique_ids
                     
                     # Log to FIM system
-                    log_event_to_fim(
+                    log_event_to_pim(
                         event_type=region["technique"],
                         file_path=process_info.get("exe_path", ""),
                         previous_metadata=None,
@@ -1638,6 +1875,18 @@ def calculate_threat_score(process_info, detection_events):
     port = process_info.get("port", 0)
     lineage = process_info.get("lineage", [])
     
+    # Consider process age in scoring
+    try:
+        process = psutil.Process(process_info.get("pid", 0))
+        process_age_seconds = time.time() - process.create_time()
+        
+        # New processes are more suspicious
+        if process_age_seconds < 300:  # 5 minutes
+            base_score += 10
+            reasons.append("Recently created process")
+    except:
+        pass
+    
     # 1. Score based on user context
     if "system" in user:
         base_score += 10
@@ -1755,6 +2004,28 @@ def calculate_threat_score(process_info, detection_events):
         elif event_type == "LINEAGE_DEVIATION":
             base_score += 20
             reasons.append("Process lineage deviation")
+            
+        elif event_type == "PROCESS_RUNTIME_CHANGES":
+            # Look for specific changes
+            if isinstance(event.get("details"), list):
+                for change in event.get("details", []):
+                    if isinstance(change, dict):
+                        field = change.get("field", "")
+                        if field == "thread_count":
+                            # Calculate magnitude of thread change
+                            delta = change.get("delta", 0)
+                            if delta > 20:
+                                base_score += 25
+                                reasons.append(f"Extreme thread count increase: +{delta} threads")
+                            elif delta > 10:
+                                base_score += 15
+                                reasons.append(f"Major thread count increase: +{delta} threads")
+                        elif field == "cmdline":
+                            base_score += 30
+                            reasons.append("Command line modified during execution")
+                        elif field == "user":
+                            base_score += 40
+                            reasons.append("Process user context changed during execution")
     
     # 6. Special cases for known malicious processes
     special_case_malware = [
@@ -1769,7 +2040,7 @@ def calculate_threat_score(process_info, detection_events):
     # 7. Cap and categorize score
     final_score = min(base_score, 100)
     
-# Determine severity category
+    # Determine severity category
     if final_score >= 80:
         severity = "critical"
     elif final_score >= 60:
@@ -1804,6 +2075,9 @@ def check_process_name_consistency(process_info, integrity_state):
     # Find all processes with the same name in integrity state
     matching_processes = []
     
+    # *** CHANGE HERE: Add a tracking set to prevent duplicate alerts ***
+    seen_alerts = set()
+    
     for hash_key, stored_info in integrity_state.items():
         # Skip comparing with self
         if hash_key == process_hash:
@@ -1813,11 +2087,16 @@ def check_process_name_consistency(process_info, integrity_state):
         if stored_info.get("process_name") == process_name:
             # Different path is immediate red flag
             if stored_info.get("exe_path") != exe_path:
-                matching_processes.append({
-                    "info": stored_info,
-                    "reason": "Path mismatch",
-                    "severity": "high"
-                })
+                # *** CHANGE HERE: Create a unique key for this alert ***
+                alert_key = f"{process_name}:{exe_path}:{stored_info.get('exe_path')}:path_mismatch"
+                
+                if alert_key not in seen_alerts:
+                    seen_alerts.add(alert_key)
+                    matching_processes.append({
+                        "info": stored_info,
+                        "reason": "Path mismatch",
+                        "severity": "high"
+                    })
                 continue
                 
             # Same path but different lineage
@@ -1829,11 +2108,16 @@ def check_process_name_consistency(process_info, integrity_state):
                 current_service = any("services.exe" in parent.lower() for parent in process_lineage)
                 
                 if legitimate_service != current_service:
-                    matching_processes.append({
-                        "info": stored_info,
-                        "reason": "Lineage mismatch (service ancestry)",
-                        "severity": "high"
-                    })
+                    # *** CHANGE HERE: Create a unique key for this alert ***
+                    alert_key = f"{process_name}:{exe_path}:service_ancestry"
+                    
+                    if alert_key not in seen_alerts:
+                        seen_alerts.add(alert_key)
+                        matching_processes.append({
+                            "info": stored_info,
+                            "reason": "Lineage mismatch (service ancestry)",
+                            "severity": "high"
+                        })
                     continue
                 
                 # Check for suspicious parent processes in current lineage
@@ -1842,22 +2126,32 @@ def check_process_name_consistency(process_info, integrity_state):
                                            for parent in process_lineage)
                 
                 if has_suspicious_parent:
-                    matching_processes.append({
-                        "info": stored_info,
-                        "reason": "Suspicious ancestor in lineage",
-                        "severity": "high"
-                    })
+                    # *** CHANGE HERE: Create a unique key for this alert ***
+                    alert_key = f"{process_name}:{exe_path}:suspicious_ancestor"
+                    
+                    if alert_key not in seen_alerts:
+                        seen_alerts.add(alert_key)
+                        matching_processes.append({
+                            "info": stored_info,
+                            "reason": "Suspicious ancestor in lineage",
+                            "severity": "high"
+                        })
                     continue
                 
                 # Significant lineage deviation
                 if len(stored_lineage) > 0 and len(process_lineage) > 0:
                     # Compare top-level ancestors (often most significant)
                     if stored_lineage[0] != process_lineage[0]:
-                        matching_processes.append({
-                            "info": stored_info,
-                            "reason": "Root ancestor mismatch",
-                            "severity": "medium"
-                        })
+                        # *** CHANGE HERE: Create a unique key for this alert ***
+                        alert_key = f"{process_name}:{exe_path}:root_ancestor"
+                        
+                        if alert_key not in seen_alerts:
+                            seen_alerts.add(alert_key)
+                            matching_processes.append({
+                                "info": stored_info,
+                                "reason": "Root ancestor mismatch",
+                                "severity": "medium"
+                            })
                         continue
     
     if not matching_processes:
@@ -1899,287 +2193,6 @@ def check_process_name_consistency(process_info, integrity_state):
         impersonation_alerts.append(alert)
     
     return impersonation_alerts if impersonation_alerts else None
-
-def monitor_listening_processes(interval=3):
-    """Main monitoring loop for detecting suspicious processes."""
-    global SERVICE_RUNNING
-    
-    # Setup tracking
-    known_processes = {}  # Store by key: process_hash
-    known_pids = {}       # Track PIDs to detect terminations
-    ml_model_info = None
-    ml_retrain_counter = 0
-    alerted_processes = set()  # Avoid duplicate alerts
-    
-    # Initialize ML model if available
-    if ML_LIBRARIES_AVAILABLE:
-        ml_model_info = implement_behavioral_baselining()
-        logging.info("ML behavioral baselining completed")
-    
-    logging.info("Starting process monitoring...")
-    
-    # Load integrity state
-    integrity_state = load_process_metadata()
-    
-    # Initialize known_pids from integrity_state
-    for process_hash, process_info in integrity_state.items():
-        try:
-            pid = int(process_info.get("pid", 0))
-            if pid > 0:
-                known_pids[pid] = process_hash
-        except (ValueError, TypeError):
-            continue
-    
-    # Start the cleanup thread
-    cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
-    cleanup_thread.start()
-    
-    while SERVICE_RUNNING:
-        try:
-            # Get current listening processes
-            current_processes = get_listening_processes()
-            
-            # Create mappings for current processes
-            current_hash_to_process = {}
-            current_pids = {}
-            
-            for process_key, process_info in current_processes.items():
-                process_hash = process_info.get("hash")
-                pid = process_info.get("pid")
-                
-                if process_hash and process_hash not in ["ERROR_HASHING_PERMISSION", "ERROR_FILE_NOT_FOUND"]:
-                    current_hash_to_process[process_hash] = process_info
-                    current_pids[pid] = process_hash
-            
-            # Detect terminated processes by PID
-            for pid in list(known_pids.keys()):
-                if pid not in current_pids:
-                    process_hash = known_pids[pid]
-                    
-                    # Get process info from integrity_state
-                    if process_hash in integrity_state:
-                        term_process = integrity_state[process_hash]
-                        process_name = term_process.get("process_name", "UNKNOWN")
-                        port = term_process.get("port", "UNKNOWN")
-                        
-                        logging.warning(f"Process terminated: {process_name} (PID: {pid}) on port {port}")
-                        
-                        # Generate alert for terminated process
-                        log_event_to_fim(
-                            event_type="PROCESS_TERMINATED",
-                            file_path=term_process.get("exe_path", ""),
-                            previous_metadata=term_process,
-                            new_metadata=None,
-                            previous_hash=process_hash,
-                            new_hash=None
-                        )
-                        
-                        # Remove pid from known_pids but KEEP in integrity_state
-                        # for legitimate processes
-                        del known_pids[pid]
-            
-            # Process new or restarted processes
-            for pid, process_hash in current_pids.items():
-                if pid not in known_pids:
-                    process_info = current_hash_to_process[process_hash]
-                    process_name = process_info.get("process_name", "UNKNOWN")
-                    port = process_info.get("port", "UNKNOWN")
-                    exe_path = process_info.get("exe_path", "")
-                    
-                    # IMPORTANT: First check for process name impersonation
-                    # This needs to happen before we check for process restarts
-                    name_alerts = check_process_name_consistency(process_info, integrity_state)
-                    
-                    if name_alerts:
-                        for alert in name_alerts:
-                            # Log critical alert for process impersonation
-                            impersonated_name = alert["details"]["process_name"]
-                            original_path = alert["details"]["original_process"]["exe_path"]
-                            impersonating_path = alert["details"]["impersonating_process"]["exe_path"]
-                            reason = alert["details"].get("reason", "Executable path mismatch")
-                            severity = alert["details"].get("severity", "high")
-                            
-                            logging.critical(f"ALERT: Process name impersonation detected!")
-                            logging.critical(f"Process '{impersonated_name}' at path '{impersonating_path}' appears to be impersonating legitimate process from '{original_path}'")
-                            logging.critical(f"Reason: {reason} (Severity: {severity})")
-                            
-                            # Add more detailed lineage information to the log
-                            original_lineage = alert["details"]["original_process"].get("lineage", [])
-                            impersonating_lineage = alert["details"]["impersonating_process"].get("lineage", [])
-                            
-                            if original_lineage and impersonating_lineage:
-                                logging.critical(f"Original process lineage: {' → '.join(original_lineage)}")
-                                logging.critical(f"Impersonating process lineage: {' → '.join(impersonating_lineage)}")
-                            
-                            # Log security event
-                            log_event_to_fim(
-                                event_type="PROCESS_NAME_IMPERSONATION",
-                                file_path=process_info.get("exe_path", ""),
-                                previous_metadata=alert["details"]["original_process"],
-                                new_metadata=alert["details"]["impersonating_process"],
-                                previous_hash=alert["details"]["original_process"].get("hash", ""),
-                                new_hash=process_hash
-                            )
-                            
-                            # Try to kill the suspicious process
-                            try:
-                                logging.critical(f"Attempting to terminate suspicious impersonating process {pid}")
-                                os.kill(pid, signal.SIGTERM)
-                                logging.info(f"Successfully terminated process {pid}")
-                                
-                                # Remove malicious process from integrity file if it was added
-                                if process_hash in integrity_state:
-                                    remove_malicious_process(process_hash, pid, integrity_state)
-                                
-                                # Set a flag to skip further processing
-                                alerted_processes.add(pid)
-                            except Exception as e:
-                                logging.error(f"Failed to terminate suspicious process {pid}: {e}")
-                    
-                    # Skip further processing if this process generated an alert
-                    if pid in alerted_processes:
-                        continue
-                    
-                    # After impersonation check, proceed with normal processing
-                    # Check if this hash exists in the integrity file (restarted process)
-                    if process_hash in integrity_state:
-                        stored_info = integrity_state[process_hash]
-                        
-                        # Check for metadata mismatches with existing record
-                        metadata_mismatches = []
-                        
-                        # Check exe_path
-                        if stored_info.get("exe_path") != process_info.get("exe_path"):
-                            metadata_mismatches.append({
-                                "field": "exe_path",
-                                "previous": stored_info.get("exe_path"),
-                                "current": process_info.get("exe_path")
-                            })
-                        
-                        # Check process_name
-                        if stored_info.get("process_name") != process_info.get("process_name"):
-                            metadata_mismatches.append({
-                                "field": "process_name",
-                                "previous": stored_info.get("process_name"),
-                                "current": process_info.get("process_name")
-                            })
-                        
-                        # Check cmdline
-                        if stored_info.get("cmdline") != process_info.get("cmdline"):
-                            metadata_mismatches.append({
-                                "field": "cmdline",
-                                "previous": stored_info.get("cmdline"),
-                                "current": process_info.get("cmdline")
-                            })
-                        
-                        if metadata_mismatches:
-                            # Metadata mismatch for same hash - potentially malicious
-                            logging.critical(f"ALERT: Process hash matches but metadata differs for {process_name} (PID: {pid})")
-                            for mismatch in metadata_mismatches:
-                                logging.critical(f"  {mismatch['field']}: '{mismatch['previous']}' -> '{mismatch['current']}'")
-                            
-                            # Log security event
-                            log_event_to_fim(
-                                event_type="HASH_IMPERSONATION",
-                                file_path=process_info.get("exe_path", ""),
-                                previous_metadata=stored_info,
-                                new_metadata=process_info,
-                                previous_hash=process_hash,
-                                new_hash=process_hash
-                            )
-                            
-                            # Try to kill the suspicious process
-                            try:
-                                logging.critical(f"Attempting to terminate suspicious process {pid}")
-                                os.kill(pid, signal.SIGTERM)
-                                logging.info(f"Successfully terminated process {pid}")
-                                
-                                # Remove malicious process from integrity file
-                                remove_malicious_process(process_hash, pid, integrity_state)
-                                
-                                # Set a flag to skip further processing
-                                alerted_processes.add(pid)
-                                continue
-                            except Exception as e:
-                                logging.error(f"Failed to terminate suspicious process {pid}: {e}")
-                        else:
-                            # Process restarted with same metadata - normal behavior
-                            logging.info(f"Process restarted with consistent metadata: {process_name} (PID: {pid})")
-                            
-                            # Update the process metadata with new PID and start time
-                            updated_info = stored_info.copy()
-                            updated_info["pid"] = pid
-                            updated_info["start_time"] = process_info.get("start_time")
-                            
-                            # Update in integrity state
-                            update_process_tracking(
-                                process_info.get("exe_path"),
-                                process_hash,
-                                updated_info
-                            )
-                    else:
-                        # Check if similar process with different hash exists (application update case)
-                        updated_process = False
-                        similar_processes = []
-                        
-                        for stored_hash, stored_info in integrity_state.items():
-                            # Check for same process name and path but different hash (likely an update)
-                            if (stored_info.get("process_name") == process_name and
-                                stored_info.get("exe_path") == exe_path and
-                                stored_hash != process_hash):
-                                similar_processes.append((stored_hash, stored_info))
-                        
-                        if similar_processes:
-                            # Found similar process - likely a software update
-                            old_hash, old_info = similar_processes[0]  # Take the first match
-                            
-                            logging.info(f"Detected updated process: {process_name} (PID: {pid})")
-                            logging.info(f"Previous hash: {old_hash}")
-                            logging.info(f"New hash: {process_hash}")
-                            
-                            # Log the update event
-                            log_event_to_fim(
-                                event_type="PROCESS_UPDATED",
-                                file_path=exe_path,
-                                previous_metadata=old_info,
-                                new_metadata=process_info,
-                                previous_hash=old_hash,
-                                new_hash=process_hash
-                            )
-                            
-                            # Remove old hash entry and add new one
-                            del integrity_state[old_hash]
-                            update_process_tracking(exe_path, process_hash, process_info)
-                            updated_process = True
-                        
-                        if not updated_process:
-                            # New process
-                            logging.info(f"New listening process: {process_name} (PID: {pid}) on port {port}")
-                            
-                            # Only track in integrity file if not flagged as malicious
-                            if pid not in alerted_processes:
-                                update_process_tracking(
-                                    process_info.get("exe_path"),
-                                    process_hash,
-                                    process_info
-                                )
-                    
-                    # Add to known_pids (unless flagged as malicious)
-                    if pid not in alerted_processes:
-                        known_pids[pid] = process_hash
-            
-            # Reload integrity state after updates
-            integrity_state = load_process_metadata()
-            
-            # Sleep until next interval
-            time.sleep(interval)
-            
-        except Exception as e:
-            logging.error(f"Error in monitoring loop: {e}")
-            logging.debug(traceback.format_exc())
-            
-            # Sleep a bit longer on error to avoid error loops
-            time.sleep(max(interval, 5))
 
 def remove_malicious_process(process_hash, pid, integrity_state):
     """Remove malicious process information from integrity_state and save it."""
@@ -2224,6 +2237,9 @@ def periodic_cleanup(interval=3600):
     
     logging.info("Starting periodic cleanup thread...")
     
+    # Counter for less frequent maintenance
+    maintenance_counter = 0
+    
     while SERVICE_RUNNING:
         try:
             # Sleep first to avoid immediate cleanup on startup
@@ -2233,19 +2249,137 @@ def periodic_cleanup(interval=3600):
                 break
                 
             logging.info("Running periodic cleanup of integrity file...")
+            
+            # Standard cleanup (existing functionality)
             modified = check_application_existence()
             
             if modified:
                 logging.info("Removed entries for non-existent applications from integrity file")
             else:
                 logging.info("Integrity file is up-to-date")
+            
+            # Process group maintenance (run less frequently)
+            maintenance_counter += 1
+            if maintenance_counter >= 24:  # Run once per day (if interval is hourly)
+                maintenance_counter = 0
+                
+                # Load latest state
+                integrity_state = load_process_metadata()
+                
+                # Perform maintenance
+                if maintain_process_groups(integrity_state):
+                    # Save if modified
+                    save_process_metadata(integrity_state)
+                    logging.info("Process group maintenance completed with changes")
+                else:
+                    logging.info("Process group maintenance completed (no changes)")
                 
         except Exception as e:
             logging.error(f"Error in periodic cleanup: {e}")
             logging.debug(traceback.format_exc())
 
-def log_event_to_fim(event_type, file_path, previous_metadata, new_metadata, previous_hash, new_hash):
-    """Log security events to a central JSON file for reporting with improved permissions handling."""
+def maintain_process_groups(integrity_state, max_age_days=30):
+    """
+    Maintain process groups by cleaning old hashes and merging similar groups.
+    Returns True if changes were made to integrity_state.
+    """
+    if "process_groups" not in integrity_state:
+        return False
+    
+    modified = False
+    now = datetime.now()
+    cutoff_date = now - timedelta(days=max_age_days)
+    
+    # 1. Clean old hashes
+    for group_id, group in integrity_state["process_groups"].items():
+        for hash_id in list(group["known_hashes"].keys()):
+            hash_data = group["known_hashes"][hash_id]
+            last_seen_str = hash_data.get("last_seen")
+            
+            if not last_seen_str:
+                continue
+                
+            try:
+                last_seen = datetime.fromisoformat(last_seen_str)
+                if last_seen < cutoff_date:
+                    # This hash hasn't been seen in a long time, remove it
+                    del group["known_hashes"][hash_id]
+                    modified = True
+            except (ValueError, TypeError):
+                # Invalid date format, skip
+                continue
+    
+    # 2. Find and merge similar groups
+    # Group process groups by process name
+    name_to_groups = {}
+    for group_id, group in integrity_state["process_groups"].items():
+        process_name = group["process_name"].lower()
+        if process_name not in name_to_groups:
+            name_to_groups[process_name] = []
+        name_to_groups[process_name].append((group_id, group))
+    
+    # Look for groups with the same name but different paths
+    for process_name, groups in name_to_groups.items():
+        if len(groups) <= 1:
+            continue
+            
+        # Check if these groups are similar enough to merge
+        for i in range(len(groups)):
+            for j in range(i+1, len(groups)):
+                group1_id, group1 = groups[i]
+                group2_id, group2 = groups[j]
+                
+                # Skip already processed groups
+                if group1_id not in integrity_state["process_groups"] or group2_id not in integrity_state["process_groups"]:
+                    continue
+                
+                # Check path similarity
+                path1 = group1["exe_path"].lower()
+                path2 = group2["exe_path"].lower()
+                
+                # If paths are very similar (e.g., case difference or x86 vs x64 paths)
+                if (path1 == path2 or
+                    path1.replace("program files", "program files (x86)") == path2 or
+                    path2.replace("program files", "program files (x86)") == path1):
+                    
+                    # Merge group2 into group1
+                    logging.info(f"Merging similar process groups for {process_name}: {path1} and {path2}")
+                    
+                    # Merge known hashes
+                    for hash_id, hash_data in group2["known_hashes"].items():
+                        if hash_id not in group1["known_hashes"]:
+                            group1["known_hashes"][hash_id] = hash_data
+                        else:
+                            # Update detection count if hash exists in both groups
+                            group1["known_hashes"][hash_id]["detection_count"] += hash_data["detection_count"]
+                            
+                            # Use the more recent last_seen date
+                            try:
+                                last_seen1 = datetime.fromisoformat(group1["known_hashes"][hash_id]["last_seen"])
+                                last_seen2 = datetime.fromisoformat(hash_data["last_seen"])
+                                if last_seen2 > last_seen1:
+                                    group1["known_hashes"][hash_id]["last_seen"] = hash_data["last_seen"]
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    # Merge command line patterns
+                    for pattern in group2["command_line_patterns"]:
+                        if pattern not in group1["command_line_patterns"]:
+                            group1["command_line_patterns"].append(pattern)
+                    
+                    # Merge lineage patterns
+                    for lineage in group2["common_lineage_patterns"]:
+                        if not any(match_lineage_pattern(lineage, pattern) for pattern in group1["common_lineage_patterns"]):
+                            group1["common_lineage_patterns"].append(lineage)
+                    
+                    # Remove the merged group
+                    del integrity_state["process_groups"][group2_id]
+                    modified = True
+    
+    return modified
+
+def log_event_to_pim(event_type, file_path, previous_metadata, new_metadata, previous_hash, new_hash, priority=None):
+    """Log security events to a central JSON file with clear change descriptions and MITRE ATT&CK classification."""
     try:
         # Import builtins in case open is undefined in this context
         import builtins
@@ -2254,15 +2388,231 @@ def log_event_to_fim(event_type, file_path, previous_metadata, new_metadata, pre
         pim_log_file = os.path.join(BASE_DIR, "logs", "pim.json")
         os.makedirs(os.path.dirname(pim_log_file), exist_ok=True)
         
-        # Create event data
+        # Determine what actually changed to create a more specific event type
+        specific_event_type = event_type
+        change_details = {}
+        
+        if event_type == "PROCESS_METADATA_CHANGED" and previous_metadata and new_metadata:
+            # Compare metadata to identify specific changes
+            specific_changes = []
+            
+            # Important fields to check
+            key_fields = [
+                ("port", "PORT_BINDING_CHANGED"),
+                ("cmdline", "COMMAND_LINE_CHANGED"),
+                ("user", "USER_CONTEXT_CHANGED"),
+                ("exe_path", "EXECUTABLE_PATH_CHANGED"),
+                ("ppid", "PARENT_PROCESS_CHANGED"),
+                ("hash", "HASH_CHANGED")
+            ]
+            
+            # Check for differences in key fields
+            for field, field_event_type in key_fields:
+                prev_value = previous_metadata.get(field)
+                new_value = new_metadata.get(field)
+                
+                if prev_value != new_value:
+                    # Add to list of specific changes
+                    specific_changes.append(field_event_type)
+                    
+                    # Add detailed change info
+                    change_details[field] = {
+                        "previous": prev_value,
+                        "current": new_value,
+                        "description": f"{field.capitalize()} changed from '{prev_value}' to '{new_value}'"
+                    }
+            
+            # Check for memory changes
+            if "memory_rss_kb" in previous_metadata and "memory_rss_kb" in new_metadata:
+                prev_mem = previous_metadata.get("memory_rss_kb", 0)
+                new_mem = new_metadata.get("memory_rss_kb", 0)
+                mem_delta = new_mem - prev_mem
+                
+                # Only flag significant memory changes (>50MB)
+                if abs(mem_delta) > 51200:  # 50MB
+                    specific_changes.append("MEMORY_USAGE_SIGNIFICANT_CHANGE")
+                    change_details["memory"] = {
+                        "previous": prev_mem,
+                        "current": new_mem,
+                        "delta": mem_delta,
+                        "delta_mb": round(mem_delta / 1024, 2),
+                        "description": f"Memory usage {'increased' if mem_delta > 0 else 'decreased'} by {abs(mem_delta // 1024)} MB"
+                    }
+            
+            # Check for thread count changes
+            if "thread_count" in previous_metadata and "thread_count" in new_metadata:
+                prev_threads = previous_metadata.get("thread_count", 0)
+                new_threads = new_metadata.get("thread_count", 0)
+                thread_delta = new_threads - prev_threads
+                
+                # Calculate percentage change if previous count was non-zero
+                thread_percentage = 0
+                if prev_threads > 0:
+                    thread_percentage = (new_threads / prev_threads * 100) - 100
+                
+                # Apply appropriate thresholds based on process type
+                process_name = new_metadata.get("process_name", "").lower()
+                benign_variable_processes = [
+                    "nissrv.exe", "msmpeng.exe", "svchost.exe", "searchindexer.exe", 
+                    "mssearch.exe", "sqlservr.exe", "w3wp.exe", "iisexpress.exe"
+                ]
+                
+                is_benign_variable = process_name in benign_variable_processes
+                
+                # Only report significant thread changes
+                if ((not is_benign_variable and (thread_delta > 10 or thread_percentage > 300)) or 
+                    (is_benign_variable and thread_delta > 20 and thread_percentage > 500)):
+                    specific_changes.append("THREAD_COUNT_SIGNIFICANT_CHANGE")
+                    change_details["threads"] = {
+                        "previous": prev_threads,
+                        "current": new_threads,
+                        "delta": thread_delta,
+                        "percentage": round(thread_percentage, 1),
+                        "description": f"Thread count {'increased' if thread_delta > 0 else 'decreased'} by {abs(thread_delta)} ({round(abs(thread_percentage), 1)}%)"
+                    }
+            
+            # If no specific changes were identified, or only minor changes in benign processes,
+            # return True without logging to reduce noise
+            if not specific_changes:
+                return True
+            
+            # If only minor thread changes in a benign process, skip logging
+            if (len(specific_changes) == 1 and 
+                specific_changes[0] == "THREAD_COUNT_SIGNIFICANT_CHANGE" and
+                is_benign_variable and
+                thread_delta <= 30):
+                return True
+            
+            # Update the event type to be more specific
+            if len(specific_changes) == 1:
+                specific_event_type = specific_changes[0]
+            else:
+                # Join multiple changes with underscores
+                specific_event_type = "MULTIPLE_CHANGES"
+        
+        elif event_type == "PROCESS_RUNTIME_CHANGES" and "detected_changes" in new_metadata:
+            # Extract detailed change information from detected_changes
+            changes = new_metadata.get("detected_changes", [])
+            
+            if changes:
+                change_fields = [change.get("field", "") for change in changes]
+                
+                # Categorize based on most significant change
+                if "user" in change_fields:
+                    specific_event_type = "USER_CONTEXT_CHANGED"
+                elif "cmdline" in change_fields:
+                    specific_event_type = "COMMAND_LINE_MODIFIED_DURING_EXECUTION"
+                elif "thread_count" in change_fields:
+                    specific_event_type = "THREAD_COUNT_SIGNIFICANT_CHANGE"
+                elif "memory_rss_kb" in change_fields:
+                    specific_event_type = "MEMORY_USAGE_SIGNIFICANT_CHANGE"
+                
+                # Add detailed change descriptions
+                for change in changes:
+                    field = change.get("field", "")
+                    severity = change.get("severity", "low")
+                    
+                    prev_value = change.get("previous", "")
+                    current_value = change.get("current", "")
+                    delta = change.get("delta", 0) if "delta" in change else None
+                    
+                    # Create descriptive message
+                    if delta is not None:
+                        if field == "thread_count":
+                            description = f"Thread count {'increased' if delta > 0 else 'decreased'} by {abs(delta)}"
+                            if "percentage" in change:
+                                description += f" ({round(abs(change.get('percentage', 0)), 1)}%)"
+                        elif field == "memory_rss_kb":
+                            description = f"Memory usage {'increased' if delta > 0 else 'decreased'} by {abs(delta // 1024)} MB"
+                        else:
+                            description = f"{field.capitalize()} changed by {delta}"
+                    else:
+                        description = f"{field.capitalize()} changed from '{prev_value}' to '{current_value}'"
+                    
+                    change_details[field] = {
+                        "previous": prev_value,
+                        "current": current_value,
+                        "delta": delta,
+                        "severity": severity,
+                        "description": description
+                    }
+        
+        # Determine event priority if not specified
+        if priority is None:
+            if specific_event_type in ["USER_CONTEXT_CHANGED", "HASH_CHANGED", "EXECUTABLE_PATH_CHANGED", 
+                                     "PROCESS_NAME_IMPERSONATION", "FILELESS_PROCESS_DETECTED"]:
+                priority = "critical"
+            elif specific_event_type in ["COMMAND_LINE_MODIFIED_DURING_EXECUTION", "PARENT_PROCESS_CHANGED",
+                                       "SUSPICIOUS_MEMORY_REGION", "SUSPICIOUS_BEHAVIOR"]:
+                priority = "high"
+            elif specific_event_type in ["PORT_BINDING_CHANGED", "MEMORY_USAGE_SIGNIFICANT_CHANGE",
+                                       "THREAD_COUNT_SIGNIFICANT_CHANGE", "UNUSUAL_PORT_USE"]:
+                priority = "medium"
+            else:
+                priority = "info"
+        
+        # Apply MITRE ATT&CK classification
+        mitre_techniques = []
+        mitre_technique_names = []
+        
+        # Use existing MITRE classification if available
+        if new_metadata and "mitre_techniques" in new_metadata:
+            mitre_techniques = new_metadata.get("mitre_techniques", [])
+            mitre_technique_names = new_metadata.get("mitre_technique_names", [])
+        else:
+            # Map specific event types to MITRE techniques
+            event_mitre_map = {
+                "USER_CONTEXT_CHANGED": ["T1078", "Valid Accounts"],
+                "HASH_CHANGED": ["T1036", "Masquerading"],
+                "EXECUTABLE_PATH_CHANGED": ["T1036", "Masquerading"],
+                "COMMAND_LINE_MODIFIED_DURING_EXECUTION": ["T1055", "Process Injection"],
+                "MEMORY_USAGE_SIGNIFICANT_CHANGE": ["T1055", "Process Injection"],
+                "THREAD_COUNT_SIGNIFICANT_CHANGE": ["T1055", "Process Injection"],
+                "PORT_BINDING_CHANGED": ["T1571", "Non-Standard Port"],
+                "PARENT_PROCESS_CHANGED": ["T1055", "Process Injection"],
+                "FILELESS_PROCESS_DETECTED": ["T1027", "Obfuscated Files or Information"]
+            }
+            
+            # Get basic MITRE mapping
+            if specific_event_type in event_mitre_map:
+                technique_id, technique_name = event_mitre_map[specific_event_type]
+                mitre_techniques.append(technique_id)
+                mitre_technique_names.append(technique_name)
+            
+            # For more nuanced mapping, use the classify_by_mitre_attck function
+            process_info = new_metadata if new_metadata else previous_metadata
+            
+            if process_info:
+                # Use change_details as detection details
+                mitre_info = classify_by_mitre_attck(specific_event_type, process_info, change_details)
+                
+                if mitre_info:
+                    techniques = mitre_info.get("techniques", [])
+                    for technique in techniques:
+                        technique_id = technique.get("technique_id")
+                        technique_name = technique.get("technique_name")
+                        
+                        if technique_id and technique_id not in mitre_techniques:
+                            mitre_techniques.append(technique_id)
+                            if technique_name:
+                                mitre_technique_names.append(technique_name)
+        
+        # Create enhanced event data with specific change details
         event = {
             "timestamp": datetime.now().isoformat(),
-            "event_type": event_type,
+            "event_type": specific_event_type,
+            "original_event_type": event_type if specific_event_type != event_type else None,
+            "priority": priority,
             "file_path": file_path,
+            "process_name": (new_metadata or previous_metadata or {}).get("process_name", "UNKNOWN"),
+            "pid": (new_metadata or previous_metadata or {}).get("pid", 0),
+            "change_details": change_details,
             "previous_metadata": previous_metadata,
             "new_metadata": new_metadata,
             "previous_hash": previous_hash,
-            "new_hash": new_hash
+            "new_hash": new_hash,
+            "mitre_techniques": mitre_techniques,
+            "mitre_technique_names": mitre_technique_names
         }
         
         # Get current events
@@ -2324,7 +2674,22 @@ def log_event_to_fim(event_type, file_path, previous_metadata, new_metadata, pre
                 except:
                     pass
             
-            logging.debug(f"Event logged successfully: {event_type}")
+            # Log detailed change information
+            process_name = (new_metadata or previous_metadata or {}).get("process_name", "UNKNOWN")
+            pid = (new_metadata or previous_metadata or {}).get("pid", 0)
+            
+            # Create descriptive log message
+            log_descriptions = []
+            for field, details in change_details.items():
+                if "description" in details:
+                    log_descriptions.append(details["description"])
+            
+            description_str = "; ".join(log_descriptions)
+            mitre_str = ", ".join(mitre_techniques) if mitre_techniques else "None"
+            
+            # Log the specific changes that occurred
+            logging.warning(f"{specific_event_type}: {process_name} (PID: {pid}) - {description_str} - MITRE: {mitre_str}")
+                
             return True
             
         except Exception as e:
@@ -2376,7 +2741,7 @@ def periodic_integrity_scan(interval=120):
                     process_name = current_info.get("process_name", "UNKNOWN")
                     if process_name != "UNKNOWN":  # Only log for valid processes
                         logging.warning(f"Untracked process detected: {process_name} (PID: {pid})")
-                        log_event_to_fim(
+                        log_event_to_pim(
                             event_type="NEW_UNTRACKED_PROCESS",
                             file_path=current_info.get("exe_path", ""),
                             previous_metadata=None,
@@ -2405,7 +2770,7 @@ def periodic_integrity_scan(interval=120):
                     logging.warning(
                         f"Metadata changes detected for PID {pid}: {list(changed_fields.keys())}"
                     )
-                    log_event_to_fim(
+                    log_event_to_pim(
                         event_type="PROCESS_METADATA_CHANGED",
                         file_path=current_info.get("exe_path", ""),
                         previous_metadata=stored_info,
@@ -3028,6 +3393,391 @@ def detect_fileless_process(pid, exe_path, cmdline, process_hash, lineage=None):
             wmi_exec or 
             dotnet_memory_load)
 
+def monitor_listening_processes(interval=3):
+    """Main monitoring loop for detecting suspicious processes with process group tracking."""
+    global SERVICE_RUNNING
+    
+    # Setup tracking
+    known_processes = {}  # Store by key: process_hash
+    known_pids = {}       # Track PIDs to detect terminations
+    ml_model_info = None
+    ml_retrain_counter = 0
+    alerted_processes = set()  # Avoid duplicate alerts
+    
+    # Initialize ML model if available
+    if ML_LIBRARIES_AVAILABLE:
+        ml_model_info = implement_behavioral_baselining()
+        logging.info("ML behavioral baselining completed")
+    
+    logging.info("Starting process monitoring with process group tracking...")
+    
+    # Load integrity state
+    integrity_state = load_process_metadata()
+    
+    # Initialize process_groups if needed
+    if "process_groups" not in integrity_state:
+        integrity_state["process_groups"] = {}
+        save_process_metadata(integrity_state)
+    
+    # *** CHANGE HERE: First populate known_processes from integrity_state ***
+    for process_hash, process_info in integrity_state.items():
+        # Skip process_groups entry
+        if process_hash == "process_groups":
+            continue
+            
+        try:
+            pid = int(process_info.get("pid", 0))
+            if pid > 0:
+                known_pids[pid] = process_hash
+                known_processes[process_hash] = process_info
+        except (ValueError, TypeError):
+            continue
+    
+    # Start the cleanup thread
+    cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+    cleanup_thread.start()
+    
+    # *** CHANGE HERE: Flag for first iteration - no process termination alerts on first run ***
+    first_run = True
+    
+    while SERVICE_RUNNING:
+        try:
+            # Get current listening processes
+            current_processes = get_listening_processes()
+            
+            # Create mappings for current processes
+            current_hash_to_process = {}
+            current_pids = {}
+            
+            for process_key, process_info in current_processes.items():
+                process_hash = process_info.get("hash")
+                pid = process_info.get("pid")
+                
+                if process_hash and process_hash not in ["ERROR_HASHING_PERMISSION", "ERROR_FILE_NOT_FOUND"]:
+                    current_hash_to_process[process_hash] = process_info
+                    current_pids[pid] = process_hash
+            
+            # Detect terminated processes by PID
+            # *** CHANGE HERE: Skip this check on first iteration to avoid false termination alerts ***
+            if not first_run:
+                for pid in list(known_pids.keys()):
+                    if pid not in current_pids:
+                        process_hash = known_pids[pid]
+                        
+                        # Get process info from integrity_state
+                        if process_hash in integrity_state:
+                            term_process = integrity_state[process_hash]
+                            process_name = term_process.get("process_name", "UNKNOWN")
+                            port = term_process.get("port", "UNKNOWN")
+                            
+                            logging.warning(f"Process terminated: {process_name} (PID: {pid}) on port {port}")
+                            
+                            # Generate alert for terminated process
+                            log_event_to_pim(
+                                event_type="PROCESS_TERMINATED",
+                                file_path=term_process.get("exe_path", ""),
+                                previous_metadata=term_process,
+                                new_metadata=None,
+                                previous_hash=process_hash,
+                                new_hash=None
+                            )
+                            
+                            # Remove pid from known_pids but KEEP in integrity_state
+                            # for legitimate processes
+                            del known_pids[pid]
+            
+            # Process new or restarted processes
+            for pid, process_hash in current_pids.items():
+                if pid not in known_pids:
+                    process_info = current_hash_to_process[process_hash]
+                    process_name = process_info.get("process_name", "UNKNOWN")
+                    port = process_info.get("port", "UNKNOWN")
+                    exe_path = process_info.get("exe_path", "")
+                    
+                    # IMPORTANT: First check for process name impersonation
+                    # This needs to happen before we check for process restarts
+                    name_alerts = check_process_name_consistency(process_info, integrity_state)
+                    
+                    if name_alerts:
+                        for alert in name_alerts:
+                            # Log critical alert for process impersonation
+                            impersonated_name = alert["details"]["process_name"]
+                            original_path = alert["details"]["original_process"]["exe_path"]
+                            impersonating_path = alert["details"]["impersonating_process"]["exe_path"]
+                            reason = alert["details"].get("reason", "Executable path mismatch")
+                            severity = alert["details"].get("severity", "high")
+                            
+                            logging.critical(f"ALERT: Process name impersonation detected!")
+                            logging.critical(f"Process '{impersonated_name}' at path '{impersonating_path}' appears to be impersonating legitimate process from '{original_path}'")
+                            logging.critical(f"Reason: {reason} (Severity: {severity})")
+                            
+                            # Add more detailed lineage information to the log
+                            original_lineage = alert["details"]["original_process"].get("lineage", [])
+                            impersonating_lineage = alert["details"]["impersonating_process"].get("lineage", [])
+                            
+                            if original_lineage and impersonating_lineage:
+                                logging.critical(f"Original process lineage: {' -> '.join(original_lineage)}")
+                                logging.critical(f"Impersonating process lineage: {' -> '.join(impersonating_lineage)}")
+                            
+                            # Log security event
+                            log_event_to_pim(
+                                event_type="PROCESS_NAME_IMPERSONATION",
+                                file_path=process_info.get("exe_path", ""),
+                                previous_metadata=alert["details"]["original_process"],
+                                new_metadata=alert["details"]["impersonating_process"],
+                                previous_hash=alert["details"]["original_process"].get("hash", ""),
+                                new_hash=process_hash
+                            )
+                            
+                            # Try to kill the suspicious process
+                            try:
+                                logging.critical(f"Attempting to terminate suspicious impersonating process {pid}")
+                                os.kill(pid, signal.SIGTERM)
+                                logging.info(f"Successfully terminated process {pid}")
+                                
+                                # Remove malicious process from integrity file if it was added
+                                if process_hash in integrity_state:
+                                    remove_malicious_process(process_hash, pid, integrity_state)
+                                
+                                # Set a flag to skip further processing
+                                alerted_processes.add(pid)
+                            except Exception as e:
+                                logging.error(f"Failed to terminate suspicious process {pid}: {e}")
+                    
+                    # Skip further processing if this process generated an alert
+                    if pid in alerted_processes:
+                        continue
+                    
+                    # Check process group legitimacy (new)
+                    group_alerts = check_process_group_legitimacy(process_info, integrity_state)
+                    
+                    if group_alerts:
+                        for alert in group_alerts:
+                            alert_type = alert.get("type", "")
+                            details = alert.get("details", {})
+                            severity = details.get("severity", "medium")
+                            description = details.get("description", "")
+                            
+                            if severity == "high":
+                                logging.critical(f"PROCESS GROUP ALERT: {description}")
+                            elif severity == "medium":
+                                logging.warning(f"PROCESS GROUP ALERT: {description}")
+                            else:
+                                logging.info(f"PROCESS GROUP INFO: {description}")
+                            
+                            # Log the alert
+                            log_event_to_pim(
+                                event_type=alert_type,
+                                file_path=process_info.get("exe_path", ""),
+                                previous_metadata=None,
+                                new_metadata=process_info,
+                                previous_hash=None,
+                                new_hash=process_hash
+                            )
+                        
+                        # If high severity alert found, consider terminating the process
+                        if any(alert.get("details", {}).get("severity") == "high" for alert in group_alerts):
+                            logging.critical(f"High severity process group alert detected for {process_name} - attempting to terminate")
+                            try:
+                                os.kill(pid, signal.SIGTERM)
+                                logging.info(f"Successfully terminated suspicious process {pid}")
+                                alerted_processes.add(pid)
+                                continue
+                            except Exception as e:
+                                logging.error(f"Failed to terminate suspicious process {pid}: {e}")
+                    
+                    # After impersonation check, proceed with normal processing
+                    # Check if this hash exists in the integrity file (restarted process)
+                    if process_hash in integrity_state:
+                        stored_info = integrity_state[process_hash]
+                        
+                        # Check for metadata mismatches with existing record
+                        metadata_mismatches = []
+                        
+                        # Check exe_path
+                        if stored_info.get("exe_path") != process_info.get("exe_path"):
+                            metadata_mismatches.append({
+                                "field": "exe_path",
+                                "previous": stored_info.get("exe_path"),
+                                "current": process_info.get("exe_path")
+                            })
+                        
+                        # Check process_name
+                        if stored_info.get("process_name") != process_info.get("process_name"):
+                            metadata_mismatches.append({
+                                "field": "process_name",
+                                "previous": stored_info.get("process_name"),
+                                "current": process_info.get("process_name")
+                            })
+                        
+                        # Check cmdline - for process group tracked processes, use pattern matching
+                        stored_cmdline = stored_info.get("cmdline", "")
+                        current_cmdline = process_info.get("cmdline", "")
+                        
+                        # Only flag cmdline mismatch if significant (not just variable parts)
+                        if stored_cmdline != current_cmdline:
+                            # Check if they match as patterns
+                            stored_pattern = simplify_command_line(stored_cmdline)
+                            current_pattern = simplify_command_line(current_cmdline)
+                            
+                            if stored_pattern != current_pattern:
+                                metadata_mismatches.append({
+                                    "field": "cmdline",
+                                    "previous": stored_cmdline,
+                                    "current": current_cmdline
+                                })
+                        
+                        if metadata_mismatches:
+                            # Metadata mismatch for same hash - potentially malicious
+                            logging.critical(f"ALERT: Process hash matches but metadata differs for {process_name} (PID: {pid})")
+                            for mismatch in metadata_mismatches:
+                                logging.critical(f"  {mismatch['field']}: '{mismatch['previous']}' -> '{mismatch['current']}'")
+                            
+                            # Log security event
+                            log_event_to_pim(
+                                event_type="HASH_IMPERSONATION",
+                                file_path=process_info.get("exe_path", ""),
+                                previous_metadata=stored_info,
+                                new_metadata=process_info,
+                                previous_hash=process_hash,
+                                new_hash=process_hash
+                            )
+                            
+                            # Try to kill the suspicious process
+                            try:
+                                logging.critical(f"Attempting to terminate suspicious process {pid}")
+                                os.kill(pid, signal.SIGTERM)
+                                logging.info(f"Successfully terminated process {pid}")
+                                
+                                # Remove malicious process from integrity file
+                                remove_malicious_process(process_hash, pid, integrity_state)
+                                
+                                # Set a flag to skip further processing
+                                alerted_processes.add(pid)
+                                continue
+                            except Exception as e:
+                                logging.error(f"Failed to terminate suspicious process {pid}: {e}")
+                        else:
+                            # Process restarted with same metadata - normal behavior
+                            logging.info(f"Process restarted with consistent metadata: {process_name} (PID: {pid})")
+                            
+                            # Update the process metadata with new PID and start time
+                            updated_info = stored_info.copy()
+                            updated_info["pid"] = pid
+                            updated_info["start_time"] = process_info.get("start_time")
+                            
+                            # Update in integrity state
+                            update_process_tracking(
+                                process_info.get("exe_path"),
+                                process_hash,
+                                updated_info
+                            )
+                    else:
+                        # Check if similar process with different hash exists (application update case)
+                        updated_process = False
+                        similar_processes = []
+                        
+                        for stored_hash, stored_info in integrity_state.items():
+                            # Skip process_groups entry
+                            if stored_hash == "process_groups":
+                                continue
+                                
+                            # Check for same process name and path but different hash (likely an update)
+                            if (stored_info.get("process_name") == process_name and
+                                stored_info.get("exe_path") == exe_path and
+                                stored_hash != process_hash):
+                                similar_processes.append((stored_hash, stored_info))
+                        
+                        if similar_processes:
+                            # Found similar process - likely a software update
+                            old_hash, old_info = similar_processes[0]  # Take the first match
+                            
+                            logging.info(f"Detected updated process: {process_name} (PID: {pid})")
+                            logging.info(f"Previous hash: {old_hash}")
+                            logging.info(f"New hash: {process_hash}")
+                            
+                            # Log the update event
+                            log_event_to_pim(
+                                event_type="PROCESS_UPDATED",
+                                file_path=exe_path,
+                                previous_metadata=old_info,
+                                new_metadata=process_info,
+                                previous_hash=old_hash,
+                                new_hash=process_hash
+                            )
+                            
+                            # Remove old hash entry and add new one
+                            del integrity_state[old_hash]
+                            update_process_tracking(exe_path, process_hash, process_info)
+                            updated_process = True
+                        
+                        if not updated_process:
+                            # New process - check traditional integrity checks
+                            
+                            # 1. Check lineage baseline
+                            lineage = process_info.get("lineage", [])
+                            if lineage:
+                                lineage_ok = check_lineage_baseline(process_info, integrity_state)
+                                if not lineage_ok:
+                                    # Log lineage deviation alert
+                                    log_event_to_pim(
+                                        event_type="LINEAGE_DEVIATION",
+                                        file_path=exe_path,
+                                        previous_metadata=None,
+                                        new_metadata=process_info,
+                                        previous_hash=None,
+                                        new_hash=process_hash
+                                    )
+                                    logging.warning(f"Process {process_name} has suspicious lineage deviation")
+                            
+                            # 2. Check for unusual ports
+                            port_alerts = check_for_unusual_port_use(process_info, integrity_state)
+                            if port_alerts:
+                                for port_alert in port_alerts:
+                                    log_event_to_pim(
+                                        event_type=port_alert["type"],
+                                        file_path=exe_path,
+                                        previous_metadata=None,
+                                        new_metadata=port_alert["details"],
+                                        previous_hash=None,
+                                        new_hash=process_hash
+                                    )
+                                    logging.warning(f"Process {process_name} has unusual port usage: {port_alert['details']['actual_port']}")
+                            
+                            # Log the new process
+                            logging.info(f"New listening process: {process_name} (PID: {pid}) on port {port}")
+                            
+                            # Only track in integrity file if not flagged as malicious
+                            if pid not in alerted_processes:
+                                update_process_tracking(
+                                    process_info.get("exe_path"),
+                                    process_hash,
+                                    process_info
+                                )
+                    
+                    # Add to known_pids (unless flagged as malicious)
+                    if pid not in alerted_processes:
+                        known_pids[pid] = process_hash
+            
+            first_run = False
+            
+            # Reload integrity state after updates
+            integrity_state = load_process_metadata()
+            
+            # Sleep until next interval
+            time.sleep(interval)
+            
+        except Exception as e:
+            logging.error(f"Error in monitoring loop: {e}")
+            logging.debug(traceback.format_exc())
+            
+            # Sleep a bit longer on error to avoid error loops
+            time.sleep(max(interval, 5))
+
+def save_process_metadata(processes):
+    """Save full process metadata to integrity_processes.json safely."""
+    return safe_write_json(INTEGRITY_PROCESS_FILE, processes)
+
 def monitor_all_processes(interval=5):
     """Main monitoring loop for tracking all processes on the system."""
     global SERVICE_RUNNING
@@ -3040,7 +3790,7 @@ def monitor_all_processes(interval=5):
     
     # Define special system processes that should be excluded from alerting
     special_system_processes = [
-        "registry", "memcompression", "vmmem", "secure system", 
+        "registry", "memcompression", "secure system", 
         "system", "idle", "memory compression"
     ]
     
@@ -3085,7 +3835,7 @@ def monitor_all_processes(interval=5):
                         logging.warning(f"Command line: {process_info.get('cmdline', 'UNKNOWN')}")
                         
                         # Generate alert for fileless process
-                        log_event_to_fim(
+                        log_event_to_pim(
                             event_type="FILELESS_PROCESS_DETECTED",
                             file_path=exe_path if exe_path != "ACCESS_DENIED" else "",
                             previous_metadata=None,
@@ -3109,7 +3859,7 @@ def monitor_all_processes(interval=5):
                         logging.warning(f"Suspicious behavior detected in process {process_name} (PID: {pid}): {behavior_str}")
                         
                         # Log the alert
-                        log_event_to_fim(
+                        log_event_to_pim(
                             event_type="SUSPICIOUS_BEHAVIOR",
                             file_path=exe_path,
                             previous_metadata=None,
@@ -3130,7 +3880,7 @@ def monitor_all_processes(interval=5):
                             logging.warning(f"ML detected anomaly in process {process_name} (PID: {pid}) - Score: {anomaly.get('score', 0)}")
                             
                             # Log the alert
-                            log_event_to_fim(
+                            log_event_to_pim(
                                 event_type="ML_DETECTED_ANOMALY",
                                 file_path=exe_path,
                                 previous_metadata=None,
@@ -3168,7 +3918,8 @@ def monitor_all_processes(interval=5):
                         changes.append({
                             "field": "cmdline",
                             "previous": stored_info.get("cmdline"),
-                            "current": process_info.get("cmdline")
+                            "current": process_info.get("cmdline"),
+                            "severity": "high"  # Command line changes are high severity
                         })
                     
                     # Check for user changes (potential privilege escalation)
@@ -3176,7 +3927,8 @@ def monitor_all_processes(interval=5):
                         changes.append({
                             "field": "user",
                             "previous": stored_info.get("user"),
-                            "current": process_info.get("user")
+                            "current": process_info.get("user"),
+                            "severity": "critical"  # User changes are critical severity
                         })
                     
                     # Check for memory growth (potential heap spray or injection)
@@ -3189,44 +3941,83 @@ def monitor_all_processes(interval=5):
                             "field": "memory_rss_kb",
                             "previous": prev_mem,
                             "current": current_mem,
-                            "delta": current_mem - prev_mem
+                            "delta": current_mem - prev_mem,
+                            "severity": "medium"
                         })
                     
-                    # Check for thread count increase (potential thread injection)
+                    # Check for thread count increase with improved thresholds
                     prev_threads = stored_info.get("thread_count", 0)
                     current_threads = process_info.get("thread_count", 0)
                     
-                    if current_threads - prev_threads > 5:  # Arbitrary threshold
+                    # Skip if previous count is zero (initialization)
+                    if prev_threads > 0:
+                        thread_increase = current_threads - prev_threads
+                        percentage_increase = ((current_threads / prev_threads) * 100) - 100 if prev_threads > 0 else 0
+                        
+                        # Process type-specific thresholds
+                        benign_variable_processes = [
+                            "nissrv.exe", "msmpeng.exe", "svchost.exe", "searchindexer.exe", 
+                            "mssearch.exe", "sqlservr.exe", "w3wp.exe", "iisexpress.exe"
+                        ]
+                        
+                        is_benign_variable = process_name in benign_variable_processes
+                        
+                        # Apply appropriate thresholds
+                        if ((not is_benign_variable and (thread_increase > 10 or percentage_increase > 300)) or 
+                            (is_benign_variable and thread_increase > 20 and percentage_increase > 500)):
+                            changes.append({
+                                "field": "thread_count",
+                                "previous": prev_threads,
+                                "current": current_threads,
+                                "delta": thread_increase,
+                                "percentage": int(percentage_increase),
+                                "severity": "medium"
+                            })
+                    
+                    # Check for handle count increase (common in poorly written malware)
+                    prev_handles = stored_info.get("handle_count", 0)
+                    current_handles = process_info.get("handle_count", 0)
+                    
+                    if prev_handles > 0 and (current_handles - prev_handles) > 100:
                         changes.append({
-                            "field": "thread_count",
-                            "previous": prev_threads,
-                            "current": current_threads,
-                            "delta": current_threads - prev_threads
+                            "field": "handle_count",
+                            "previous": prev_handles,
+                            "current": current_handles,
+                            "delta": current_handles - prev_handles,
+                            "severity": "low"
                         })
                     
                     # If significant changes detected, log and alert
                     if changes:
-                        process_name = process_info.get("process_name", "UNKNOWN")
-                        logging.warning(f"Significant changes detected in process {process_name} (PID: {pid}):")
+                        # Only alert on medium or higher severity changes
+                        significant_changes = [c for c in changes if c.get("severity") in ["medium", "high", "critical"]]
                         
-                        for change in changes:
-                            if "delta" in change:
-                                logging.warning(f"  {change['field']}: {change['previous']} -> {change['current']} (delta: {change['delta']})")
-                            else:
-                                logging.warning(f"  {change['field']}: '{change['previous']}' -> '{change['current']}'")
-                        
-                        # Log the alert
-                        log_event_to_fim(
-                            event_type="PROCESS_RUNTIME_CHANGES",
-                            file_path=process_info.get("exe_path", ""),
-                            previous_metadata=stored_info,
-                            new_metadata=process_info,
-                            previous_hash=process_hash,
-                            new_hash=process_hash
-                        )
-                        
-                        # Add to alerted processes to prevent duplicate alerts
-                        alerted_processes.add(pid)
+                        if significant_changes:
+                            process_name = process_info.get("process_name", "UNKNOWN")
+                            logging.warning(f"Significant changes detected in process {process_name} (PID: {pid}):")
+                            
+                            for change in significant_changes:
+                                severity = change.get("severity", "").upper()
+                                if "delta" in change:
+                                    logging.warning(f"  [{severity}] {change['field']}: {change['previous']} -> {change['current']} (delta: {change['delta']})")
+                                else:
+                                    logging.warning(f"  [{severity}] {change['field']}: '{change['previous']}' -> '{change['current']}'")
+                            
+                            # Add the changes to process_info for logging
+                            process_info["detected_changes"] = significant_changes
+                            
+                            # Log the alert
+                            log_event_to_pim(
+                                event_type="PROCESS_RUNTIME_CHANGES",
+                                file_path=process_info.get("exe_path", ""),
+                                previous_metadata=stored_info,
+                                new_metadata=process_info,
+                                previous_hash=process_info.get("hash", ""),
+                                new_hash=process_info.get("hash", "")
+                            )
+                            
+                            # Add to alerted processes to prevent duplicate alerts
+                            alerted_processes.add(pid)
                     
                     # Update stored information
                     known_processes[pid] = process_info
@@ -3253,7 +4044,7 @@ def monitor_all_processes(interval=5):
                         del known_hashes[process_hash]
                     
                     # Generate alert for terminated process
-                    log_event_to_fim(
+                    log_event_to_pim(
                         event_type="PROCESS_TERMINATED",
                         file_path=process_info.get("exe_path", ""),
                         previous_metadata=process_info,
