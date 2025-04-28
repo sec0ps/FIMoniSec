@@ -39,13 +39,10 @@ import atexit
 import json
 import remote
 import updater
-#import yara
-#from malscan_yara import ensure_rules_exist, update_rules, compile_rules, yara_scan_file
 from pathlib import Path
 from utils.process_guardian import ProcessGuardian
 
 # Define BASE_DIR as a static path
-# In monisec_client.py
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
 UTILS_DIR = os.path.join(BASE_DIR, "utils")
 sys.path.append(UTILS_DIR)
@@ -129,7 +126,7 @@ if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
 
 # List of monitored processes
 PROCESSES = {
-    "fim_client": "python3 fim_client.py -d",
+    "fim": "python3 fim.py -d",
     "pim": "python3 pim.py -d",
     "lim": "python3 lim.py -d",
 }
