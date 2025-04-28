@@ -1,33 +1,7 @@
-# =============================================================================
-# FIMonsec Tool - File Integrity Monitoring Security Solution
-# =============================================================================
-#
-# Author: Keith Pachulski
-# Company: Red Cell Security, LLC
-# Email: keith@redcellsecurity.org
-# Website: www.redcellsecurity.org
-#
-# Copyright (c) 2025 Keith Pachulski. All rights reserved.
-#
-# License: This software is licensed under the MIT License.
-#          You are free to use, modify, and distribute this software
-#          in accordance with the terms of the license.
-#
-# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
-#          system integrity monitoring with real-time alerting capabilities. It monitors
-#          critical system and application files for unauthorized modifications,
-#          supports baseline comparisons, and integrates with SIEM solutions.
-#
-# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
-#             express or implied, including but not limited to the warranties
-#             of merchantability, fitness for a particular purpose, and non-infringement.
-#             In no event shall the authors or copyright holders be liable for any claim,
-#             damages, or other liability, whether in an action of contract, tort, or otherwise,
-#             arising from, out of, or in connection with the software or the use or other dealings
-#             in the software.
-#
-# =============================================================================
 #!/usr/bin/env python3
+# LIM.py - Log Integrity Monitor
+# A single file program for monitoring system log integrity with MITRE ATT&CK mapping
+
 import argparse
 import datetime
 import json
@@ -1235,30 +1209,51 @@ class LogIntegrityMonitor:
         # Start monitoring
         self.monitoring_loop()
     
-    def start_daemon(self):
-        """Start monitoring as daemon"""
-        self.logger.info("Starting daemon mode")
+    @staticmethod
+    def stop_daemon(pid_file=None):
+        """Stop daemon if running without loading config"""
+        if pid_file is None:
+            base_dir = "/opt/FIMoniSec/Linux-Client"
+            output_dir = os.path.join(base_dir, "output")
+            pid_file = os.path.join(output_dir, "lim.pid")
         
-        # Context for daemon
-        context = daemon.DaemonContext(
-            pidfile=pidfile.TimeoutPIDLockFile(self.pid_file),
-            working_directory=self.base_dir,
-            umask=0o022,
-            detach_process=True
-        )
-        
-        # Handle signals
-        context.signal_map = {
-            signal.SIGTERM: self.handle_sigterm,
-            signal.SIGINT: self.handle_sigterm
-        }
-        
-        # Start daemon
-        with context:
-            self.logger.info("Daemon started")
-            self.scan_logs()
-            self.monitoring_loop()
-    
+        try:
+            if os.path.exists(pid_file):
+                with open(pid_file, 'r') as f:
+                    pid = int(f.read().strip())
+                
+                # Try to terminate process
+                os.kill(pid, signal.SIGTERM)
+                print(f"Sent SIGTERM to process {pid}")
+                
+                # Wait for process to terminate
+                max_wait = 10  # seconds
+                while max_wait > 0:
+                    try:
+                        os.kill(pid, 0)  # Check if process exists
+                        time.sleep(1)
+                        max_wait -= 1
+                    except OSError:
+                        # Process terminated
+                        break
+                
+                # Force kill if still running
+                if max_wait == 0:
+                    os.kill(pid, signal.SIGKILL)
+                    print(f"Process {pid} did not terminate, sent SIGKILL")
+                
+                # Remove PID file
+                if os.path.exists(pid_file):
+                    os.remove(pid_file)
+                
+                return True
+            else:
+                print("No PID file found, daemon not running?")
+                return False
+        except Exception as e:
+            print(f"Error stopping daemon: {e}")
+            return False
+            
     def handle_sigterm(self, signum, frame):
         """Handle termination signals"""
         self.logger.info(f"Received signal {signum}, stopping")
@@ -1303,6 +1298,39 @@ class LogIntegrityMonitor:
             self.logger.error(f"Error stopping daemon: {str(e)}")
             return False
 
+def display_help():
+    """Display a visually appealing help menu"""
+    help_text = """
+Log Integrity Monitor (LIM) - Help Menu
+Usage:
+  python lim.py              Start the LIM monitoring service in foreground mode
+  python lim.py start        Start the LIM monitoring service in foreground mode
+  python lim.py stop/-k      Stop the LIM service if running in background mode
+  python lim.py daemon/-d    Run LIM in background (daemon) mode
+  python lim.py scan         Scan logs and update configuration
+  python lim.py help/-h      Show this help message
+
+Description:
+  The Log Integrity Monitor continuously monitors system log files for:
+    - Malicious activity patterns and signatures mapped to MITRE ATT&CK framework
+    - Suspicious command executions and privilege escalation attempts
+    - Unauthorized access attempts and user enumeration
+    - Anomalous log patterns detected via machine learning analysis
+    - Correlation of related events to identify sophisticated attack patterns
+  
+  It uses logging and alerting to flag any security anomalies and supports 
+  integration with SIEM tools.
+
+Options:
+  --base-dir    Base directory (default: /opt/FIMoniSec/Linux-Client)
+  --config      Custom config file path
+
+Note:
+  Use the 'daemon/-d' option to run LIM in background mode. This is recommended
+  for long-term monitoring.
+"""
+    print(help_text)
+
 def main():
     """Main entry point with improved help text"""
     parser = argparse.ArgumentParser(description="Log Integrity Monitor (LIM)")
@@ -1313,11 +1341,7 @@ def main():
                       default="start",
                       help="Action to perform (default: start)")
     
-    parser.add_argument("--base-dir", default="/opt/FIMoniSec/Linux-Client",
-                      help="Base directory for LIM (default: /opt/FIMoniSec/Linux-Client)")
-    
-    parser.add_argument("--config", help="Path to config file (default: <base_dir>/fim.config)")
-    
+    # Parse arguments
     args = parser.parse_args()
     
     # Map short options to full action names
@@ -1331,19 +1355,19 @@ def main():
     
     # Display help information
     if action == "help":
-        print("Log Integrity Monitor (LIM) - Usage Guide:\n")
-        print("Start LIM - lim.py start or -s")
-        print("Daemon LIM - lim.py daemon or -d")
-        print("Stop LIM (when in daemon mode) - lim.py stop or -k")
-        print("Scan - lim.py scan - scan system for logs and update configuration with new log files it finds")
-
+        display_help()
         return
     
-    # Initialize LIM
-    lim = LogIntegrityMonitor(
-        config_file=args.config,
-        base_dir=args.base_dir
-    )
+    # Special case for stop - don't need to initialize the full object
+    if action == "stop":
+        base_dir = "/opt/FIMoniSec/Linux-Client"
+        output_dir = os.path.join(base_dir, "output")
+        pid_file = os.path.join(output_dir, "lim.pid")
+        LogIntegrityMonitor.stop_daemon(pid_file)
+        return
+    
+    # Initialize LIM with static configuration
+    lim = LogIntegrityMonitor()
     
     # Execute requested action
     if action == "start":
@@ -1352,12 +1376,6 @@ def main():
     elif action == "daemon":
         lim.logger.info("Starting LIM in daemon mode")
         lim.start_daemon()
-    elif action == "stop":
-        lim.logger.info("Stopping LIM daemon")
-        if lim.stop():
-            print("LIM daemon stopped")
-        else:
-            print("Failed to stop LIM daemon")
     elif action == "scan":
         lim.logger.info("Running one-time log scan")
         alert_count = lim.scan_logs()
