@@ -1,6 +1,33 @@
+# =============================================================================
+# FIMonsec Tool - File Integrity Monitoring Security Solution
+# =============================================================================
+#
+# Author: Keith Pachulski
+# Company: Red Cell Security, LLC
+# Email: keith@redcellsecurity.org
+# Website: www.redcellsecurity.org
+#
+# Copyright (c) 2025 Keith Pachulski. All rights reserved.
+#
+# License: This software is licensed under the MIT License.
+#          You are free to use, modify, and distribute this software
+#          in accordance with the terms of the license.
+#
+# Purpose: This script is part of the FIMonsec Tool, which provides enterprise-grade
+#          system integrity monitoring with real-time alerting capabilities. It monitors
+#          critical system and application files for unauthorized modifications,
+#          supports baseline comparisons, and integrates with SIEM solutions.
+#
+# DISCLAIMER: This software is provided "as-is," without warranty of any kind,
+#             express or implied, including but not limited to the warranties
+#             of merchantability, fitness for a particular purpose, and non-infringement.
+#             In no event shall the authors or copyright holders be liable for any claim,
+#             damages, or other liability, whether in an action of contract, tort, or otherwise,
+#             arising from, out of, or in connection with the software or the use or other dealings
+#             in the software.
+#
+# =============================================================================
 #!/usr/bin/env python3
-# LIM.py - Log Integrity Monitor
-# A single file program for monitoring system log integrity with MITRE ATT&CK mapping
 
 import argparse
 import datetime
@@ -41,7 +68,7 @@ class LogIntegrityMonitor:
         
         # Initialize log positions tracking
         self.log_positions = {}
-        self.positions_file = os.path.join(self.base_dir, "log_positions.json")
+        self.positions_file = os.path.join(self.output_dir, "log_positions.json")
         self.load_log_positions()
         
         # State flags
@@ -1253,50 +1280,46 @@ class LogIntegrityMonitor:
         except Exception as e:
             print(f"Error stopping daemon: {e}")
             return False
-            
+          
+    def start_daemon(self):
+        """Start monitoring in background daemon mode"""
+        self.logger.info("Starting daemon mode")
+        
+        # Ensure pid directory exists
+        os.makedirs(os.path.dirname(self.pid_file), exist_ok=True)
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGTERM, self.handle_sigterm)
+        
+        # Configure daemon context
+        daemon_context = daemon.DaemonContext(
+            working_directory=self.base_dir,
+            umask=0o022,
+            pidfile=pidfile.TimeoutPIDLockFile(self.pid_file),
+            detach_process=True,
+            signal_map={
+                signal.SIGTERM: self.handle_sigterm,
+                signal.SIGINT: self.handle_sigterm
+            }
+        )
+        
+        # Start daemon
+        try:
+            with daemon_context:
+                self.logger.info("Daemon started")
+                
+                # Initial scan
+                self.scan_logs()
+                
+                # Start monitoring loop
+                self.monitoring_loop()
+        except Exception as e:
+            self.logger.error(f"Error starting daemon: {str(e)}")          
+  
     def handle_sigterm(self, signum, frame):
         """Handle termination signals"""
         self.logger.info(f"Received signal {signum}, stopping")
         self.running = False
-    
-    def stop(self):
-        """Stop daemon if running"""
-        try:
-            if os.path.exists(self.pid_file):
-                with open(self.pid_file, 'r') as f:
-                    pid = int(f.read().strip())
-                
-                # Try to terminate process
-                os.kill(pid, signal.SIGTERM)
-                self.logger.info(f"Sent SIGTERM to process {pid}")
-                
-                # Wait for process to terminate
-                max_wait = 10  # seconds
-                while max_wait > 0:
-                    try:
-                        os.kill(pid, 0)  # Check if process exists
-                        time.sleep(1)
-                        max_wait -= 1
-                    except OSError:
-                        # Process terminated
-                        break
-                
-                # Force kill if still running
-                if max_wait == 0:
-                    os.kill(pid, signal.SIGKILL)
-                    self.logger.warning(f"Process {pid} did not terminate, sent SIGKILL")
-                
-                # Remove PID file
-                if os.path.exists(self.pid_file):
-                    os.remove(self.pid_file)
-                
-                return True
-            else:
-                self.logger.warning("No PID file found, daemon not running?")
-                return False
-        except Exception as e:
-            self.logger.error(f"Error stopping daemon: {str(e)}")
-            return False
 
 def display_help():
     """Display a visually appealing help menu"""
@@ -1333,7 +1356,13 @@ Note:
 
 def main():
     """Main entry point with improved help text"""
-    parser = argparse.ArgumentParser(description="Log Integrity Monitor (LIM)")
+    # First, do a simple check for help flags before any other processing
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "-h" or sys.argv[1] == "help":
+            display_help()
+            return  # Exit immediately after showing help
+    
+    parser = argparse.ArgumentParser(description="Log Integrity Monitor (LIM)", add_help=False)
     
     # Command line arguments with more descriptive help
     parser.add_argument("action", nargs="?",
@@ -1342,7 +1371,7 @@ def main():
                       help="Action to perform (default: start)")
     
     # Parse arguments
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
     
     # Map short options to full action names
     action_map = {
@@ -1353,20 +1382,16 @@ def main():
     }
     action = action_map.get(args.action, args.action)
     
-    # Display help information
-    if action == "help":
-        display_help()
-        return
+    # Log before taking action for debugging
+    print(f"Selected action: {action}")
     
     # Special case for stop - don't need to initialize the full object
     if action == "stop":
-        base_dir = "/opt/FIMoniSec/Linux-Client"
-        output_dir = os.path.join(base_dir, "output")
-        pid_file = os.path.join(output_dir, "lim.pid")
+        pid_file = os.path.join(os.path.join(BASE_DIR, "output"), "lim.pid")
         LogIntegrityMonitor.stop_daemon(pid_file)
         return
     
-    # Initialize LIM with static configuration
+    # Initialize LIM with default configuration
     lim = LogIntegrityMonitor()
     
     # Execute requested action
