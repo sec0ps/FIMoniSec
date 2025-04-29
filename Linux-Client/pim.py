@@ -290,7 +290,7 @@ def check_for_unusual_port_use(process_info):
         print(f"[ERROR] Could not read known_ports.json: {e}")
         return
 
-    from fim_client import log_event
+    from fim import log_event
 
     proc_name = process_info.get("process_name")
     proc_port = str(process_info.get("port"))
@@ -379,7 +379,7 @@ def monitor_listening_processes(interval=2):
             new_processes = {pid: info for pid, info in current_processes.items() if pid not in known_processes}
             terminated_processes = {pid: info for pid, info in known_processes.items() if pid not in current_processes}
             
-            from fim_client import log_event
+            from fim import log_event
             
             # Process all currently active processes
             for pid, info in current_processes.items():
@@ -568,7 +568,7 @@ def rescan_listening_processes(interval=120):
         try:
             print("[PERIODIC SCAN] Running integrity check on listening processes...")
 
-            from fim_client import log_event
+            from fim import log_event
 
             integrity_state = load_process_metadata()  # Load stored metadata indexed by PID
             current_processes = get_listening_processes()  # Get active processes
@@ -668,7 +668,7 @@ def check_lineage_baseline(process_info, known_lineages):
         print(f"[ALERT] Lineage deviation for {proc_name}:")
         print(f"  Expected: {baseline}")
         print(f"  Found:    {lineage}")
-        from fim_client import log_event
+        from fim import log_event
         log_event(
             event_type="LINEAGE_DEVIATION",
             file_path=process_info["exe_path"],
@@ -929,7 +929,7 @@ def scan_process_memory(pid):
                 })
         
         if suspicious_regions:
-            from fim_client import log_event
+            from fim import log_event
             log_event(
                 event_type="SUSPICIOUS_MEMORY_REGION",
                 file_path=exe_path,
