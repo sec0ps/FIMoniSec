@@ -39,10 +39,13 @@ import atexit
 import json
 import remote
 import updater
+#import yara
+#from malscan_yara import ensure_rules_exist, update_rules, compile_rules, yara_scan_file
 from pathlib import Path
 from utils.process_guardian import ProcessGuardian
 
 # Define BASE_DIR as a static path
+# In monisec_client.py
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
 UTILS_DIR = os.path.join(BASE_DIR, "utils")
 sys.path.append(UTILS_DIR)
@@ -131,12 +134,6 @@ PROCESSES = {
     "lim": "python3 lim.py -d",
 }
 
-# Define BASE_DIR as a static path
-BASE_DIR = "/opt/FIMoniSec/Linux-Client"
-
-# Define CONFIG_FILE using the BASE_DIR
-CONFIG_FILE = os.path.join(BASE_DIR, "fim.config")
-
 def create_default_config():
     """Create a default configuration file if it does not exist and set permissions."""
     default_config = {
@@ -178,29 +175,7 @@ def create_default_config():
             "enabled": False,  # Default to disabled
             "siem_server": "",
             "siem_port": 0
-        },
-        "enhanced_fim": {
-            "enabled": True,
-            "environment": "production",
-            "performance": {
-                "system_load_threshold": 75,
-                "io_threshold": 80,
-                "worker_threads": 4
-            },
-            "behavioral": {
-                "training_samples": 100,
-                "retraining_interval": 86400,
-                "max_baseline_samples": 10000
-            },
-            "content_analysis": {
-                "diff_threshold": 0.3,
-                "max_file_size": 10485760
-            },
-            "detection": {
-                "risk_multiplier": 1.5,
-                "alert_threshold": 70
-            }
-        },
+   },         
         "instructions": {
             "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
             "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
