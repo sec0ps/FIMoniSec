@@ -94,7 +94,6 @@ def load_config():
     with open(CONFIG_FILE, "r") as f:
         try:
             config = json.load(f)
-#            print(f"[DEBUG] Loaded config: {json.dumps(config, indent=4)}")  # Debugging line
 
             # Ensure the 'siem_settings' key exists
             if "siem_settings" not in config:
