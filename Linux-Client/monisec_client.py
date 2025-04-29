@@ -512,7 +512,7 @@ def stop_monisec_client_daemon():
             logging.error(f"Error stopping watchdog: {e}")
     
     # Find and stop all child processes
-    for name in ["fim_client", "pim", "lim"]:
+    for name in ["fim", "pim", "lim"]:
         pid = is_process_running(name)
         if pid:
             logging.info(f"Stopping {name} with PID {pid}...")
@@ -665,7 +665,7 @@ def handle_exit(signum, frame):
     
     # Get a list of all child process PIDs to terminate
     child_processes = []
-    for name in ["fim_client", "pim", "lim"]:
+    for name in ["fim", "pim", "lim"]:
         pid = is_process_running(name)
         if pid:
             child_processes.append((name, pid))
@@ -702,7 +702,7 @@ def handle_exit(signum, frame):
             pass  # Process might already be gone
     
     # Make sure all child processes are terminated
-    for name in ["fim_client", "pim", "lim"]:
+    for name in ["fim", "pim", "lim"]:
         pid = is_process_running(name)
         if pid:
             logging.warning(f"Process {name} still running with PID {pid}. Force killing...")
@@ -967,7 +967,7 @@ if __name__ == "__main__":
                 sys.exit(0)
             
             # Clean up any existing orphaned child processes
-            for name in ["fim_client", "pim", "lim"]:
+            for name in ["fim", "pim", "lim"]:
                 instances = is_process_running(name, count_instances=True)
                 if instances > 0:
                     logging.info(f"Found {instances} orphaned {name} processes. Cleaning up...")
