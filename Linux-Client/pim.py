@@ -40,6 +40,7 @@ import daemon.pidfile
 import threading
 import traceback
 import atexit
+import re
 
 # New imports for ML and analysis
 import numpy as np  # For numerical operations
@@ -60,13 +61,9 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 
 LOG_FILE = os.path.join(LOG_DIR, "process_monitor.log")
-PROCESS_HASHES_FILE = os.path.join(OUTPUT_DIR, "process_hashes.txt")
 INTEGRITY_PROCESS_FILE = os.path.join(OUTPUT_DIR, "integrity_processes.json")
 PID_FILE = os.path.join(OUTPUT_DIR, "pim.pid")
-FILE_MONITOR_JSON = os.path.join(LOG_DIR, "file_monitor.json")
-KNOWN_PORTS_FILE = os.path.join(OUTPUT_DIR, "known_ports.json")
-KNOWN_LINEAGES_FILE = os.path.join(OUTPUT_DIR, "known_lineages.json")
-
+PIM_LOGGING_JSON = os.path.join(LOG_DIR, "pim_monitor.json")
 
 # Preserve environment variables for sudo and command execution
 daemon_env = os.environ.copy()
@@ -74,30 +71,42 @@ daemon_env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 def ensure_output_dir():
     """Ensure that the output directory and necessary files exist."""
-    os.makedirs(OUTPUT_DIR, mode=0o700, exist_ok=True)
-
-    # Ensure process hashes file exists
-    if not os.path.exists(PROCESS_HASHES_FILE):
-        with open(PROCESS_HASHES_FILE, "w") as f:
-            f.write("")
-        os.chmod(PROCESS_HASHES_FILE, 0o600)
-
-    # Ensure integrity state file exists
-    if not os.path.exists(INTEGRITY_PROCESS_FILE):
-        with open(INTEGRITY_PROCESS_FILE, "w") as f:
-            json.dump({}, f, indent=4)
-        os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
-
-def ensure_file_monitor_json():
-    """Ensure that the file_monitor.json file exists and create logs directory if needed."""
-    os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)  # ✅ Ensure logs directory exists
-
-    if not os.path.exists(FILE_MONITOR_JSON):
-        with open(FILE_MONITOR_JSON, "w") as f:
-            json.dump({}, f, indent=4)
-        os.chmod(FILE_MONITOR_JSON, 0o600)
-
-ensure_file_monitor_json()
+    # Make sure the output and log directories exist
+    try:
+        os.makedirs(OUTPUT_DIR, mode=0o700, exist_ok=True)
+        os.makedirs(LOG_DIR, mode=0o700, exist_ok=True)
+        
+        # Ensure directories are fully created before continuing
+        if not os.path.exists(OUTPUT_DIR) or not os.path.exists(LOG_DIR):
+            print("[ERROR] Failed to create required directories")
+            sys.exit(1)
+            
+        print(f"[INFO] Ensuring output directories exist: {OUTPUT_DIR}, {LOG_DIR}")
+        
+        # Ensure integrity process file exists with valid JSON
+        if not os.path.exists(INTEGRITY_PROCESS_FILE):
+            with open(INTEGRITY_PROCESS_FILE, "w") as f:
+                f.write("{}\n")  # Initialize with empty JSON object
+            os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
+            print(f"[INFO] Created integrity file: {INTEGRITY_PROCESS_FILE}")
+        
+        # Ensure PIM logging file exists
+        if not os.path.exists(PIM_LOGGING_JSON):
+            with open(PIM_LOGGING_JSON, "w") as f:
+                f.write("")  # Empty file is fine for append-only logging
+            os.chmod(PIM_LOGGING_JSON, 0o600)
+            print(f"[INFO] Created PIM logging file: {PIM_LOGGING_JSON}")
+        
+        # Create PID file directory if it doesn't exist
+        pid_dir = os.path.dirname(PID_FILE)
+        if not os.path.exists(pid_dir):
+            os.makedirs(pid_dir, mode=0o700, exist_ok=True)
+            
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to ensure output directories: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 def start_daemon():
     with daemon.DaemonContext(
@@ -110,38 +119,33 @@ def start_daemon():
     ):
         run_monitor()
 
-def load_process_hashes():
-    """Load stored process hashes from process_hashes.txt."""
-    if os.path.exists(PROCESS_HASHES_FILE):
-        with open(PROCESS_HASHES_FILE, "r") as f:
-            try:
-                return dict(line.strip().split(":", 1) for line in f if ":" in line)
-            except ValueError:
-                return {}
-    return {}
-
-def save_process_hashes(process_hashes):
-    """Save process hashes to process_hashes.txt safely."""
-    temp_file = f"{PROCESS_HASHES_FILE}.tmp"
-    with open(temp_file, "w") as f:
-        for exe_path, hash_value in process_hashes.items():
-            f.write(f"{exe_path}:{hash_value}\n")
-
-    os.replace(temp_file, PROCESS_HASHES_FILE)
-    os.chmod(PROCESS_HASHES_FILE, 0o600)
-
 def load_process_metadata():
-    """Load stored process metadata from integrity_processes.json."""
+    """
+    Load stored process metadata from integrity_processes.json.
+    This file will now store all process information previously stored in separate files.
+    """
     if os.path.exists(INTEGRITY_PROCESS_FILE):
         try:
             with open(INTEGRITY_PROCESS_FILE, "r") as f:
                 return json.load(f)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Failed to parse integrity_processes.json: {e}")
+            # Create backup of corrupted file
+            backup_file = f"{INTEGRITY_PROCESS_FILE}.corrupted.{int(time.time())}"
+            try:
+                import shutil
+                shutil.copy(INTEGRITY_PROCESS_FILE, backup_file)
+                print(f"[INFO] Created backup of corrupted file: {backup_file}")
+            except Exception as backup_error:
+                print(f"[ERROR] Failed to create backup: {backup_error}")
             return {}
     return {}
 
 def save_process_metadata(processes):
-    """Save full process metadata to integrity_processes.json safely."""
+    """
+    Save full process metadata to integrity_processes.json safely.
+    This now includes all process tracking information previously stored in separate files.
+    """
     temp_file = f"{INTEGRITY_PROCESS_FILE}.tmp"
     try:
         with open(temp_file, "w") as f:
@@ -149,567 +153,798 @@ def save_process_metadata(processes):
 
         os.replace(temp_file, INTEGRITY_PROCESS_FILE)
         os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
-#        print(f"[DEBUG] Successfully wrote integrity metadata to {INTEGRITY_PROCESS_FILE}")
+        print(f"[INFO] Successfully wrote integrity metadata with {len(processes)} processes")
 
     except Exception as e:
         print(f"[ERROR] Failed to write to {INTEGRITY_PROCESS_FILE}: {e}", file=sys.stderr)
 
+def get_all_processes():
+    """
+    Retrieve all running processes and their metadata with improved parsing.
+    Filter out transient user commands and focus on actual system processes.
+    """
+    all_processes = {}
+
+    try:
+        # Use ps with explicit format specifiers to avoid parsing issues
+        ps_command = "sudo -n /bin/ps -eo pid,user,start_time,ppid,comm,state --no-headers"
+        output = subprocess.getoutput(ps_command)
+
+        if not output:
+            print("[ERROR] ps command returned no output. Check sudo permissions.")
+            return all_processes
+
+        for line in output.splitlines():
+            parts = line.strip().split(None, 5)
+            if len(parts) < 6:
+                continue
+
+            try:
+                pid = parts[0].strip()
+                if not pid.isdigit():
+                    continue
+                
+                pid_int = int(pid)
+                user = parts[1].strip()
+                start_time = parts[2].strip()
+                ppid = parts[3].strip()
+                ppid_int = int(ppid) if ppid.isdigit() else 0
+                process_name = parts[4].strip()  # Clean up the process name
+                
+                # State column: R (running), S (sleeping), D (disk sleep), etc.
+                process_state = parts[5].strip()[0]  # Get first character of state
+                
+                # Filter out likely transient user commands
+                # Skip processes that are in a "T" (stopped) state
+                if process_state == 'T':
+                    continue
+                    
+                # Get command line separately for accuracy
+                cmdline_raw = subprocess.getoutput(f"sudo -n /bin/cat /proc/{pid}/cmdline 2>/dev/null").strip()
+                cmdline = cmdline_raw.replace("\x00", " ").strip()
+                
+                # Skip typical interactive commands
+                interactive_commands = ['more', 'less', 'vi', 'vim', 'nano', 'cat', 'tail', 'grep', 'awk', 'sed']
+                if any(cmd == process_name for cmd in interactive_commands) and user not in ['root', 'system']:
+                    continue
+                
+                # Get executable path
+                exe_path = f"/proc/{pid}/exe"
+                try:
+                    # First, try using 'which' for common commands
+                    if os.path.exists(f"/usr/bin/{process_name}"):
+                        exe_real_path = f"/usr/bin/{process_name}"
+                    elif os.path.exists(f"/usr/sbin/{process_name}"):
+                        exe_real_path = f"/usr/sbin/{process_name}"
+                    elif os.path.exists(f"/bin/{process_name}"):
+                        exe_real_path = f"/bin/{process_name}"
+                    elif os.path.exists(f"/sbin/{process_name}"):
+                        exe_real_path = f"/sbin/{process_name}"
+                    else:
+                        # Fall back to readlink if not in standard locations
+                        exe_real_path = subprocess.getoutput(f"sudo -n /usr/bin/readlink -f {exe_path}").strip()
+                        
+                    if not exe_real_path or "Permission denied" in exe_real_path:
+                        exe_real_path = f"/usr/bin/{process_name}"  # Make a reasonable assumption
+                        process_hash = "UNKNOWN_" + get_process_hash(process_name, cmdline)
+                    else:
+                        process_hash = get_process_hash(exe_real_path, cmdline)
+                except Exception:
+                    exe_real_path = f"/usr/bin/{process_name}"  # Make a reasonable assumption
+                    process_hash = "UNKNOWN_" + get_process_hash(process_name, cmdline)
+                
+                # Resolve lineage
+                lineage = resolve_lineage(pid_int)
+                
+                # Check for short-lived interactive processes
+                is_interactive = False
+                terminal_processes = ['bash', 'zsh', 'sh', 'csh', 'ksh', 'dash', 'tcsh', 'fish']
+                session_indicators = ['sshd', 'login', 'gdm-session', 'lightdm']
+                
+                if (any(term in lineage for term in terminal_processes) and 
+                    any(session in lineage for session in session_indicators) and
+                    process_name not in ['sshd', 'cron', 'systemd', 'init']):
+                    # Check process runtime
+                    try:
+                        proc_start_time = None
+                        with open(f"/proc/{pid}/stat", "r") as f:
+                            stats = f.read().split()
+                            proc_start_time = int(stats[21]) / os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+                        
+                        uptime = None
+                        with open("/proc/uptime", "r") as f:
+                            uptime = float(f.read().split()[0])
+                        
+                        # Calculate how many seconds the process has been running
+                        runtime_seconds = uptime - proc_start_time
+                        
+                        # Skip processes running for less than 5 minutes
+                        if runtime_seconds < 300:
+                            is_interactive = True
+                    except:
+                        # If we can't determine runtime, continue with the process
+                        pass
+                
+                # Skip interactive processes
+                if is_interactive:
+                    continue
+                
+                # Determine if this is a listening process (port will be set later)
+                port = "NOT_LISTENING"
+                
+                # Build process metadata
+                all_processes[process_hash] = {
+                    "pid": pid_int,
+                    "exe_path": exe_real_path,
+                    "process_name": process_name,  # Now correctly parsed
+                    "port": port,
+                    "user": user,
+                    "start_time": start_time,
+                    "cmdline": cmdline,
+                    "hash": process_hash,
+                    "ppid": ppid_int,
+                    "lineage": lineage,
+                    "is_listening": False,
+                    "state": process_state
+                }
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to process PID {pid}: {e}")
+                continue
+
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] subprocess error in get_all_processes: {e}")
+
+    return all_processes
+
 def get_process_hash(exe_path, cmdline=None):
-    """Generate SHA-256 hash of the process executable and optionally include cmdline."""
+    """
+    Generate SHA-256 hash of the process executable only.
+    This will be used as a unique identifier for process tracking.
+    """
     try:
         hash_obj = hashlib.sha256()
 
-        # Hash the executable file
-        with open(exe_path, "rb") as f:
-            hash_obj.update(f.read())
+        # Hash the executable file if it exists and is accessible
+        try:
+            if os.path.exists(exe_path) and os.access(exe_path, os.R_OK):
+                with open(exe_path, "rb") as f:
+                    hash_obj.update(f.read())
+            else:
+                # If executable can't be accessed, use its path as a fallback
+                hash_obj.update(exe_path.encode("utf-8"))
+        except (PermissionError, FileNotFoundError):
+            # Handle permission issues gracefully
+            hash_obj.update(exe_path.encode("utf-8"))
 
-        # include command-line arguments in hashing
-        if cmdline:
-            hash_obj.update(cmdline.encode("utf-8"))
-
+        # No longer include command-line arguments in hashing
         return hash_obj.hexdigest()
 
-    except Exception:
-        return "ERROR_HASHING"
+    except Exception as e:
+        print(f"[ERROR] Failed to hash process {exe_path}: {e}")
+        return f"ERROR_HASHING_{exe_path}"
 
 def get_listening_processes():
-    """Retrieve all listening processes and their metadata."""
+    """
+    Retrieve all listening processes and their metadata.
+    This now returns processes identified by hash rather than PID.
+    """
     listening_processes = {}
-
+    
     try:
-        lsof_command = "sudo -n /usr/bin/lsof -i -P -n | /bin/grep LISTEN"
-        output = subprocess.getoutput(lsof_command)
-
-        if not output:
-            print("[ERROR] lsof returned no output. Check sudo permissions.")
-
+        # Try multiple commands to ensure we catch all listening processes
+        commands = [
+            "sudo -n /usr/bin/lsof -i -P -n",  # No grep to catch everything
+            "sudo -n netstat -tulpn"           # Backup command
+        ]
+        
+        output = ""
+        for cmd in commands:
+            cmd_output = subprocess.getoutput(cmd)
+            if cmd_output:
+                output += cmd_output + "\n"
+        
+        # Track processed PIDs to avoid duplicates
+        processed_pids = set()
+        
         for line in output.splitlines():
-            parts = line.split()
-            if len(parts) < 9:
+            # Skip header lines and empty lines
+            if not line.strip() or "COMMAND" in line or "Proto" in line:
                 continue
-
-            pid = parts[1]
-            exe_path = f"/proc/{pid}/exe"
-
+                
+            # Parse based on if this is likely a lsof or netstat line
+            pid = None
+            process_name = None
+            port = None
+            
+            if "LISTEN" in line or "UDP" in line:
+                # This looks like a lsof line
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                
+                # Extract process info from lsof
+                if parts[0] and parts[1] and parts[1].isdigit():
+                    process_name = parts[0]
+                    pid = parts[1]
+                
+                # Extract port from lsof format
+                for part in parts:
+                    if ':' in part:
+                        port_str = part.split(':')[-1]
+                        if port_str.isdigit():
+                            port = int(port_str)
+                            break
+            else:
+                # This is likely a netstat line
+                parts = line.split()
+                if len(parts) < 7:
+                    continue
+                
+                # Extract process info from netstat format (PID/Program)
+                for part in parts:
+                    if '/' in part:
+                        pid_parts = part.split('/')
+                        if pid_parts[0].isdigit():
+                            pid = pid_parts[0]
+                            process_name = '/'.join(pid_parts[1:]) if len(pid_parts) > 1 else "UNKNOWN"
+                            break
+                
+                # Extract port from netstat format (Local Address)
+                for part in parts:
+                    if ':' in part:
+                        port_str = part.split(':')[-1]
+                        if port_str.isdigit():
+                            port = int(port_str)
+                            break
+            
+            # Skip if we couldn't extract the needed info
+            if not pid or not pid.isdigit():
+                continue
+                
+            pid_int = int(pid)
+            
+            # Skip if we've already processed this PID
+            if pid_int in processed_pids:
+                continue
+            
+            processed_pids.add(pid_int)
+            
+            if port is None or not str(port).isdigit():
+                port = "UNKNOWN"
+            
+            # Get executable path and command line
             try:
+                exe_path = f"/proc/{pid}/exe"
                 exe_real_path = subprocess.getoutput(f"sudo -n /usr/bin/readlink -f {exe_path}").strip()
+                
                 if "Permission denied" in exe_real_path or not exe_real_path:
-                    raise PermissionError("Could not read process executable path")
+                    exe_real_path = "PERMISSION_DENIED"
+                    if not process_name:
+                        process_name = subprocess.getoutput(f"sudo -n /bin/ps -p {pid} -o comm=").strip()
+                
                 cmdline_raw = subprocess.getoutput(f"sudo -n /bin/cat /proc/{pid}/cmdline 2>/dev/null").strip()
                 cmdline = cmdline_raw.replace("\x00", " ")
-                process_hash = get_process_hash(exe_real_path, cmdline)
-            except (PermissionError, FileNotFoundError, subprocess.CalledProcessError):
-                exe_real_path = "PERMISSION_DENIED"
-                process_hash = "UNKNOWN"
-                cmdline = ""
-
-            try:
-                port = parts[-2].split(':')[-1]
-                if not port.isdigit():
-                    port = "UNKNOWN"
+                
+                if not process_name or process_name == "UNKNOWN":
+                    process_name = subprocess.getoutput(f"sudo -n /bin/ps -p {pid} -o comm=").strip()
+                
+                # Generate hash from executable and command line
+                if exe_real_path != "PERMISSION_DENIED":
+                    process_hash = get_process_hash(exe_real_path, cmdline)
                 else:
-                    port = int(port)
-            except IndexError:
-                port = "UNKNOWN"
-
-            try:
+                    process_hash = "UNKNOWN_" + get_process_hash(process_name, "")
+                
+                # Get user, start time, and parent PID
                 user = subprocess.getoutput(f"sudo -n /bin/ps -o user= -p {pid}").strip()
                 start_time = subprocess.getoutput(f"sudo -n /bin/ps -o lstart= -p {pid}").strip()
                 ppid = subprocess.getoutput(f"sudo -n /bin/ps -o ppid= -p {pid}").strip()
-                ppid = int(ppid) if ppid.isdigit() else "UNKNOWN"
+                ppid = int(ppid) if ppid.isdigit() else 0
+                
                 if not user:
                     user = "UNKNOWN"
-            except Exception:
-                user, start_time, ppid = "UNKNOWN", "UNKNOWN", "UNKNOWN"
-
-            pid_int = int(pid)
-            lineage = resolve_lineage(pid_int)
-
-            listening_processes[pid_int] = {
-                "pid": pid_int,
-                "exe_path": exe_real_path,
-                "process_name": os.path.basename(exe_real_path) if exe_real_path != "PERMISSION_DENIED" else "UNKNOWN",
-                "port": port,
-                "user": user,
-                "start_time": start_time,
-                "cmdline": cmdline,
-                "hash": process_hash,
-                "ppid": ppid,
-                "lineage": lineage  # ✅ resolved dynamically and included
-            }
-
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] subprocess error in get_listening_processes: {e}")
-
+                
+                # Get process lineage
+                lineage = resolve_lineage(pid_int)
+                
+                # Add to listening processes dictionary
+                listening_processes[process_hash] = {
+                    "pid": pid_int,
+                    "exe_path": exe_real_path,
+                    "process_name": process_name,
+                    "port": port,
+                    "user": user,
+                    "start_time": start_time,
+                    "cmdline": cmdline,
+                    "hash": process_hash,
+                    "ppid": ppid,
+                    "lineage": lineage,
+                    "is_listening": True
+                }
+                
+                print(f"[DEBUG] Found listening process: {process_name} (PID: {pid_int}) on port {port}")
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to process listening PID {pid}: {e}")
+                continue
+    
+    except Exception as e:
+        print(f"[ERROR] Exception in get_listening_processes: {e}")
+        traceback.print_exc()
+    
     return listening_processes
 
-def load_known_ports():
-    """Load the known process-port mapping."""
-    if not os.path.exists(KNOWN_PORTS_FILE):
-        return {}
-    with open(KNOWN_PORTS_FILE, "r") as f:
-        return json.load(f)
-
-def save_known_ports(mapping):
-    """Save the process-port mapping to known_ports.json."""
-    with open(KNOWN_PORTS_FILE, "w") as f:
-        json.dump(mapping, f, indent=4)
-    os.chmod(KNOWN_PORTS_FILE, 0o600)
-
-def build_known_ports_baseline(processes):
-    known_ports = {}
-
-    for proc in processes.values():
-        proc_name = proc.get("process_name", "UNKNOWN")
-        if proc_name == "UNKNOWN":
-            continue
-
-        if proc_name not in known_ports:
-            known_ports[proc_name] = {
-                "ports": [],
-                "metadata": proc  # store full metadata
-            }
-
-        port = proc.get("port")
-        if port not in known_ports[proc_name]["ports"]:
-            known_ports[proc_name]["ports"].append(port)
-
-    with open(KNOWN_PORTS_FILE, "w") as f:
-        json.dump(known_ports, f, indent=4)
-    os.chmod(KNOWN_PORTS_FILE, 0o600)
-
-def check_for_unusual_port_use(process_info):
-    """Check if a process is listening on a non-standard port or has unexpected metadata."""
-    if not os.path.exists(KNOWN_PORTS_FILE):
-        return
-
+def log_pim_event(event_type, process_hash, previous_metadata=None, new_metadata=None):
+    """
+    Log process monitoring events to the dedicated PIM logging file with enhanced context.
+    Includes detailed explanations and MITRE ATT&CK mappings when applicable.
+    """
+    # Create the basic log entry
+    log_entry = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": event_type,
+        "process_hash": process_hash,
+        "previous_metadata": previous_metadata,
+        "new_metadata": new_metadata
+    }
+    
+    # Extract details for better logging
+    process_name = (new_metadata or previous_metadata or {}).get("process_name", "UNKNOWN")
+    pid = (new_metadata or previous_metadata or {}).get("pid", "UNKNOWN")
+    exe_path = (new_metadata or previous_metadata or {}).get("exe_path", "UNKNOWN")
+    
+    # Add context about what changed
+    changes_description = ""
+    if event_type == "PROCESS_MODIFIED" and previous_metadata and new_metadata:
+        # Only include significant fields in the changes description
+        significant_fields = ["exe_path", "process_name", "port", "user", "cmdline", "is_listening"]
+        
+        changed_fields = []
+        for field in significant_fields:
+            prev_value = previous_metadata.get(field)
+            curr_value = new_metadata.get(field)
+            if prev_value != curr_value:
+                changed_fields.append(f"{field}: {prev_value} → {curr_value}")
+        
+        if changed_fields:
+            changes_description = f"Significant changes detected: {', '.join(changed_fields)}"
+            log_entry["changes_description"] = changes_description
+    
+    # Add MITRE ATT&CK mapping if applicable
+    process_info = new_metadata or previous_metadata or {}
+    
+    # Only get MITRE mapping for significant events, not PID changes
+    if event_type != "PROCESS_MODIFIED" or (event_type == "PROCESS_MODIFIED" and changes_description):
+        mitre_mapping = classify_by_mitre_attck(event_type, process_info)
+        if mitre_mapping:
+            log_entry["mitre_mapping"] = mitre_mapping
+    
+    # Add process lineage information for context
+    if new_metadata and "lineage" in new_metadata:
+        log_entry["lineage"] = new_metadata.get("lineage", [])
+    elif previous_metadata and "lineage" in previous_metadata:
+        log_entry["lineage"] = previous_metadata.get("lineage", [])
+    
+    # Write to the PIM logging file
     try:
-        with open(KNOWN_PORTS_FILE, "r") as f:
-            known_ports = json.load(f)
+        with open(PIM_LOGGING_JSON, "a") as log_file:
+            log_file.write(json.dumps(log_entry) + "\n")
     except Exception as e:
-        print(f"[ERROR] Could not read known_ports.json: {e}")
-        return
-
-    from fim import log_event
-
-    proc_name = process_info.get("process_name")
-    proc_port = str(process_info.get("port"))
-
-    if proc_name not in known_ports:
-        return
-
-    expected_ports = list(map(str, known_ports[proc_name].get("ports", [])))
-    baseline_metadata = known_ports[proc_name].get("metadata", {})
-
-    if proc_port not in expected_ports:
-        print(f"[ALERT] {proc_name} listening on unexpected port {proc_port}. Expected: {expected_ports}")
-        log_event(
-            event_type="UNUSUAL_PORT_USE",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    # Individual alerts for specific metadata mismatches
-    if baseline_metadata.get("exe_path") != process_info.get("exe_path"):
-        print(f"[ALERT] Executable path mismatch for {proc_name}: expected '{baseline_metadata.get('exe_path')}', got '{process_info.get('exe_path')}'")
-        log_event(
-            event_type="EXECUTABLE_PATH_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    if baseline_metadata.get("cmdline") != process_info.get("cmdline"):
-        print(f"[ALERT] Command-line mismatch for {proc_name}: expected '{baseline_metadata.get('cmdline')}', got '{process_info.get('cmdline')}'")
-        log_event(
-            event_type="CMDLINE_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    if baseline_metadata.get("hash") != process_info.get("hash"):
-        print(f"[ALERT] Binary hash mismatch for {proc_name}: expected '{baseline_metadata.get('hash')}', got '{process_info.get('hash')}'")
-        log_event(
-            event_type="HASH_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-    if baseline_metadata.get("user") != process_info.get("user"):
-        print(f"[ALERT] User mismatch for {proc_name}: expected '{baseline_metadata.get('user')}', got '{process_info.get('user')}'")
-        log_event(
-            event_type="USER_MISMATCH",
-            file_path=process_info.get("exe_path", "UNKNOWN"),
-            previous_metadata=baseline_metadata,
-            new_metadata=process_info,
-            previous_hash=baseline_metadata.get("hash", "UNKNOWN"),
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
-
-def monitor_listening_processes(interval=2):
-    """Enhanced monitoring loop with ML-based detection and improved systemd handling."""
-    known_lineages = load_known_lineages()
-    known_processes = get_listening_processes()
-    terminated_pids = set()
+        print(f"[ERROR] Failed to write to PIM log file: {e}")
     
-    # Train initial ML model
-    ml_model_info = implement_behavioral_baselining()
-    ml_retrain_counter = 0
+    # Only print alerts for significant events
+    significant_event = (
+        event_type in ["NEW_PROCESS", "PROCESS_TERMINATED", "SUSPICIOUS_MEMORY_REGION", "ML_DETECTED_ANOMALY"] or
+        (event_type == "PROCESS_MODIFIED" and changes_description)
+    )
     
-    # Initialize detection history and already alerted processes
+    if significant_event:
+        alert_message = f"[ALERT] {event_type}: {process_name} (PID: {pid}, Path: {exe_path})"
+        
+        # Add changes description if available
+        if changes_description:
+            alert_message += f"\n  {changes_description}"
+        
+        # Add MITRE ATT&CK context if available
+        if log_entry.get("mitre_mapping") and "techniques" in log_entry["mitre_mapping"]:
+            techniques = log_entry["mitre_mapping"]["techniques"]
+            if techniques:
+                technique_info = techniques[0]  # Get the first technique
+                alert_message += f"\n  [MITRE ATT&CK] {technique_info.get('technique_id')}: {technique_info.get('technique_name')} ({technique_info.get('tactic')})"
+        
+        print(alert_message)
+
+def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
+    """Enhanced monitoring loop that tracks both listening and all other processes."""
+    # Load initial baseline if provided
+    all_known_processes = INITIAL_BASELINE.copy() if use_initial_baseline and 'INITIAL_BASELINE' in globals() else {}
+    
     detection_history = {}
     alerted_processes = set()
     
-    print("[INFO] Starting enhanced process monitoring with ML-based detection...")
+    # ML baseline establishment phase - separate from core PIM functionality
+    ml_model_info = None
+    ml_baseline_counter = 0
+    ml_baseline_cycles = 300  # 10 minutes (at 2 second intervals)
+    establishing_ml_baseline = True
+    
+    # CRITICAL FIX: If baseline exists, we should NOT be in first_run mode
+    # This ensures alerts start immediately when a baseline already exists
+    if use_initial_baseline and all_known_processes:
+        first_run = False
+        print("[INFO] Using existing baseline - immediate alerting enabled")
+    
+    # Initialize first_iteration based on first_run parameter
+    first_iteration = first_run
+    
+    if establishing_ml_baseline:
+        print("[INFO] Starting immediate process monitoring")
+        print("[INFO] ML behavioral analysis will begin after 10 minutes of data collection")
+    else:
+        print("[INFO] Starting process monitoring with ML-based detection...")
+    
+    # Track the PIDs we've seen as listening
+    seen_listening_pids = set()
     
     while True:
         try:
-            current_processes = get_listening_processes()
-            new_processes = {pid: info for pid, info in current_processes.items() if pid not in known_processes}
-            terminated_processes = {pid: info for pid, info in known_processes.items() if pid not in current_processes}
+            # Get both listening and all processes
+            listening_processes = get_listening_processes()
             
-            from fim import log_event
+            # Get current listening PIDs
+            current_listening_pids = set(info.get("pid") for info in listening_processes.values())
             
-            # Process all currently active processes
-            for pid, info in current_processes.items():
-                # Skip if we've already alerted on this process recently
-                if pid in alerted_processes:
-                    continue
+            # Find new listening PIDs
+            new_listening_pids = current_listening_pids - seen_listening_pids
+            if new_listening_pids:
+                print(f"[DEBUG] Detected new listening PIDs: {new_listening_pids}")
+            
+            non_listening_processes = get_all_processes()
+            
+            # Start with a clean current processes list
+            current_all_processes = {}
+            
+            # Add non-listening processes first
+            for process_hash, info in non_listening_processes.items():
+                current_all_processes[process_hash] = info
+            
+            # Then add ALL listening processes, overriding any duplicates
+            # This ensures listening processes are properly tracked
+            for process_hash, info in listening_processes.items():
+                current_all_processes[process_hash] = info
+            
+            # Identify new processes
+            new_processes = {h: info for h, info in current_all_processes.items() 
+                            if h not in all_known_processes}
+            
+            # Identify terminated processes
+            terminated_processes = {h: info for h, info in all_known_processes.items() 
+                                  if h not in current_all_processes}
+            
+            # Process events - only log if not in first run mode
+            
+            # 1. Handle new processes
+            for process_hash, info in new_processes.items():
+                # Always update tracking
+                update_process_tracking(process_hash, info)
                 
-                detection_events = []
-                
-                # 1. Memory analysis for code injection
-                suspicious_memory = scan_process_memory(pid)
-                if suspicious_memory:
-                    print(f"[ALERT] Suspicious memory regions detected in PID {pid} ({info.get('process_name', 'unknown')})")
-                    detection_events.append({
-                        "event_type": "SUSPICIOUS_MEMORY_REGION",
-                        "details": suspicious_memory
-                    })
-                
-                # 1.5 Behavioral pattern detection
-                behavioral_patterns = analyze_process_for_anomalies(pid, info)
-                if behavioral_patterns:
-                    print(f"[ALERT] Suspicious behavioral patterns detected in PID {pid} ({info.get('process_name', 'unknown')})")
-                    for pattern in behavioral_patterns.get("suspicious_patterns", []):
-                        print(f"  - {pattern}")
+                # Only log if not in first run mode
+                if not first_iteration:
+                    # First log it as a new process
+                    log_pim_event(
+                        event_type="NEW_PROCESS",
+                        process_hash=process_hash,
+                        previous_metadata=None,
+                        new_metadata=info
+                    )
                     
-                    detection_events.append({
-                        "event_type": "SUSPICIOUS_BEHAVIOR",
-                        "details": behavioral_patterns
-                    })
+                    # If it's a listening process, log that specifically too
+                    if info.get("is_listening", False):
+                        print(f"[ALERT] NEW LISTENING PROCESS: {info.get('process_name')} (PID: {info.get('pid')}) on port {info.get('port')}")
+                        log_pim_event(
+                            event_type="NEW_LISTENING_PROCESS",
+                            process_hash=process_hash,
+                            previous_metadata=None,
+                            new_metadata=info
+                        )
+            
+            # 2. Handle terminated processes
+            for process_hash, info in terminated_processes.items():
+                remove_process_tracking(process_hash)
                 
-                # 2. ML-based anomaly detection if model exists
-                if ml_model_info and ml_model_info['model'] and len(current_processes) >= 5:
-                    model = ml_model_info['model']
-                    feature_names = ml_model_info['features']
-                    system_processes = ml_model_info.get('system_processes', [])
-                    
-                    # Skip ML detection for certain system processes with PID 1
-                    process_name = info.get('process_name', '')
-                    if process_name in system_processes and pid == 1:
+                if not first_iteration:
+                    log_pim_event(
+                        event_type="PROCESS_TERMINATED",
+                        process_hash=process_hash,
+                        previous_metadata=info,
+                        new_metadata=None
+                    )
+            
+            # 3. Handle modified processes - specifically check for new listening status
+            for process_hash, current_info in current_all_processes.items():
+                if process_hash in all_known_processes and process_hash not in new_processes:
+                    # Skip during first iteration
+                    if first_iteration:
                         continue
                     
-                    # Prepare features for this process
-                    process_features = {}
-                    try:
+                    previous_info = all_known_processes[process_hash]
+                    
+                    # Check if a process started listening
+                    was_listening = previous_info.get("is_listening", False)
+                    is_listening_now = current_info.get("is_listening", False)
+                    
+                    if not was_listening and is_listening_now:
+                        # Process has started listening on a port
+                        print(f"[ALERT] PROCESS STARTED LISTENING: {current_info.get('process_name')} (PID: {current_info.get('pid')}) on port {current_info.get('port')}")
+                        log_pim_event(
+                            event_type="NEW_LISTENING_PROCESS",
+                            process_hash=process_hash,
+                            previous_metadata=previous_info,
+                            new_metadata=current_info
+                        )
+                    
+                    # Check for other significant changes
+                    changes = {}
+                    significant_fields = ["exe_path", "process_name", "port", "user", "cmdline"]
+                    
+                    for field in significant_fields:
+                        prev_value = previous_info.get(field)
+                        curr_value = current_info.get(field)
+                        if prev_value != curr_value:
+                            changes[field] = {
+                                "previous": prev_value,
+                                "current": curr_value
+                            }
+                    
+                    if changes:
+                        log_pim_event(
+                            event_type="PROCESS_MODIFIED",
+                            process_hash=process_hash,
+                            previous_metadata=previous_info,
+                            new_metadata=current_info
+                        )
+                        update_process_tracking(process_hash, current_info)
+            
+            # ML Model Training - Separate from core PIM functionality
+            if establishing_ml_baseline:
+                # During ML baseline phase, just increment counter while still allowing PIM to operate
+                ml_baseline_counter += 1
+                
+                # Check if we've reached the end of the baseline phase
+                if ml_baseline_counter >= ml_baseline_cycles:
+                    establishing_ml_baseline = False
+                    print("[INFO] ML baseline collection complete (10 minutes). Training model...")
+                    
+                    # Train ML model only after baseline collection is complete
+                    if ML_LIBRARIES_AVAILABLE:
+                        ml_model_info = implement_behavioral_baselining()
+                        if ml_model_info and ml_model_info.get('model'):
+                            print("[INFO] ML model trained successfully. Enabling ML-based anomaly detection.")
+                        else:
+                            print("[WARNING] Failed to train ML model")
+                    else:
+                        print("[WARNING] ML libraries not available - anomaly detection disabled")
+            
+            # ML-based security checks - Only performed after ML baseline established
+            # Core PIM functionality continues regardless of ML model status
+            if not establishing_ml_baseline and ML_LIBRARIES_AVAILABLE and ml_model_info and ml_model_info.get('model'):
+                # Enhanced security checks for active processes
+                for process_hash, info in current_all_processes.items():
+                    # Skip processes we've already alerted on recently
+                    if process_hash in alerted_processes:
+                        continue
+                    
+                    pid = info.get("pid")
+                    
+                    # Check for security issues
+                    detection_events = []
+                    
+                    # 1. Memory analysis for code injection (prioritize listening processes)
+                    if info.get("is_listening", False):
+                        suspicious_memory = scan_process_memory(pid)
+                        if suspicious_memory:
+                            detection_events.append({
+                                "event_type": "SUSPICIOUS_MEMORY_REGION",
+                                "details": suspicious_memory
+                            })
+                    
+                    # 2. Behavioral pattern detection
+                    behavioral_patterns = analyze_process_for_anomalies(pid, info)
+                    if behavioral_patterns:
+                        detection_events.append({
+                            "event_type": "SUSPICIOUS_BEHAVIOR",
+                            "details": behavioral_patterns
+                        })
+                    
+                    # 3. ML-based anomaly detection
+                    if ml_model_info and ml_model_info.get('model'):
+                        # Prepare features
                         process_features = {
                             'port': int(info.get('port', 0)) if isinstance(info.get('port', 0), (int, str)) and str(info.get('port', 0)).isdigit() else 0,
                             'lineage_length': len(info.get('lineage', [])),
                             'cmdline_length': len(info.get('cmdline', '')),
                             'user_is_root': 1 if info.get('user') == 'root' else 0,
                             'child_processes': get_child_process_count(pid),
-                            'fd_count': get_open_fd_count(pid) 
+                            'fd_count': get_open_fd_count(pid)
                         }
                         
+                        # Add memory usage
                         mem_usage = get_process_memory_usage(pid)
                         if mem_usage:
                             process_features['memory_usage'] = mem_usage
-                    except Exception as e:
-                        print(f"[ERROR] Error extracting features for ML prediction on PID {pid}: {e}")
-                        continue
-                    
-                    # Create a DataFrame with proper feature names
-                    features_for_prediction = {}
-                    for feature in feature_names:
-                        features_for_prediction[feature] = process_features.get(feature, 0)
-                    
-                    import pandas as pd
-                    prediction = model.predict(pd.DataFrame([features_for_prediction]))[0]
-                    
-                    if prediction == -1:  # Anomaly
-                        # Calculate anomaly score
-                        anomaly_score = model.decision_function(pd.DataFrame([features_for_prediction]))[0]
                         
-                        # Only alert on more significant anomalies
-                        if anomaly_score < -0.1:  # Threshold to reduce noise
-                            print(f"[ALERT] ML-detected anomaly in process behavior: PID {pid} ({info.get('process_name', 'unknown')})")
-                            print(f"  Anomaly score: {anomaly_score:.4f}")
-                            print(f"  Command: {info.get('cmdline', 'N/A')}")
+                        # Create prediction features
+                        feature_names = ml_model_info['features']
+                        features_for_prediction = {}
+                        for feature in feature_names:
+                            features_for_prediction[feature] = process_features.get(feature, 0)
+                        
+                        # Make prediction
+                        import pandas as pd
+                        prediction = ml_model_info['model'].predict(pd.DataFrame([features_for_prediction]))[0]
+                        if prediction == -1:  # Anomaly
+                            # Calculate anomaly score
+                            anomaly_score = ml_model_info['model'].decision_function(pd.DataFrame([features_for_prediction]))[0]
                             
-                            detection_events.append({
-                                "event_type": "ML_DETECTED_ANOMALY",
-                                "details": {
-                                    "anomaly_score": anomaly_score,
-                                    "features": process_features
+                            # Only alert on more significant anomalies
+                            if anomaly_score < -0.1:  # Threshold to reduce noise
+                                detection_events.append({
+                                    "event_type": "ML_DETECTED_ANOMALY",
+                                    "details": {
+                                        "anomaly_score": anomaly_score,
+                                        "features": process_features
+                                    }
+                                })
+                    
+                    # If we have detection events, log them and analyze
+                    if detection_events:
+                        # Calculate threat score
+                        threat_assessment = calculate_threat_score(info, detection_events)
+                        
+                        # Add MITRE ATT&CK classification
+                        for event in detection_events:
+                            mitre_info = classify_by_mitre_attck(event["event_type"], info, event.get("details"))
+                            if mitre_info:
+                                event["mitre"] = mitre_info
+                            
+                            # Log the event
+                            log_pim_event(
+                                event_type=event["event_type"],
+                                process_hash=process_hash,
+                                previous_metadata=None,
+                                new_metadata={
+                                    "process_info": info,
+                                    "detection_details": event.get("details", {}),
+                                    "mitre_mapping": event.get("mitre", {}),
+                                    "threat_assessment": threat_assessment
                                 }
-                            })
+                            )
+                        
+                        # Add to detection history and mark as alerted
+                        if process_hash not in detection_history:
+                            detection_history[process_hash] = []
+                        detection_history[process_hash].extend(detection_events)
+                        alerted_processes.add(process_hash)
                 
-                # Calculate threat score if we have any detection events
-                if detection_events:
-                    threat_assessment = calculate_threat_score(info, detection_events)
-                    print(f"[THREAT SCORE] PID {pid} ({info.get('process_name', 'unknown')}): {threat_assessment['score']}/100")
-                    print(f"[THREAT SEVERITY] {threat_assessment['severity'].upper()}")
-                    for reason in threat_assessment['reasons']:
-                        print(f"  - {reason}")
-                    
-                    # Add threat score to all events
-                    for event in detection_events:
-                        event["threat_assessment"] = threat_assessment
-                
-                # 3. MITRE ATT&CK classification for any detections
-                for event in detection_events:
-                    details = event.get("details")
-                    mitre_info = classify_by_mitre_attck(event["event_type"], info, details)
-                    if mitre_info:
-                        event["mitre"] = mitre_info
-                
-                # 4. Log all detection events
-                if detection_events:
-                    # Add to detection history and mark as alerted
-                    if pid not in detection_history:
-                        detection_history[pid] = []
-                    detection_history[pid].extend(detection_events)
-                    alerted_processes.add(pid)
-                    
-                    # Log each event
-                    for event in detection_events:
-                        log_event(
-                            event_type=event["event_type"],
-                            file_path=info.get("exe_path", "UNKNOWN"),
-                            previous_metadata=None,
-                            new_metadata={
-                                "process_info": info,
-                                "detection_details": event.get("details", {}),
-                                "mitre_mapping": event.get("mitre", {}),
-                                "threat_assessment": event.get("threat_assessment", {})
-                            },
-                            previous_hash=None,
-                            new_hash=info.get("hash", "UNKNOWN")
-                        )
+                # Periodically clear the alerted_processes set
+                if ml_baseline_counter % 60 == 0:
+                    print("[INFO] Resetting alert suppression...")
+                    alerted_processes.clear()  # Allow processes to trigger alerts again
             
-            # Handle new processes (original functionality)
-            for pid, info in new_processes.items():
-                log_event(
-                    event_type="NEW_LISTENING_PROCESS",
-                    file_path=info["exe_path"],
-                    previous_metadata=None,
-                    new_metadata=info,
-                    previous_hash=None,
-                    new_hash=info.get("hash", "UNKNOWN")
-                )
-                update_process_tracking(info["exe_path"], info["hash"], info)
-                check_for_unusual_port_use(info)
-                check_lineage_baseline(info, known_lineages)
+            # CRITICAL FIX: Always set first_iteration to False after first cycle
+            # This ensures we don't miss any events after the first run
+            first_iteration = False
             
-            # Handle terminated processes (original functionality)
-            for pid, info in terminated_processes.items():
-                if pid in terminated_pids:
-                    continue
-                
-                stored_info = load_process_metadata().get(str(pid), None)
-                log_event(
-                    event_type="PROCESS_TERMINATED",
-                    file_path=info["exe_path"] if stored_info else "UNKNOWN",
-                    previous_metadata=stored_info if stored_info else "UNKNOWN",
-                    new_metadata=None,
-                    previous_hash=stored_info["hash"] if stored_info else "UNKNOWN",
-                    new_hash=None
-                )
-                remove_process_tracking(str(pid))
-                terminated_pids.add(pid)
-                
-                # Remove from detection history when process terminates
-                if pid in detection_history:
-                    del detection_history[pid]
-                if pid in alerted_processes:
-                    alerted_processes.remove(pid)
+            # Update for next iteration
+            all_known_processes = current_all_processes.copy()
+            seen_listening_pids.update(current_listening_pids)
             
-            # Periodically clear the alerted_processes set and retrain model
-            ml_retrain_counter += 1
-            if ml_retrain_counter >= 60:  # Every ~2 minutes
-                print("[INFO] Retraining ML model and resetting alerts...")
-                ml_model_info = implement_behavioral_baselining()
-                ml_retrain_counter = 0
-                alerted_processes.clear()  # Allow processes to trigger alerts again
+            # Increment counter regardless of phase
+            ml_baseline_counter += 1
             
-            known_processes = current_processes
             time.sleep(interval)
             
         except Exception as e:
             print(f"[ERROR] Exception in enhanced monitoring loop: {e}")
             traceback.print_exc()
-            continue
-
-def rescan_listening_processes(interval=120):
-    """Periodically scans listening processes and ensures accurate tracking."""
-    while True:
-        try:
-            print("[PERIODIC SCAN] Running integrity check on listening processes...")
-
-            from fim import log_event
-
-            integrity_state = load_process_metadata()  # Load stored metadata indexed by PID
-            current_processes = get_listening_processes()  # Get active processes
-
-            for pid, current_info in current_processes.items():
-                pid_str = str(pid)  # Ensure PID is a string for key lookup
-
-                if pid_str in integrity_state:
-                    stored_info = integrity_state[pid_str]
-
-                    # Ensure process hash and metadata match before reporting changes
-                    if stored_info["hash"] != current_info["hash"]:
-                        print(f"[ALERT] Hash mismatch detected for PID {pid_str} ({current_info['exe_path']})")
-                        log_event(
-                            event_type="PROCESS_MODIFIED",
-                            file_path=current_info["exe_path"],
-                            previous_metadata=stored_info,
-                            new_metadata=current_info,
-                            previous_hash=stored_info["hash"],
-                            new_hash=current_info["hash"]
-                        )
-
-                    # Check for metadata changes
-                    changed_fields = {}
-                    for key in ["user", "port", "cmdline"]:
-                        if stored_info[key] != current_info[key]:
-                            changed_fields[key] = {
-                                "previous": stored_info[key],
-                                "current": current_info[key]
-                            }
-
-                    if changed_fields:
-                        print(f"[ALERT] Metadata changes detected for PID {pid_str}: {changed_fields}")
-                        log_event(
-                            event_type="PROCESS_METADATA_CHANGED",
-                            file_path=current_info["exe_path"],
-                            previous_metadata=stored_info,
-                            new_metadata=current_info,
-                            previous_hash=stored_info["hash"],
-                            new_hash=current_info["hash"]
-                        )
-
-                else:
-                    # Process is missing in integrity records → log as new
-                    print(f"[ALERT] New untracked process detected: PID {pid_str} ({current_info['exe_path']})")
-                    log_event(
-                        event_type="NEW_UNTRACKED_PROCESS",
-                        file_path=current_info["exe_path"],
-                        previous_metadata="N/A",
-                        new_metadata=current_info,
-                        previous_hash="N/A",
-                        new_hash=current_info["hash"]
-                    )
-
-            time.sleep(interval)
-
-        except Exception as e:
-            print(f"[ERROR] Exception in periodic scan: {e}")
-
-def load_known_lineages():
-    if not os.path.exists(KNOWN_LINEAGES_FILE):
-        print("[DEBUG] known_lineages.json does not exist, starting fresh.")
-        return {}
+            time.sleep(interval)  # Sleep to avoid spinning on errors
+            
+def create_baseline():
+    """Create an initial baseline of all processes without generating alerts or logs."""
     try:
-        with open(KNOWN_LINEAGES_FILE, "r") as f:
-            return json.load(f)
+        print("[INFO] Creating initial process baseline...")
+        
+        # Get current processes
+        listening_processes = get_listening_processes()
+        all_processes = get_all_processes()
+        
+        # Merge processes, with listening processes taking precedence
+        merged_processes = all_processes.copy()
+        for process_hash, info in listening_processes.items():
+            merged_processes[process_hash] = info
+        
+        # Log statistics but not events
+        print(f"[INFO] Initial baseline: {len(merged_processes)} total processes, {len(listening_processes)} listening processes")
+        
+        # Write directly to integrity file without using the functions that log events
+        with open(INTEGRITY_PROCESS_FILE, "w") as f:
+            json.dump(merged_processes, f, indent=4)
+        os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
+        
+        print(f"[INFO] Successfully wrote baseline to {INTEGRITY_PROCESS_FILE}")
+        return True
+        
     except Exception as e:
-        print(f"[ERROR] Failed to load known_lineages.json: {e}")
-        return {}
-
-def save_known_lineages(lineages):
-    try:
-        temp_file = f"{KNOWN_LINEAGES_FILE}.tmp"
-        with open(temp_file, "w") as f:
-            json.dump(lineages, f, indent=4)
-
-        os.replace(temp_file, KNOWN_LINEAGES_FILE)
-        os.chmod(KNOWN_LINEAGES_FILE, 0o600)
-        print("[DEBUG] Saved updated known_lineages.json")
-    except Exception as e:
-        print(f"[ERROR] Failed to save known_lineages.json: {e}")
-
-def check_lineage_baseline(process_info, known_lineages):
-    proc_name = process_info["process_name"]
-    lineage = process_info.get("lineage", [])
-
-    if not lineage:
-        return
-
-    baseline = known_lineages.get(proc_name)
-
-    if not baseline:
-        known_lineages[proc_name] = lineage
-        print(f"[INFO] Baseline lineage established for {proc_name}: {lineage}")
-        save_known_lineages(known_lineages)
-    elif lineage != baseline:
-        print(f"[ALERT] Lineage deviation for {proc_name}:")
-        print(f"  Expected: {baseline}")
-        print(f"  Found:    {lineage}")
-        from fim import log_event
-        log_event(
-            event_type="LINEAGE_DEVIATION",
-            file_path=process_info["exe_path"],
-            previous_metadata={"lineage": baseline},
-            new_metadata={"lineage": lineage},
-            previous_hash="N/A",
-            new_hash=process_info.get("hash", "UNKNOWN")
-        )
+        print(f"[ERROR] Failed to create baseline: {e}")
+        traceback.print_exc()
+        return False
 
 def resolve_lineage(pid):
-    """Walks the PPID chain to build the process lineage as a list of process names."""
+    """
+    Walks the PPID chain to build the process lineage as a list of process names.
+    Enhanced to handle more edge cases and improve reliability.
+    """
     lineage = []
+    max_depth = 20  # Prevent infinite loops in case of circular references
 
     try:
-        seen = set()
-        while pid not in seen:
-            seen.add(pid)
-            status_path = f"/proc/{pid}/status"
+        seen_pids = set()
+        current_pid = pid
+        depth = 0
+
+        while current_pid not in seen_pids and current_pid > 0 and depth < max_depth:
+            seen_pids.add(current_pid)
+            depth += 1
+            
+            # Check if the process still exists
+            status_path = f"/proc/{current_pid}/status"
             if not os.path.exists(status_path):
+                # Try to get info from ps as a fallback
+                try:
+                    cmd = f"sudo -n /bin/ps -p {current_pid} -o comm= -o ppid="
+                    ps_output = subprocess.getoutput(cmd).strip()
+                    if ps_output and len(ps_output.split()) >= 2:
+                        proc_name, ppid = ps_output.split(None, 1)
+                        lineage.insert(0, proc_name)
+                        current_pid = int(ppid) if ppid.strip().isdigit() else 0
+                        continue
+                except Exception:
+                    break  # If we can't get info, just end the chain
                 break
 
-            with open(status_path, "r") as f:
-                lines = f.readlines()
-
-            name = None
-            ppid = None
-            for line in lines:
-                if line.startswith("Name:"):
-                    name = line.split()[1]
-                elif line.startswith("PPid:"):
-                    ppid = int(line.split()[1])
-
-            if name:
-                lineage.insert(0, name)
-
-            if not ppid or ppid == 0 or ppid == pid:
+            # Read from /proc status file
+            try:
+                with open(status_path, "r") as f:
+                    status_content = f.read()
+                
+                # Extract process name
+                name_match = re.search(r"Name:\s+(\S+)", status_content)
+                if name_match:
+                    name = name_match.group(1)
+                    lineage.insert(0, name)
+                
+                # Extract parent PID
+                ppid_match = re.search(r"PPid:\s+(\d+)", status_content)
+                if ppid_match:
+                    ppid = int(ppid_match.group(1))
+                    if ppid == current_pid:  # Self-reference check
+                        break
+                    current_pid = ppid
+                else:
+                    break  # No parent found, end of chain
+            except Exception as e:
+                print(f"[ERROR] Failed to read status for PID {current_pid}: {e}")
                 break
-            pid = ppid
 
     except Exception as e:
         print(f"[ERROR] Failed to resolve lineage for PID {pid}: {e}")
+    
+    # Add more context to lineage
+    if lineage:
+        # Mark system init processes specifically
+        if lineage[0] in ["systemd", "init"]:
+            lineage[0] = f"{lineage[0]}:system"
+    
     return lineage
 
 def implement_behavioral_baselining():
@@ -725,37 +960,38 @@ def implement_behavioral_baselining():
     processes_data = []
     integrity_state = load_process_metadata()
     
-    for pid, process in integrity_state.items():
+    for process_hash, process in integrity_state.items():
         process_name = process.get("process_name", "")
+        pid = process.get("pid", 0)
         
         # Skip system processes in the training data (to prevent them from affecting the model)
-        if process_name in system_processes and int(pid) == 1:
+        if process_name in system_processes and process_name == "systemd" and pid == 1:
             continue
             
         # Extract features
         try:
             features = {
-                'pid': int(pid),
-                'port': int(process['port']) if isinstance(process['port'], (int, str)) and str(process['port']).isdigit() else 0,
+                'pid': pid,
+                'port': int(process.get('port', 0)) if isinstance(process.get('port', 0), (int, str)) and str(process.get('port', 0)).isdigit() else 0,
                 'lineage_length': len(process.get('lineage', [])),
                 'cmdline_length': len(process.get('cmdline', '')),
                 'user_is_root': 1 if process.get('user') == 'root' else 0,
-                'child_processes': get_child_process_count(int(pid))
+                'child_processes': get_child_process_count(pid) if pid > 0 else 0
             }
             
             # Add memory usage as a feature
-            mem_usage = get_process_memory_usage(int(pid))
+            mem_usage = get_process_memory_usage(pid) if pid > 0 else None
             if mem_usage:
                 features['memory_usage'] = mem_usage
                 
             # Add open file descriptor count
-            fd_count = get_open_fd_count(int(pid))
+            fd_count = get_open_fd_count(pid) if pid > 0 else None
             if fd_count:
                 features['fd_count'] = fd_count
                 
             processes_data.append(features)
         except Exception as e:
-            print(f"[ERROR] Error extracting features for PID {pid}: {e}")
+            print(f"[ERROR] Error extracting features for process {process_name} (Hash: {process_hash}): {e}")
     
     # Return empty model info if not enough data
     if len(processes_data) < 5:
@@ -818,9 +1054,8 @@ def analyze_process_for_anomalies(pid, info):
                 suspicious_patterns.append(f"Running from unusual directory: {unusual_dir}")
                 break
         
-        # Check for unusual port
-        if isinstance(info.get('port'), int) and info.get('port') > 1024 and info.get('port') not in [8080, 8443]:
-            suspicious_patterns.append(f"Unusual port: {info.get('port')}")
+        # REMOVED: Static port check
+        # We no longer check for unusual ports based on static values
         
         # Check for unexpected shell in lineage for server process
         if unexpected_execution:
@@ -874,6 +1109,10 @@ def scan_process_memory(pid):
         # Get process executable path for context using sudo
         exe_path = subprocess.getoutput(f"sudo -n readlink -f /proc/{pid}/exe").strip()
         process_name = os.path.basename(exe_path)
+        
+        # Generate a process hash for logging
+        cmdline = subprocess.getoutput(f"sudo -n /bin/cat /proc/{pid}/cmdline 2>/dev/null").strip().replace("\x00", " ")
+        process_hash = get_process_hash(exe_path, cmdline)
         
         # Read memory maps using sudo
         maps_content = subprocess.getoutput(f"sudo -n cat /proc/{pid}/maps")
@@ -929,18 +1168,17 @@ def scan_process_memory(pid):
                 })
         
         if suspicious_regions:
-            from fim import log_event
-            log_event(
+            # Log using our hash-based PIM event logging
+            log_pim_event(
                 event_type="SUSPICIOUS_MEMORY_REGION",
-                file_path=exe_path,
+                process_hash=process_hash,
                 previous_metadata=None,
                 new_metadata={
                     "pid": pid,
                     "process_name": process_name,
+                    "exe_path": exe_path,
                     "suspicious_regions": [f"{r['region']['addr_range']} ({r['region']['perms']}) - {r['reason']}" for r in suspicious_regions]
-                },
-                previous_hash=None,
-                new_hash=None
+                }
             )
     except Exception as e:
         print(f"[ERROR] Failed to scan memory for PID {pid}: {e}")
@@ -958,210 +1196,369 @@ def calculate_region_size(addr_range):
         return 0
 
 def classify_by_mitre_attck(event_type, process_info, detection_details=None):
-    """Map detected activities to MITRE ATT&CK techniques using dynamic classification."""
-    # Load MITRE ATT&CK mappings from a JSON file if it exists
-    mitre_mapping_file = os.path.join(OUTPUT_DIR, "mitre_mappings.json")
-    
-    if os.path.exists(mitre_mapping_file):
-        try:
-            with open(mitre_mapping_file, "r") as f:
-                mitre_mapping = json.load(f)
-        except Exception as e:
-            print(f"[ERROR] Failed to load MITRE mappings: {e}")
-            mitre_mapping = {}
-    else:
-        # Default mappings as fallback
-        mitre_mapping = {
-            "NEW_LISTENING_PROCESS": [{
-                "technique_id": "T1059", 
+    """
+    Map detected activities to MITRE ATT&CK techniques with enhanced impersonation detection
+    by comparing process attributes to known good processes in the integrity database.
+    """
+    # Comprehensive built-in MITRE ATT&CK mappings
+    mitre_mapping = {
+        "NEW_PROCESS": [
+            {
+                "technique_id": "T1059",
                 "technique_name": "Command and Scripting Interpreter",
                 "tactic": "Execution"
-            }],
-            "UNUSUAL_PORT_USE": [{
-                "technique_id": "T1571", 
+            }
+        ],
+        "NEW_LISTENING_PROCESS": [
+            {
+                "technique_id": "T1571",
                 "technique_name": "Non-Standard Port",
                 "tactic": "Command and Control"
-            }],
-            "PROCESS_MODIFIED": [{
-                "technique_id": "T1055", 
+            },
+            {
+                "technique_id": "T1543",
+                "technique_name": "Create or Modify System Process",
+                "tactic": "Persistence"
+            }
+        ],
+        "PROCESS_TERMINATED": [
+            {
+                "technique_id": "T1562.001",
+                "technique_name": "Impair Defenses: Disable or Modify Tools",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "PROCESS_MODIFIED": [
+            {
+                "technique_id": "T1055",
                 "technique_name": "Process Injection",
                 "tactic": "Defense Evasion"
-            }],
-            "SUSPICIOUS_MEMORY_REGION": [{
-                "technique_id": "T1055", 
+            },
+            {
+                "technique_id": "T1112",
+                "technique_name": "Modify Registry",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "SUSPICIOUS_MEMORY_REGION": [
+            {
+                "technique_id": "T1055",
                 "technique_name": "Process Injection",
                 "tactic": "Defense Evasion"
-            }],
-            "LINEAGE_DEVIATION": [{
-                "technique_id": "T1036", 
+            },
+            {
+                "technique_id": "T1055.001",
+                "technique_name": "Process Injection: Dynamic-link Library Injection",
+                "tactic": "Defense Evasion"
+            },
+            {
+                "technique_id": "T1055.002",
+                "technique_name": "Process Injection: Portable Executable Injection",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "LINEAGE_DEVIATION": [
+            {
+                "technique_id": "T1036",
                 "technique_name": "Masquerading",
                 "tactic": "Defense Evasion"
-            }],
-            "ML_DETECTED_ANOMALY": [
-                {
-                    "technique_id": "T1036", 
-                    "technique_name": "Masquerading",
-                    "tactic": "Defense Evasion"
-                },
-                {
-                    "technique_id": "T1059", 
-                    "technique_name": "Command and Scripting Interpreter",
-                    "tactic": "Execution"
-                }
-            ],
-            "SUSPICIOUS_BEHAVIOR": [
-                {
-                    "technique_id": "T1059", 
-                    "technique_name": "Command and Scripting Interpreter",
-                    "tactic": "Execution"
-                }
-            ]
-        }
+            },
+            {
+                "technique_id": "T1036.005",
+                "technique_name": "Masquerading: Match Legitimate Name or Location",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "ML_DETECTED_ANOMALY": [
+            {
+                "technique_id": "T1036",
+                "technique_name": "Masquerading",
+                "tactic": "Defense Evasion"
+            },
+            {
+                "technique_id": "T1059",
+                "technique_name": "Command and Scripting Interpreter",
+                "tactic": "Execution"
+            },
+            {
+                "technique_id": "T1562",
+                "technique_name": "Impair Defenses",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "SUSPICIOUS_BEHAVIOR": [
+            {
+                "technique_id": "T1059",
+                "technique_name": "Command and Scripting Interpreter",
+                "tactic": "Execution"
+            },
+            {
+                "technique_id": "T1053",
+                "technique_name": "Scheduled Task/Job",
+                "tactic": "Persistence"
+            },
+            {
+                "technique_id": "T1078",
+                "technique_name": "Valid Accounts",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "UNUSUAL_PORT_USE": [
+            {
+                "technique_id": "T1571",
+                "technique_name": "Non-Standard Port",
+                "tactic": "Command and Control"
+            },
+            {
+                "technique_id": "T1090",
+                "technique_name": "Proxy",
+                "tactic": "Command and Control"
+            }
+        ],
+        "EXECUTABLE_PATH_MISMATCH": [
+            {
+                "technique_id": "T1036",
+                "technique_name": "Masquerading",
+                "tactic": "Defense Evasion"
+            },
+            {
+                "technique_id": "T1036.005",
+                "technique_name": "Masquerading: Match Legitimate Name or Location",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "HASH_MISMATCH": [
+            {
+                "technique_id": "T1036",
+                "technique_name": "Masquerading",
+                "tactic": "Defense Evasion"
+            },
+            {
+                "technique_id": "T1027",
+                "technique_name": "Obfuscated Files or Information",
+                "tactic": "Defense Evasion"
+            }
+        ],
+        "USER_MISMATCH": [
+            {
+                "technique_id": "T1078",
+                "technique_name": "Valid Accounts",
+                "tactic": "Defense Evasion"
+            },
+            {
+                "technique_id": "T1548",
+                "technique_name": "Abuse Elevation Control Mechanism",
+                "tactic": "Privilege Escalation"
+            }
+        ]
+    }
     
     # Context-based classification enhancements
+    if not process_info:
+        return None
+        
     process_name = process_info.get("process_name", "").lower()
+    exe_path = process_info.get("exe_path", "").lower()
     cmdline = process_info.get("cmdline", "").lower()
     user = process_info.get("user", "").lower()
+    lineage = process_info.get("lineage", [])
+    process_hash = process_info.get("hash", "")
     
-    # Build contextual insights
+    # Build contextual insights based on heuristics and patterns
     context_insights = []
     
-    # Special handling for SUSPICIOUS_BEHAVIOR events with pattern field
-    if event_type == "SUSPICIOUS_BEHAVIOR" and detection_details:
-        # Handle the old pattern-based format
-        if "pattern" in detection_details:
-            pattern = detection_details.get("pattern", "")
+    # CRITICAL: Check for process impersonation by comparing with known good processes
+    # Load the integrity database to check for known good processes
+    integrity_database = load_process_metadata()
+    
+    # 1. Check for process name impersonation (same name but different attributes)
+    impersonation_detected = False
+    impersonation_details = []
+    
+    # Get all processes with the same name from the integrity database
+    known_good_processes = []
+    for hash_key, proc_data in integrity_database.items():
+        if proc_data.get("process_name", "").lower() == process_name:
+            # Skip if this is the same process (same hash)
+            if hash_key == process_hash:
+                continue
+            known_good_processes.append(proc_data)
+    
+    # If we found known good processes with the same name, check for impersonation
+    if known_good_processes and event_type in ["NEW_PROCESS", "NEW_LISTENING_PROCESS"]:
+        # Check each known good process for attribute mismatches
+        for good_proc in known_good_processes:
+            mismatches = []
             
-            if pattern == "unusual_shell_ancestry":
-                context_insights.append({
-                    "technique_id": "T1059.004",
-                    "technique_name": "Command and Scripting Interpreter: Unix Shell",
-                    "tactic": "Execution"
-                })
-                
-            elif pattern == "ephemeral_port_listener":
-                context_insights.append({
-                    "technique_id": "T1571",
-                    "technique_name": "Non-Standard Port",
-                    "tactic": "Command and Control"
-                })
-                
-            elif pattern == "privileged_port_by_non_root":
-                context_insights.append({
-                    "technique_id": "T1068",
-                    "technique_name": "Exploitation for Privilege Escalation",
-                    "tactic": "Privilege Escalation"
-                })
-                
-            elif pattern == "encoded_command_execution":
-                context_insights.append({
-                    "technique_id": "T1027",
-                    "technique_name": "Obfuscated Files or Information",
-                    "tactic": "Defense Evasion"
-                })
-                
-            elif pattern == "connection_to_unusual_port":
-                context_insights.append({
-                    "technique_id": "T1071",
-                    "technique_name": "Application Layer Protocol",
-                    "tactic": "Command and Control"
-                })
-                
-            elif pattern == "execution_from_unusual_location":
-                context_insights.append({
-                    "technique_id": "T1074",
-                    "technique_name": "Data Staged",
-                    "tactic": "Collection"
-                })
+            # Check executable path
+            good_exe_path = good_proc.get("exe_path", "").lower()
+            if good_exe_path and exe_path and good_exe_path != exe_path:
+                mismatches.append(f"Executable path mismatch: {good_exe_path} vs {exe_path}")
+            
+            # Check user
+            good_user = good_proc.get("user", "").lower()
+            if good_user and user and good_user != user:
+                mismatches.append(f"User mismatch: {good_user} vs {user}")
+            
+            # Check lineage pattern (might not be exact match but should follow similar pattern)
+            good_lineage = good_proc.get("lineage", [])
+            if good_lineage and lineage and len(good_lineage) > 0 and len(lineage) > 0:
+                # Simple check - does it follow a different ancestry pattern?
+                if (good_lineage[0] != lineage[0] or 
+                    ("bash" in lineage and "bash" not in good_lineage) or
+                    (len(good_lineage) > 1 and len(lineage) > 1 and good_lineage[1] != lineage[1])):
+                    mismatches.append(f"Lineage mismatch: {good_lineage} vs {lineage}")
+            
+            # If we found mismatches, we have impersonation
+            if mismatches:
+                impersonation_detected = True
+                impersonation_details.extend(mismatches)
+    
+    # 2. If impersonation detected, add specific MITRE ATT&CK techniques
+    if impersonation_detected:
+        context_insights.append({
+            "technique_id": "T1036",
+            "technique_name": "Masquerading",
+            "tactic": "Defense Evasion",
+            "severity": "high",
+            "evidence": f"Process impersonation detected: {process_name} with {'; '.join(impersonation_details)}"
+        })
         
-        # Handle the new patterns list format
-        if "patterns" in detection_details:
-            patterns = detection_details.get("patterns", [])
-            
-            for pattern in patterns:
-                pattern_lower = pattern.lower()
+        context_insights.append({
+            "technique_id": "T1036.005",
+            "technique_name": "Masquerading: Match Legitimate Name or Location",
+            "tactic": "Defense Evasion",
+            "severity": "high",
+            "evidence": f"Process masquerading as {process_name} but with different attributes"
+        })
+        
+        # Add specific alert for server process impersonation
+        server_processes = ["apache", "apache2", "httpd", "nginx", "sshd", "ftpd", "smbd", "nmbd", "named", "mysqld", "postgres"]
+        if any(server in process_name for server in server_processes):
+            context_insights.append({
+                "technique_id": "T1190",
+                "technique_name": "Exploit Public-Facing Application",
+                "tactic": "Initial Access",
+                "severity": "critical",
+                "evidence": f"Server process {process_name} being impersonated, possible web shell or backdoor"
+            })
+    
+    # 3. Check for defense evasion - running from temp or unusual directories
+    suspicious_dirs = ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/", "/home/"]
+    if any(susp_dir in exe_path for susp_dir in suspicious_dirs):
+        context_insights.append({
+            "technique_id": "T1564.001",
+            "technique_name": "Hide Artifacts: Hidden Files and Directories",
+            "tactic": "Defense Evasion",
+            "severity": "medium",
+            "evidence": f"Process running from suspicious location: {exe_path}"
+        })
+    
+    # 4. Check for privilege escalation - non-root user binding to privileged port
+    port = process_info.get("port", 0)
+    if isinstance(port, int) and port < 1024 and user != "root":
+        context_insights.append({
+            "technique_id": "T1068",
+            "technique_name": "Exploitation for Privilege Escalation",
+            "tactic": "Privilege Escalation",
+            "severity": "high",
+            "evidence": f"Non-root user '{user}' binding to privileged port {port}"
+        })
+    
+    # 5. Check for suspicious command line patterns
+    suspicious_cmd_patterns = [
+        "base64", "-encode", "--decode", "powershell", "eval", "exec", 
+        "system(", "shell_exec", "wget", "curl", "nc ", "netcat", "perl -e", "python -c"
+    ]
+    if any(pattern in cmdline for pattern in suspicious_cmd_patterns):
+        context_insights.append({
+            "technique_id": "T1059",
+            "technique_name": "Command and Scripting Interpreter",
+            "tactic": "Execution",
+            "severity": "medium",
+            "evidence": f"Suspicious command line pattern detected: {cmdline}"
+        })
+    
+    # 6. Check for server processes spawned by shell (suspicious lineage)
+    server_processes = ["apache", "apache2", "httpd", "nginx", "sshd", "ftpd", "smbd", "nmbd", "named", "mysqld", "postgres"]
+    if any(server in process_name for server in server_processes) and any(shell in lineage for shell in ["bash", "sh", "zsh", "dash"]):
+        context_insights.append({
+            "technique_id": "T1190",
+            "technique_name": "Exploit Public-Facing Application",
+            "tactic": "Initial Access",
+            "severity": "high",
+            "evidence": f"Server process '{process_name}' spawned by shell in lineage: {lineage}"
+        })
+    
+    # 7. Check for reverse shells
+    if "shell" in cmdline.lower() and any(net_tool in cmdline.lower() for net_tool in ["nc", "netcat", "socat"]):
+        context_insights.append({
+            "technique_id": "T1071.001",
+            "technique_name": "Application Layer Protocol: Web Protocols",
+            "tactic": "Command and Control",
+            "severity": "critical",
+            "evidence": f"Potential reverse shell detected: {cmdline}"
+        })
+    
+    # 8. Check for credential access
+    if "shadow" in cmdline or "passwd" in cmdline or "/etc/passwd" in cmdline:
+        context_insights.append({
+            "technique_id": "T1003.008",
+            "technique_name": "OS Credential Dumping: /etc/passwd and /etc/shadow",
+            "tactic": "Credential Access",
+            "severity": "high",
+            "evidence": f"Potential credential access attempt: {cmdline}"
+        })
+    
+    # 9. Check for web exploitation tools
+    web_exploit_tools = ["sqlmap", "nikto", "burpsuite", "metasploit", "msfconsole", "hydra", "john"]
+    if any(tool in process_name.lower() or tool in cmdline.lower() for tool in web_exploit_tools):
+        context_insights.append({
+            "technique_id": "T1190",
+            "technique_name": "Exploit Public-Facing Application",
+            "tactic": "Initial Access",
+            "severity": "high",
+            "evidence": f"Web exploitation tool detected: {process_name}"
+        })
+    
+    # 10. Check for specific detection events
+    if event_type == "SUSPICIOUS_BEHAVIOR" and detection_details:
+        if "suspicious_patterns" in detection_details:
+            for pattern in detection_details.get("suspicious_patterns", []):
+                pattern_lower = pattern.lower() if isinstance(pattern, str) else ""
                 
                 if "unusual directory" in pattern_lower:
                     context_insights.append({
-                        "technique_id": "T1074", 
-                        "technique_name": "Data Staged",
-                        "tactic": "Collection",
-                        "evidence": pattern
-                    })
-                    
-                elif "malicious port" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1571", 
-                        "technique_name": "Non-Standard Port",
-                        "tactic": "Command and Control",
-                        "evidence": pattern
-                    })
-                    
-                elif "encoded command" in pattern_lower or "base64" in pattern_lower:
-                    context_insights.append({
-                        "technique_id": "T1027", 
-                        "technique_name": "Obfuscated Files or Information",
+                        "technique_id": "T1564.001", 
+                        "technique_name": "Hide Artifacts: Hidden Files and Directories",
                         "tactic": "Defense Evasion",
+                        "severity": "medium",
                         "evidence": pattern
                     })
-                    
+                
                 elif "webshell" in pattern_lower:
                     context_insights.append({
                         "technique_id": "T1505.003", 
                         "technique_name": "Server Software Component: Web Shell",
                         "tactic": "Persistence",
+                        "severity": "high",
                         "evidence": pattern
                     })
-                    
-                elif "network utility" in pattern_lower or "netcat" in pattern_lower or "nc " in pattern_lower:
+                
+                elif "encoded command" in pattern_lower or "base64" in pattern_lower:
                     context_insights.append({
-                        "technique_id": "T1219", 
-                        "technique_name": "Remote Access Software",
-                        "tactic": "Command and Control",
+                        "technique_id": "T1027", 
+                        "technique_name": "Obfuscated Files or Information",
+                        "tactic": "Defense Evasion",
+                        "severity": "medium",
                         "evidence": pattern
                     })
     
-    # Other event types handling
-    elif event_type == "ML_DETECTED_ANOMALY":
-        if process_name in ["python", "perl", "ruby", "node", "java"]:
-            context_insights.append({
-                "technique_id": "T1059.006",
-                "technique_name": "Command and Scripting Interpreter: Python",
-                "tactic": "Execution"
-            })
-        elif process_name in ["bash", "sh", "zsh", "dash"]:
-            context_insights.append({
-                "technique_id": "T1059.004",
-                "technique_name": "Command and Scripting Interpreter: Unix Shell",
-                "tactic": "Execution"
-            })
-        elif user == "root":
-            context_insights.append({
-                "technique_id": "T1068",
-                "technique_name": "Exploitation for Privilege Escalation",
-                "tactic": "Privilege Escalation"
-            })
-    
-    # Add context-based techniques based on process info, regardless of event type
-    
-    # Special handling for privileged processes run as non-root
-    if user != "root" and isinstance(process_info.get("port"), int) and process_info.get("port") < 1024:
-        context_insights.append({
-            "technique_id": "T1068",
-            "technique_name": "Exploitation for Privilege Escalation",
-            "tactic": "Privilege Escalation"
-        })
-    
-    # Special handling for credential access pattern
-    if "shadow" in cmdline or "passwd" in cmdline:
-        context_insights.append({
-            "technique_id": "T1003",
-            "technique_name": "OS Credential Dumping",
-            "tactic": "Credential Access"
-        })
-    
-    # Merge base classifications with context-specific insights
-    techniques = mitre_mapping.get(event_type, []) + context_insights
+    # Merge base techniques with context-specific insights
+    techniques = []
+    if event_type in mitre_mapping:
+        techniques.extend(mitre_mapping[event_type])
+    techniques.extend(context_insights)
     
     # Deduplicate techniques
     unique_techniques = []
@@ -1172,10 +1569,6 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             seen_ids.add(technique["technique_id"])
     
     if unique_techniques:
-        # Log all applicable techniques
-        technique_list = [f"{t['technique_id']} ({t['technique_name']})" for t in unique_techniques]
-        print(f"[MITRE ATT&CK] Event {event_type} mapped to: {', '.join(technique_list)}")
-        
         return {
             "techniques": unique_techniques,
             "evidence": {
@@ -1330,141 +1723,295 @@ def calculate_threat_score(process_info, detection_events):
         "reasons": reasons
     }
     
-def remove_process_tracking(pid):
-    """Remove process metadata from integrity_processes.json and process_hashes.txt using PID reference."""
-    process_hashes = load_process_hashes()
+def remove_process_tracking(process_hash):
+    """
+    Remove process metadata from integrity_processes.json using process hash as the key.
+    This replaces the previous PID-based approach.
+    """
     integrity_state = load_process_metadata()
-    known_lineages = load_known_lineages()
 
-    pid_str = str(pid)
-
-    if pid_str in integrity_state:
-        process_info = integrity_state[pid_str]
-        proc_name = process_info.get("process_name", "UNKNOWN")
-        lineage = process_info.get("lineage", [])
+    if process_hash in integrity_state:
+        process_info = integrity_state[process_hash]
+        pid = process_info.get("pid", "UNKNOWN")
+        process_name = process_info.get("process_name", "UNKNOWN")
 
         # Remove the process metadata
-        del integrity_state[pid_str]
+        del integrity_state[process_hash]
         save_process_metadata(integrity_state)
 
-        # Check if lineage for that process name should still be retained
-        still_running_with_same_lineage = any(
-            p.get("process_name") == proc_name and p.get("lineage") == known_lineages.get(proc_name)
-            for p in integrity_state.values()
+        print(f"[INFO] Process {process_name} (PID: {pid}, Hash: {process_hash}) removed from tracking.")
+        
+        # Log the removal event
+        log_pim_event(
+            event_type="PROCESS_TERMINATED",
+            process_hash=process_hash,
+            previous_metadata=process_info,
+            new_metadata=None
         )
-
-        if proc_name in known_lineages and not still_running_with_same_lineage:
-            print(f"[INFO] Removing lineage for {proc_name} from known_lineages.json")
-            del known_lineages[proc_name]
-            save_known_lineages(known_lineages)
-
-        # Remove from hash tracking if necessary
-        exe_path = process_info.get("exe_path")
-        if exe_path and exe_path in process_hashes:
-            del process_hashes[exe_path]
-            save_process_hashes(process_hashes)
-
-        print(f"[INFO] Process {pid_str} removed from tracking.")
+        
+        return True
     else:
-        print(f"[WARNING] No matching process found for PID: {pid_str}. It may have already been removed.")
+        print(f"[WARNING] No matching process found for hash: {process_hash}. It may have already been removed.")
+        return False
 
-def update_process_tracking(exe_path, process_hash, metadata):
-    """Update process tracking files with new or modified processes."""
-    process_hashes = load_process_hashes()
+def update_process_tracking(process_hash, metadata):
+    """
+    Update process tracking with new or modified processes.
+    This now uses hash as the primary key instead of PID.
+    """
     integrity_state = load_process_metadata()
 
-    pid = metadata["pid"]  # Ensure PID is used as a unique key
-
-    # Ensure we store entries separately even if they have the same exe_path
-    integrity_state[str(pid)] = metadata  # Store by PID instead of exe_path
-
-    # Update hash tracking separately
-    process_hashes[exe_path] = process_hash
-
-    # Save the updated process metadata and hashes
+    # Update the process metadata in our tracking structure using hash as key
+    integrity_state[process_hash] = metadata
+    
+    # Log the event as new or modified based on whether it existed before
+    is_new = process_hash not in integrity_state
+    event_type = "NEW_PROCESS" if is_new else "PROCESS_UPDATED"
+    
+    # If this process has a new PID but we've seen this hash before, that's interesting
+    old_metadata = integrity_state.get(process_hash)
+    if not is_new and old_metadata and old_metadata.get("pid") != metadata.get("pid"):
+        print(f"[INFO] Process hash {process_hash} now has PID {metadata.get('pid')}, was previously {old_metadata.get('pid')}")
+        
+    # Save the updated process metadata
     save_process_metadata(integrity_state)
-    save_process_hashes(process_hashes)
-
-def save_process_hashes(process_hashes):
-    """Save process hashes to process_hashes.txt."""
-    temp_file = f"{PROCESS_HASHES_FILE}.tmp"
-    try:
-        with open(temp_file, "w") as f:
-            for exe_path, hash_value in process_hashes.items():
-                f.write(f"{exe_path}:{hash_value}\n")
-
-        os.replace(temp_file, PROCESS_HASHES_FILE)
-        os.chmod(PROCESS_HASHES_FILE, 0o600)
-#        print(f"[DEBUG] Successfully wrote process hashes to {PROCESS_HASHES_FILE}")
-
-    except Exception as e:
-        print(f"[ERROR] Failed to write to {PROCESS_HASHES_FILE}: {e}", file=sys.stderr)
+    
+    # Return information about the update for potential logging or alerting
+    return {
+        "event_type": event_type,
+        "process_hash": process_hash,
+        "is_new": is_new,
+        "metadata": metadata
+    }
 
 def stop_daemon():
     """Stop the daemon process cleanly."""
     if os.path.exists(PID_FILE):
-        with open(PID_FILE, "r") as f:
-            pid = int(f.read().strip())
-        print(f"[INFO] Stopping daemon process (PID {pid})...")
-        os.kill(pid, signal.SIGTERM)
-        os.remove(PID_FILE)
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            print(f"[INFO] Stopping daemon process (PID {pid})...")
+            
+            # Try to send SIGTERM first for graceful shutdown
+            os.kill(pid, signal.SIGTERM)
+            
+            # Wait briefly to let the process clean up
+            timeout = 5
+            while timeout > 0 and os.path.exists(f"/proc/{pid}"):
+                time.sleep(0.5)
+                timeout -= 0.5
+            
+            # If process still exists, force kill
+            if os.path.exists(f"/proc/{pid}"):
+                print(f"[WARNING] Process did not terminate gracefully, sending SIGKILL...")
+                os.kill(pid, signal.SIGKILL)
+            
+            # Clean up PID file if it still exists
+            if os.path.exists(PID_FILE):
+                os.remove(PID_FILE)
+                
+            print("[INFO] PIM daemon successfully stopped")
+        except (ValueError, ProcessLookupError) as e:
+            print(f"[WARNING] Process not running or already terminated: {e}")
+            # Clean up stale PID file
+            os.remove(PID_FILE)
+        except Exception as e:
+            print(f"[ERROR] Failed to stop daemon: {e}")
     else:
         print("[ERROR] No PID file found. Is the daemon running?")
 
 def run_monitor():
-    """Run the process monitoring loop and start periodic integrity checks."""
+    """Run the process monitoring loop with comprehensive tracking of all processes."""
     try:
+        # First, ensure all directories and files exist
+        ensure_output_dir()
+        
+        # Write PID file
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
-
-        ensure_output_dir()
-
+        
         # Register cleanup on normal and signal-based exits
         atexit.register(cleanup_and_exit)
         signal.signal(signal.SIGINT, cleanup_and_exit)
         signal.signal(signal.SIGTERM, cleanup_and_exit)
-
+        
+        # Set up logging if in daemon mode
         if "--daemon" in sys.argv:
             sys.stdout = open(LOG_FILE, "a", buffering=1)
             sys.stderr = sys.stdout
-
-#        signal.signal(signal.SIGINT, cleanup_and_exit)
-#        signal.signal(signal.SIGTERM, cleanup_and_exit)
-
-        print("[INFO] Logging all listening processes on startup...")
-        initial_processes = get_listening_processes()
-
-        # ✅ Generate baseline if not present
-        if not os.path.exists(KNOWN_PORTS_FILE):
-            build_known_ports_baseline(initial_processes)
-
-        # ✅ Load existing lineage map or create new one
-        known_lineages = load_known_lineages()
-
-        # ✅ Track and validate lineage for all currently listening processes
-        for pid, info in initial_processes.items():
-            update_process_tracking(info["exe_path"], info["hash"], info)
-            check_lineage_baseline(info, known_lineages)
-
-        print("[INFO] Initial process tracking complete.")
-
-        integrity_thread = threading.Thread(target=rescan_listening_processes, daemon=True)
+        
+        # Check if this is the first run (integrity file doesn't exist or is empty)
+        if not os.path.exists(INTEGRITY_PROCESS_FILE) or os.path.getsize(INTEGRITY_PROCESS_FILE) <= 3:
+            print("[INFO] First run detected - establishing baseline without generating alerts")
+            
+            # Create baseline directly here
+            print("[INFO] Creating initial process baseline...")
+            
+            # Get current processes
+            listening_processes = get_listening_processes()
+            all_processes = get_all_processes()
+            
+            # Merge processes, with listening processes taking precedence
+            merged_processes = all_processes.copy()
+            for process_hash, info in listening_processes.items():
+                merged_processes[process_hash] = info
+            
+            # Log statistics but not events
+            print(f"[INFO] Initial baseline: {len(merged_processes)} total processes, {len(listening_processes)} listening processes")
+            
+            # Write directly to integrity file without using the functions that log events
+            with open(INTEGRITY_PROCESS_FILE, "w") as f:
+                json.dump(merged_processes, f, indent=4)
+            os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
+            
+            print("[INFO] Baseline established. Starting monitoring mode...")
+            # Wait briefly to ensure file is fully written
+            time.sleep(1)
+        else:
+            print("[INFO] Baseline already exists. Starting in monitoring mode.")
+        
+        # Store initial baseline for reference
+        global INITIAL_BASELINE
+        INITIAL_BASELINE = load_process_metadata()
+        
+        # Set flag to use initial baseline
+        use_initial_baseline = True
+        
+        # Start periodic integrity scan in a separate thread with a delay
+        print("[INFO] Waiting for monitoring to initialize before starting integrity scan...")
+        integrity_thread = threading.Thread(target=rescan_all_processes, args=(120, use_initial_baseline), daemon=True)
         integrity_thread.start()
-
-        monitor_listening_processes()  # ⬅ Main monitoring loop
-
+        print("[INFO] Started integrity scan thread")
+        
+        # Run the main monitoring loop with ML baseline establishment phase
+        monitor_processes(first_run=False, use_initial_baseline=use_initial_baseline)
+        
     except Exception as e:
         print(f"[ERROR] PIM encountered an error: {e}")
         traceback.print_exc()
 
+def rescan_all_processes(interval=120, use_initial_baseline=False):
+    """
+    Periodically scans all processes (both listening and non-listening) and performs integrity checks.
+    This replaces the previous rescan_listening_processes function.
+    """
+    # Set first_iteration flag based on use_initial_baseline parameter
+    first_iteration = use_initial_baseline
+    
+    if use_initial_baseline:
+        print("[INFO] Integrity scan using initial baseline - suppressing alerts for first scan")
+        # Wait a longer interval before first scan to ensure monitoring is established
+        time.sleep(interval * 2)
+    
+    while True:
+        try:
+            if first_iteration:
+                print("[PERIODIC SCAN] First run - establishing baseline without generating alerts")
+            else:
+                print("[PERIODIC SCAN] Running integrity check on all processes...")
+
+            # Load current tracking state
+            integrity_state = load_process_metadata()
+            
+            # Get current processes
+            listening_processes = get_listening_processes()
+            all_processes = get_all_processes()
+            
+            # Merge processes, with listening processes taking precedence
+            current_processes = all_processes.copy()
+            for process_hash, info in listening_processes.items():
+                current_processes[process_hash] = info
+            
+            # Only check for dead processes if not in first run mode
+            if not first_iteration:
+                # Check for processes in our tracking that no longer exist
+                terminated_processes = {}
+                for process_hash, stored_info in integrity_state.items():
+                    if process_hash not in current_processes:
+                        terminated_processes[process_hash] = stored_info
+                        log_pim_event(
+                            event_type="PROCESS_TERMINATED",
+                            process_hash=process_hash,
+                            previous_metadata=stored_info,
+                            new_metadata=None
+                        )
+                        remove_process_tracking(process_hash)
+            
+                # Check for modifications in existing processes
+                for process_hash, current_info in current_processes.items():
+                    if process_hash in integrity_state:
+                        stored_info = integrity_state[process_hash]
+                        
+                        # Check for significant metadata changes (ignore pid/ppid changes)
+                        changes = {}
+                        
+                        # Fields to check for significant changes
+                        significant_fields = ["exe_path", "process_name", "port", "user", "cmdline", "is_listening"]
+                        
+                        for field in significant_fields:
+                            stored_value = stored_info.get(field)
+                            current_value = current_info.get(field)
+                            if stored_value != current_value:
+                                changes[field] = {
+                                    "previous": stored_value,
+                                    "current": current_value
+                                }
+                        
+                        # Log changes if any were found
+                        if changes:
+                            log_pim_event(
+                                event_type="PROCESS_MODIFIED",
+                                process_hash=process_hash,
+                                previous_metadata=stored_info,
+                                new_metadata=current_info
+                            )
+                            
+                            # Update the stored metadata
+                            update_process_tracking(process_hash, current_info)
+                    
+                    else:
+                        # New process found during scan that wasn't in our tracking
+                        log_pim_event(
+                            event_type="NEW_UNTRACKED_PROCESS",
+                            process_hash=process_hash,
+                            previous_metadata=None,
+                            new_metadata=current_info
+                        )
+                        
+                        # Add to tracking
+                        update_process_tracking(process_hash, current_info)
+            else:
+                # During first run, just update all processes without alerts
+                for process_hash, info in current_processes.items():
+                    update_process_tracking(process_hash, info)
+            
+            # Clear first_iteration flag after the first run
+            first_iteration = False
+            
+            time.sleep(interval)
+            
+        except Exception as e:
+            print(f"[ERROR] Exception in periodic scan: {e}")
+            traceback.print_exc()
+            time.sleep(interval)  # Still sleep to avoid spinning on errors
+
 def cleanup_and_exit(signum=None, frame=None):
-    """Cleanup tasks before exiting."""
+    """Cleanup tasks before exiting. Updated to reflect our revised approach."""
     try:
+        # Save any pending changes to process integrity state
+        integrity_state = load_process_metadata()
+        if integrity_state:
+            print(f"[INFO] Saving integrity state for {len(integrity_state)} processes")
+            save_process_metadata(integrity_state)
+        
+        # Remove PID file
         if os.path.exists(PID_FILE):
             os.remove(PID_FILE)
             print(f"[INFO] Cleaned up PID file: {PID_FILE}")
+        
+        print("[INFO] PIM shutdown complete")
     except Exception as e:
-        print(f"[ERROR] Failed to remove PID file during cleanup: {e}")
+        print(f"[ERROR] Failed during cleanup: {e}")
 
     # Only call sys.exit if triggered by a signal (i.e., not atexit)
     if signum is not None:
@@ -1479,26 +2026,25 @@ Usage:
   python pim -s or stop    Stop the PIM service if running in background (daemon) mode
   python pim restart       Restart the PIM monitoring service
   python pim -d or daemon  Run PIM in background (daemon) mode
-  python pim help        Show this help message
+  python pim help          Show this help message
 
 Description:
-  The Process Integrity Monitor continuously monitors system processes for:
-    - New or terminated listening processes
-    - Non-standard port use by known binaries
-    - Unexpected changes in process metadata (user, hash, command line, etc.)
-    - Suspicious memory regions (e.g., shellcode injection or anonymous executable pages)
-
-  It uses logging and alerting to flag any anomalies and supports integration with SIEM tools.
+  The Process Integrity Monitor continuously monitors ALL system processes for:
+    - New or terminated processes
+    - Process modifications (user, command line, etc.)
+    - Suspicious memory regions (e.g., shellcode injection)
+    - Anomalous behavior using machine learning
+    - Classification of suspicious activity using MITRE ATT&CK framework
 
 Note:
-  Use the `-d` option to run PIM in background mode (daemon). This is recommended for long-term monitoring.
+  Use the `-d` option to run PIM in background mode (daemon).
+  This is recommended for long-term monitoring.
 """
     print(help_text.strip())
 
 if __name__ == "__main__":
     ensure_output_dir()
-    ensure_file_monitor_json()
-
+    
     parser = argparse.ArgumentParser(description="Process Integrity Monitor (PIM)", add_help=False)
     parser.add_argument("-d", "--daemon", action="store_true", help="Run PIM in daemon mode")
     parser.add_argument("-s", "--stop", action="store_true", help="Stop PIM daemon")
@@ -1515,7 +2061,7 @@ if __name__ == "__main__":
         stop_daemon()
 
     elif args.daemon or cmd == "daemon":
-        print("[INFO] Running PIM in daemon mode...")
+        print("[INFO] Running PIM in daemon mode with comprehensive process monitoring...")
         try:
             with daemon.DaemonContext(
                 working_directory=os.getcwd(),
@@ -1532,7 +2078,7 @@ if __name__ == "__main__":
     elif cmd == "restart":
         stop_daemon()
         time.sleep(1)
-        print("[INFO] Restarting PIM in daemon mode...")
+        print("[INFO] Restarting PIM in daemon mode with comprehensive process monitoring...")
         try:
             with daemon.DaemonContext(
                 working_directory=os.getcwd(),
@@ -1547,5 +2093,5 @@ if __name__ == "__main__":
             traceback.print_exc()
 
     else:
-        print("[INFO] Running PIM in foreground mode...")
+        print("[INFO] Running PIM in foreground mode with comprehensive process monitoring...")
         run_monitor()
