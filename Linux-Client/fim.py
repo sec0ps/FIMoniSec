@@ -65,7 +65,7 @@ class EventHandler(pyinotify.ProcessEvent):
     """Event handler for file system changes."""
 
     def process_IN_CREATE(self, event):
-        """Handles file creation."""
+        """Handles file creation with enhanced detection for moved files."""
         global is_baseline_mode, integrity_state, exclusions
         
         full_path = event.pathname
@@ -76,23 +76,45 @@ class EventHandler(pyinotify.ProcessEvent):
             
         file_hash = get_file_hash(full_path)
         metadata = get_file_metadata(full_path)
-
+    
         if file_hash and metadata:
             # Add hash to metadata
             metadata["hash"] = file_hash
             
-            # Only log events if not in baseline mode
-            if not is_baseline_mode:
-                log_event(
-                    event_type="NEW FILE",
-                    file_path=full_path,
-                    previous_metadata=None,
-                    new_metadata=metadata,
-                    previous_hash=None,
-                    new_hash=file_hash
-                )
-
-            update_file_tracking(full_path, file_hash, metadata)
+            # Check if this might be a moved file rather than a new file
+            moved_from = detect_moved_file(file_hash, metadata, full_path)
+            
+            if moved_from:
+                # This is likely a moved file
+                if not is_baseline_mode:
+                    prev_metadata = integrity_state.get(moved_from)
+                    log_event(
+                        event_type="MOVED",
+                        file_path=full_path,
+                        previous_metadata=prev_metadata,
+                        new_metadata=metadata,
+                        previous_hash=file_hash,
+                        new_hash=file_hash,
+                        old_path=moved_from
+                    )
+                
+                # Remove the old file entry
+                remove_file_tracking(moved_from)
+                # Add the new file entry
+                update_file_tracking(full_path, file_hash, metadata)
+            else:
+                # Only log events if not in baseline mode
+                if not is_baseline_mode:
+                    log_event(
+                        event_type="NEW FILE",
+                        file_path=full_path,
+                        previous_metadata=None,
+                        new_metadata=metadata,
+                        previous_hash=None,
+                        new_hash=file_hash
+                    )
+    
+                update_file_tracking(full_path, file_hash, metadata)
 
     def process_IN_DELETE(self, event):
         """Handles file deletion."""
@@ -182,7 +204,7 @@ class EventHandler(pyinotify.ProcessEvent):
                 )
 
             update_file_tracking(full_path, file_hash, metadata)
-
+    
 ######################################################################################
 
 def load_config():
@@ -209,7 +231,7 @@ def load_config():
             create_default_config()  # Create default config if JSON is invalid
             return load_config()  # Reload the default config
             
-def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None, changes=None):
+def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None, changes=None, old_path=None):
     """Log file change events with exact details of what changed."""
     global integrity_state, is_baseline_mode
     
@@ -229,6 +251,10 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
         "file_path": file_path,
         "mitre_mapping": mitre_mapping
     }
+    
+    # Add original path for moved files
+    if event_type == "MOVED" and old_path:
+        log_entry["old_path"] = old_path
     
     # Add hash information if available
     if previous_hash:
@@ -267,6 +293,8 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
         print(f"[MODIFIED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
     elif event_type == "METADATA_CHANGED":
         print(f"[METADATA] {file_path}{changes_text} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+    elif event_type == "MOVED":
+        print(f"[MOVED] {old_path} -> {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
     
     return log_entry
 
@@ -666,7 +694,7 @@ def update_file_tracking(file_path, file_hash, metadata):
     save_integrity_state(integrity_state)
 
 def scan_files(scheduled_directories, scan_interval, exclusions):
-    """Perform periodic file integrity scans."""
+    """Perform periodic file integrity scans with enhanced move detection."""
     print("[INFO] Periodic scanning started...")
     integrity_state = load_integrity_state()
 
@@ -674,88 +702,114 @@ def scan_files(scheduled_directories, scan_interval, exclusions):
         start_time = time.time()
         changes_detected = 0
         
+        # First pass: collect all current files
+        current_files = {}
         for directory in scheduled_directories:
             if directory not in exclusions.get("directories", []):
                 for filepath in Path(directory).rglob("*"):
                     if filepath.is_file() and not should_exclude_file(filepath, exclusions):
-                        file_hash = get_file_hash(filepath)
+                        str_filepath = str(filepath)
                         metadata = get_file_metadata(filepath)
-
+                        file_hash = get_file_hash(filepath)
+                        
                         if file_hash and metadata:
-                            str_filepath = str(filepath)
-                            previous_metadata = integrity_state.get(str_filepath)
-                            previous_hash = previous_metadata.get("hash") if previous_metadata else None
-
-                            # Skip if both hash and metadata are unchanged
-                            if previous_hash == file_hash and previous_metadata and \
-                               all(previous_metadata.get(k) == metadata.get(k) for k in metadata.keys() if k != "hash"):
-                                continue  # No changes, move to next file
-
-                            # Add hash to metadata
+                            # Store metadata and hash for later processing
                             metadata["hash"] = file_hash
-                            
-                            # Detect if this is a new file or a modified one
-                            if not previous_metadata:
-                                log_event(
-                                    event_type="NEW FILE",
-                                    file_path=str_filepath,
-                                    previous_metadata=None,
-                                    new_metadata=metadata,
-                                    previous_hash=None,
-                                    new_hash=file_hash
-                                )
-                                changes_detected += 1
-                            else:
-                                # Check for metadata changes
-                                metadata_changes = compare_metadata(previous_metadata, metadata)
-                                if metadata_changes:
-                                    log_event(
-                                        event_type="METADATA_CHANGED",
-                                        file_path=str_filepath,
-                                        previous_metadata=previous_metadata,
-                                        new_metadata=metadata,
-                                        changes=metadata_changes
-                                    )
-                                    changes_detected += 1
-                                
-                                # Check for content changes (if metadata changes weren't detected)
-                                elif previous_hash != file_hash:
-                                    log_event(
-                                        event_type="MODIFIED",
-                                        file_path=str_filepath,
-                                        previous_metadata=previous_metadata,
-                                        new_metadata=metadata,
-                                        previous_hash=previous_hash,
-                                        new_hash=file_hash
-                                    )
-                                    changes_detected += 1
+                            current_files[str_filepath] = (file_hash, metadata)
+        
+        # Second pass: process changes including moves
+        for str_filepath, (file_hash, metadata) in current_files.items():
+            previous_metadata = integrity_state.get(str_filepath)
+            previous_hash = previous_metadata.get("hash") if previous_metadata else None
 
-                            integrity_state[str_filepath] = metadata
+            # Skip if both hash and metadata are unchanged
+            if previous_hash == file_hash and previous_metadata and \
+               all(previous_metadata.get(k) == metadata.get(k) for k in metadata.keys() if k != "hash"):
+                continue  # No changes, move to next file
+
+            # Check if this is a new file
+            if not previous_metadata:
+                # Check if it might be a moved file
+                moved_from = detect_moved_file(file_hash, metadata, str_filepath)
+                
+                if moved_from:
+                    # This is likely a moved file
+                    prev_metadata = integrity_state.get(moved_from)
+                    log_event(
+                        event_type="MOVED",
+                        file_path=str_filepath,
+                        previous_metadata=prev_metadata,
+                        new_metadata=metadata,
+                        previous_hash=file_hash,
+                        new_hash=file_hash,
+                        old_path=moved_from
+                    )
+                    
+                    # Remove the old file entry
+                    integrity_state.pop(moved_from, None)
+                    changes_detected += 1
+                else:
+                    # Genuinely new file
+                    log_event(
+                        event_type="NEW FILE",
+                        file_path=str_filepath,
+                        previous_metadata=None,
+                        new_metadata=metadata,
+                        previous_hash=None,
+                        new_hash=file_hash
+                    )
+                    changes_detected += 1
+            else:
+                # Check for metadata changes
+                metadata_changes = compare_metadata(previous_metadata, metadata)
+                if metadata_changes:
+                    log_event(
+                        event_type="METADATA_CHANGED",
+                        file_path=str_filepath,
+                        previous_metadata=previous_metadata,
+                        new_metadata=metadata,
+                        changes=metadata_changes
+                    )
+                    changes_detected += 1
+                
+                # Check for content changes (if metadata changes weren't detected)
+                elif previous_hash != file_hash:
+                    log_event(
+                        event_type="MODIFIED",
+                        file_path=str_filepath,
+                        previous_metadata=previous_metadata,
+                        new_metadata=metadata,
+                        previous_hash=previous_hash,
+                        new_hash=file_hash
+                    )
+                    changes_detected += 1
+
+            # Update integrity state with current info
+            integrity_state[str_filepath] = metadata
 
         # Check for deleted files
-        existing_files = []
-        for directory in scheduled_directories:
-            if directory not in exclusions.get("directories", []):
-                for filepath in Path(directory).rglob("*"):
-                    if filepath.is_file():
-                        existing_files.append(str(filepath))
+        existing_files = set(current_files.keys())
+        deleted_files = set(integrity_state.keys()) - existing_files
         
-        deleted_files = set(integrity_state.keys()) - set(existing_files)
         for deleted_file in deleted_files:
             previous_metadata = integrity_state.get(deleted_file)
             previous_hash = previous_metadata.get("hash") if previous_metadata else None
             
-            log_event(
-                event_type="DELETED",
-                file_path=deleted_file,
-                previous_metadata=integrity_state.get(deleted_file, None),
-                new_metadata=None,
-                previous_hash=previous_hash,
-                new_hash=None
-            )
-            integrity_state.pop(deleted_file, None)
-            changes_detected += 1
+            # Check if this file was part of a move operation
+            # If it was, it would have been removed from integrity_state already
+            if deleted_file in integrity_state:
+                log_event(
+                    event_type="DELETED",
+                    file_path=deleted_file,
+                    previous_metadata=integrity_state.get(deleted_file, None),
+                    new_metadata=None,
+                    previous_hash=previous_hash,
+                    new_hash=None
+                )
+                integrity_state.pop(deleted_file, None)
+                changes_detected += 1
 
+        # Save the updated integrity state
         save_integrity_state(integrity_state)
 
         # Report scan results
@@ -800,6 +854,34 @@ def should_exclude_file(file_path, exclusions):
             pass  # If we can't check size, don't exclude
     
     return False
+
+def detect_moved_file(file_hash, metadata, new_path):
+    """Detect if a file was moved by comparing hash and inode with existing tracked files."""
+    global integrity_state
+    
+    # Files with the same hash and inode are likely the same file that was moved
+    current_inode = metadata.get("inode")
+    
+    for path, file_data in integrity_state.items():
+        # Skip the current file
+        if path == new_path:
+            continue
+            
+        # Check if hash matches
+        if file_data.get("hash") == file_hash:
+            # If the inode also matches, this is very likely a moved file
+            if file_data.get("inode") == current_inode:
+                return path
+            
+            # If only hash matches but file size is the same, it might be a copy
+            # This is a weaker indication but still useful
+            if file_data.get("size") == metadata.get("size"):
+                # Check if the original file still exists
+                if not os.path.exists(path):
+                    return path
+    
+    # No match found
+    return None
 
 def correlate_with_processes(file_path, event_type):
     """Correlate file changes with process activity."""
@@ -1021,6 +1103,12 @@ def get_mitre_mapping(event_type, file_path, changes=None):
             "technique_name": "File and Directory Permissions Modification",
             "tactic": "Defense Evasion",
             "description": "Adversary modified file attributes which could indicate permission changes"
+        },
+        "MOVED": {
+            "technique_id": "T1036",
+            "technique_name": "Masquerading",
+            "tactic": "Defense Evasion",
+            "description": "Adversary moved file to a different location, potentially to hide malicious activity or evade detection"
         }
     }
     
@@ -1109,6 +1197,38 @@ def get_mitre_mapping(event_type, file_path, changes=None):
                 "technique_name": "Hijack Execution Flow: Dynamic Linker Hijacking",
                 "tactic": "Persistence",
                 "description": "Adversary placed binary in temporary directory for execution hijacking"
+            }
+    
+    # Context-specific mappings for moved files
+    if event_type == "MOVED":
+        # Moving files to/from sensitive locations
+        if "/etc/" in file_path:
+            return {
+                "technique_id": "T1036.005",
+                "technique_name": "Masquerading: Match Legitimate Name or Location",
+                "tactic": "Defense Evasion",
+                "description": "Adversary moved file to a system configuration directory to appear legitimate"
+            }
+        if "/bin/" in file_path or "/sbin/" in file_path or "/usr/bin/" in file_path:
+            return {
+                "technique_id": "T1036.003",
+                "technique_name": "Masquerading: Rename System Utilities",
+                "tactic": "Defense Evasion",
+                "description": "Adversary moved file to a system binary location, potentially masquerading as legitimate tool"
+            }
+        if "/tmp/" in file_path or "/var/tmp/" in file_path:
+            return {
+                "technique_id": "T1074.001",
+                "technique_name": "Data Staged: Local Data Staging",
+                "tactic": "Collection",
+                "description": "Adversary moved file to a temporary location, potentially staging for exfiltration"
+            }
+        if "/.ssh/" in file_path:
+            return {
+                "technique_id": "T1098",
+                "technique_name": "Account Manipulation",
+                "tactic": "Persistence",
+                "description": "Adversary moved file to SSH directory, potentially for persistence via SSH keys"
             }
 
     # Provide generic mapping if no specific context match
