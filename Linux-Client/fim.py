@@ -42,38 +42,16 @@ import subprocess
 import stat
 import shutil
 import pyinotify
-import audit
 import psutil
-import time
-import joblib
-from collections import defaultdict, Counter, deque
+from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from daemon import DaemonContext
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-from sklearn.ensemble import IsolationForest, RandomForestClassifier
-from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import StandardScaler
-
-ML_LIBRARIES_AVAILABLE = True
-try:
-    # Try a simple operation to verify ML libraries work
-    test_array = np.array([1, 2, 3])
-    test_model = IsolationForest(n_estimators=10)
-except Exception:
-    ML_LIBRARIES_AVAILABLE = False
-
-ml_model_info = None
-context_detection = None
+is_baseline_mode = False
 adv_content_analysis = None
 exclusions = {}
-
-def get_base_dir():
-    """Get the base directory for the application based on script location"""
-    return os.path.dirname(os.path.abspath(__file__))
 
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
 CONFIG_FILE = os.path.join(BASE_DIR, "fim.config")
@@ -81,8 +59,131 @@ LOG_DIR = os.path.join(BASE_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "file_monitor.json")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 PID_FILE = os.path.join(OUTPUT_DIR, "fim.pid")
-HASH_FILE = os.path.join(OUTPUT_DIR, "file_hashes.txt")
 INTEGRITY_STATE_FILE = os.path.join(OUTPUT_DIR, "integrity_state.json")
+
+class EventHandler(pyinotify.ProcessEvent):
+    """Event handler for file system changes."""
+
+    def process_IN_CREATE(self, event):
+        """Handles file creation."""
+        global is_baseline_mode, integrity_state, exclusions
+        
+        full_path = event.pathname
+        
+        # Skip directories and excluded files
+        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
+            return
+            
+        file_hash = get_file_hash(full_path)
+        metadata = get_file_metadata(full_path)
+
+        if file_hash and metadata:
+            # Add hash to metadata
+            metadata["hash"] = file_hash
+            
+            # Only log events if not in baseline mode
+            if not is_baseline_mode:
+                log_event(
+                    event_type="NEW FILE",
+                    file_path=full_path,
+                    previous_metadata=None,
+                    new_metadata=metadata,
+                    previous_hash=None,
+                    new_hash=file_hash
+                )
+
+            update_file_tracking(full_path, file_hash, metadata)
+
+    def process_IN_DELETE(self, event):
+        """Handles file deletion."""
+        global is_baseline_mode, integrity_state, exclusions
+        
+        full_path = event.pathname
+        
+        # Skip excluded files
+        if should_exclude_file(full_path, exclusions):
+            return
+            
+        previous_metadata = integrity_state.get(full_path, None)
+        previous_hash = previous_metadata.get("hash") if previous_metadata else None
+
+        if previous_metadata:  # Only log if we were tracking this file
+            if not is_baseline_mode:
+                log_event(
+                    event_type="DELETED",
+                    file_path=full_path,
+                    previous_metadata=previous_metadata,
+                    new_metadata=None,
+                    previous_hash=previous_hash,
+                    new_hash=None
+                )
+
+            remove_file_tracking(full_path)
+
+    def process_IN_ATTRIB(self, event):
+        """Handles metadata changes like permission, ownership, and size updates."""
+        global is_baseline_mode, integrity_state, exclusions
+        
+        full_path = event.pathname
+        
+        # Skip directories and excluded files
+        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
+            return
+            
+        metadata = get_file_metadata(full_path)
+        previous_metadata = integrity_state.get(full_path)
+
+        if metadata and previous_metadata:
+            changes = compare_metadata(previous_metadata, metadata)
+
+            if changes:
+                # Preserve the hash in the metadata
+                file_hash = previous_metadata.get("hash")
+                metadata["hash"] = file_hash
+                
+                if not is_baseline_mode:
+                    log_event(
+                        event_type="METADATA_CHANGED",
+                        file_path=full_path,
+                        previous_metadata=previous_metadata,
+                        new_metadata=metadata,
+                        changes=changes
+                    )
+
+                update_file_tracking(full_path, file_hash, metadata)
+
+    def process_IN_MODIFY(self, event):
+        """Handles file modifications."""
+        global is_baseline_mode, integrity_state, exclusions
+        
+        full_path = event.pathname
+        
+        # Skip directories and excluded files
+        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
+            return
+            
+        file_hash = get_file_hash(full_path)
+        metadata = get_file_metadata(full_path)
+        previous_metadata = integrity_state.get(full_path)
+        previous_hash = previous_metadata.get("hash") if previous_metadata else None
+
+        if file_hash and previous_hash and file_hash != previous_hash:
+            # Add hash to metadata
+            metadata["hash"] = file_hash
+            
+            if not is_baseline_mode:
+                log_event(
+                    event_type="MODIFIED",
+                    file_path=full_path,
+                    previous_metadata=previous_metadata,
+                    new_metadata=metadata,
+                    previous_hash=previous_hash,
+                    new_hash=file_hash
+                )
+
+            update_file_tracking(full_path, file_hash, metadata)
+
+######################################################################################
 
 def load_config():
     """Load configuration settings from fim.config file."""
@@ -110,134 +211,66 @@ def load_config():
             
 def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None, changes=None):
     """Log file change events with exact details of what changed."""
-    global ml_model_info, context_detection, adv_content_analysis
+    global integrity_state, is_baseline_mode
     
-    # Correlate with process information if available
-    process_correlation = correlate_with_processes(file_path, event_type)
+    print(f"[DEBUG] log_event called for {event_type} on {file_path}")
+    
+    # Skip alerts during baseline mode
+    if is_baseline_mode:
+        return None
     
     # Get MITRE ATT&CK mapping
     mitre_mapping = get_mitre_mapping(event_type, file_path, changes)
     
-    # Create base log entry
+    # Create simplified log entry
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "event_type": event_type,
         "file_path": file_path,
-        "previous_metadata": previous_metadata if previous_metadata else "N/A",
-        "new_metadata": new_metadata if new_metadata else "N/A",
-        "changes": changes if changes else "N/A",
-        "previous_hash": previous_hash if previous_hash else "N/A",
-        "new_hash": new_hash if new_hash else "N/A",
-        "process_correlation": process_correlation if process_correlation else "N/A",
         "mitre_mapping": mitre_mapping
     }
     
-    # Perform advanced content analysis for file modifications and new files
-    if adv_content_analysis and os.path.exists(file_path) and event_type in ["MODIFIED", "NEW FILE"]:
-        try:
-            # Analyze file content changes
-            content_analysis = adv_content_analysis.analyze_file_changes(file_path, previous_hash, new_hash)
-            if content_analysis and "error" not in content_analysis:
-                log_entry["content_analysis"] = content_analysis
-                
-                # Check for malware indicators in high-risk changes
-                if (content_analysis.get("diff", {}).get("significant_change", False) or 
-                    content_analysis.get("type_specific", {}).get("criticality", "low") in ["medium", "high"]):
-                    
-                    malware_check = adv_content_analysis.check_malware_indicators(file_path, new_hash)
-                    if malware_check and "error" not in malware_check:
-                        log_entry["malware_indicators"] = malware_check
-                        
-                        # Alert on high entropy or suspicious strings
-                        if malware_check.get("high_entropy", False) or malware_check.get("strings_analysis"):
-                            print(f"[ALERT] Potential malicious content detected in: {file_path}")
-                            if malware_check.get("high_entropy", False):
-                                print(f"[ALERT] High entropy detected (Score: {malware_check.get('entropy', 0):.2f})")
-                            
-                            if malware_check.get("strings_analysis"):
-                                print("[ALERT] Suspicious strings detected:")
-                                for category, items in malware_check.get("strings_analysis", {}).items():
-                                    if items:
-                                        print(f"  - {category}: {items[0]}" + (f" and {len(items)-1} more" if len(items) > 1 else ""))
-                
-                # Alert on critical changes based on file type
-                if content_analysis.get("type_specific", {}).get("criticality") == "high":
-                    print(f"[ALERT] Critical changes detected in: {file_path}")
-                    file_type = content_analysis.get("file_type", "unknown")
-                    
-                    if file_type == "config":
-                        changes = content_analysis.get("type_specific", {}).get("changes", {})
-                        print(f"[ALERT] Critical configuration changes: {len(changes.get('added', {}))} added, {len(changes.get('removed', {}))} removed, {len(changes.get('modified', {}))} modified")
-                    
-                    elif file_type == "script":
-                        suspicious = content_analysis.get("type_specific", {}).get("suspicious_patterns", {})
-                        if suspicious:
-                            print("[ALERT] Suspicious script patterns detected:")
-                            for category, items in suspicious.items():
-                                if items:
-                                    print(f"  - {category}: {items[0]}" + (f" and {len(items)-1} more" if len(items) > 1 else ""))
-                    
-                    # Print associated MITRE technique for context
-                    if mitre_mapping:
-                        print(f"[MITRE ATT&CK] {mitre_mapping.get('technique_id', 'N/A')} ({mitre_mapping.get('technique_name', 'N/A')}): {mitre_mapping.get('description', 'N/A')}")
-        
-        except Exception as e:
-            print(f"[WARNING] Advanced content analysis failed: {e}")
-
-    # Check for anomalies if ML model is available
-    if ml_model_info:
-        anomaly_result = detect_file_anomalies(log_entry, ml_model_info)
-        if anomaly_result:
-            log_entry["anomaly_detection"] = anomaly_result
-            print(f"[ALERT] Anomalous file activity detected: {file_path} (Score: {anomaly_result['anomaly_score']:.4f})")
-            
-            # Print MITRE info for context
-            if mitre_mapping and "technique_id" in mitre_mapping:
-                print(f"[MITRE ATT&CK] {mitre_mapping['technique_id']} ({mitre_mapping['technique_name']}): {mitre_mapping['description']}")
-                
-            # Print process correlation for context
-            if process_correlation:
-                proc = process_correlation.get("related_process", {})
-                print(f"[PROCESS CORRELATION] Likely modified by PID {proc.get('pid')} ({proc.get('process_name')}): {proc.get('cmdline')}")
+    # Add hash information if available
+    if previous_hash:
+        log_entry["previous_hash"] = previous_hash
+    if new_hash:
+        log_entry["new_hash"] = new_hash
     
-    # Add context-aware detection analysis
-    if context_detection:
-        try:
-            # Calculate risk score
-            risk_analysis = context_detection.calculate_risk_score(log_entry)
-            log_entry["risk_analysis"] = risk_analysis
-            
-            # Look for attack chains
-            attack_patterns = context_detection.correlate_attack_chain(log_entry)
-            if attack_patterns:
-                log_entry["attack_patterns"] = attack_patterns
-                
-                # Alert on high-severity attack patterns
-                for pattern in attack_patterns:
-                    print(f"[ATTACK CHAIN DETECTED] {pattern['pattern']} (Severity: {pattern['severity']})")
-                    print(f"[ATTACK CHAIN DETECTED] Matched techniques: {', '.join(pattern['matched_techniques'])}")
-            
-            # Alert on high-risk events
-            if risk_analysis.get("is_alert", False):
-                print(f"[HIGH RISK EVENT] Risk score: {risk_analysis['score']:.2f} - {file_path}")
-                for component, value in risk_analysis.get("components", {}).items():
-                    print(f"  - {component}: {value}")
-        except Exception as e:
-            print(f"[WARNING] Context-aware detection failed: {e}")
-
+    # Add metadata changes if available
+    if changes:
+        log_entry["changes"] = changes
+    
     # Write to log file
     with open(LOG_FILE, "a") as log:
         log.write(json.dumps(log_entry, indent=4) + "\n")
-
-    # Send logs to SIEM (if configured)
-    audit.send_to_siem(log_entry)
     
-    if should_alert(log_entry):
-        trigger_alert(log_entry)
+    # Print simplified alert
+    mitre_id = mitre_mapping.get("technique_id", "Unknown")
+    mitre_name = mitre_mapping.get("technique_name", "Unknown")
+    mitre_tactic = mitre_mapping.get("tactic", "Unknown")
+    
+    # Format changes text
+    changes_text = ""
+    if event_type == "METADATA_CHANGED" and changes:
+        change_items = []
+        for change_type, details in changes.items():
+            change_items.append(change_type)
+        if change_items:
+            changes_text = f" ({', '.join(change_items)})"
+    
+    # Print a single line alert based on event type
+    if event_type == "NEW FILE":
+        print(f"[NEW FILE] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+    elif event_type == "DELETED":
+        print(f"[DELETED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+    elif event_type == "MODIFIED":
+        print(f"[MODIFIED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+    elif event_type == "METADATA_CHANGED":
+        print(f"[METADATA] {file_path}{changes_text} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
     
     return log_entry
 
-def process_file(filepath, file_hashes, integrity_state):
+def process_file(filepath, integrity_state):
     """Process a single file for hashing and metadata tracking."""
     str_filepath = str(filepath)
     metadata = get_file_metadata(filepath)
@@ -252,15 +285,25 @@ def process_file(filepath, file_hashes, integrity_state):
     if not prev_metadata or metadata["last_modified"] != prev_metadata["last_modified"]:
         file_hash = get_file_hash(filepath)  # Compute new hash
     else:
-        file_hash = file_hashes.get(str_filepath)  # Reuse existing hash
+        file_hash = prev_metadata.get("hash")  # Reuse existing hash
 
     if file_hash:
+        # Include the hash in the metadata
+        metadata["hash"] = file_hash
         return str_filepath, file_hash, metadata
     return None
 
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions, config=None):
     """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
-    file_hashes = load_file_hashes()
+    global is_baseline_mode  # Add global declaration here
+    
+    # Check if this is an initial baseline
+    is_initial_baseline = not os.path.exists(INTEGRITY_STATE_FILE) or os.path.getsize(INTEGRITY_STATE_FILE) <= 2  # {} is 2 bytes
+    
+    if is_initial_baseline:
+        print("[INFO] Performing initial baseline - alerts will be suppressed during this process")
+        is_baseline_mode = True  # Set the global variable
+    
     integrity_state = load_integrity_state()
 
     # Performance optimization: Dynamic thread pool sizing
@@ -276,12 +319,7 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
 
     print(f"[INFO] Using {worker_count} worker threads for file processing")
 
-    new_file_hashes = file_hashes.copy()
     new_integrity_state = integrity_state.copy()
-
-    excluded_dirs = set(exclusions.get("directories", []))
-    excluded_files = set(exclusions.get("files", []))
-
     existing_files = set()
     all_files = []
 
@@ -289,7 +327,7 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     
     # Build file list with enhanced exclusion logic
     for directory in scheduled_directories + real_time_directories:
-        if directory in excluded_dirs:
+        if directory in exclusions.get("directories", []):
             continue
         for filepath in Path(directory).rglob("*"):
             if filepath.is_file() and not should_exclude_file(filepath, exclusions):
@@ -299,72 +337,90 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     print(f"[INFO] Found {file_count} files to process")
     
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        results = executor.map(lambda fp: process_file(fp, file_hashes, integrity_state), all_files)
+        results = executor.map(lambda fp: process_file(fp, integrity_state), all_files)
 
+    changes_detected = 0
+    
     for result in results:
         if result:
             str_filepath, file_hash, metadata = result
             existing_files.add(str_filepath)
 
-            previous_hash = file_hashes.get(str_filepath)
             previous_metadata = integrity_state.get(str_filepath)
+            previous_hash = previous_metadata.get("hash") if previous_metadata else None
 
-            if str_filepath in file_hashes:
+            if str_filepath in integrity_state:
                 # Detect Metadata Changes Separately
                 metadata_changes = compare_metadata(previous_metadata, metadata)
                 if metadata_changes:
-                    log_event(
-                        event_type="METADATA_CHANGED",
-                        file_path=str_filepath,
-                        previous_metadata=previous_metadata,
-                        new_metadata=metadata,
-                        changes=metadata_changes
-                    )
+                    # Only log during non-baseline operations
+                    if not is_initial_baseline:
+                        log_event(
+                            event_type="METADATA_CHANGED",
+                            file_path=str_filepath,
+                            previous_metadata=previous_metadata,
+                            new_metadata=metadata,
+                            changes=metadata_changes
+                        )
+                    changes_detected += 1
 
                 # Detect Content Changes (Hash Differences)
                 if previous_hash != file_hash:
-                    log_event(
-                        event_type="MODIFIED",
-                        file_path=str_filepath,
-                        previous_metadata=previous_metadata,
-                        new_metadata=metadata,
-                        previous_hash=previous_hash,
-                        new_hash=file_hash
-                    )
+                    # Only log during non-baseline operations
+                    if not is_initial_baseline:
+                        log_event(
+                            event_type="MODIFIED",
+                            file_path=str_filepath,
+                            previous_metadata=previous_metadata,
+                            new_metadata=metadata,
+                            previous_hash=previous_hash,
+                            new_hash=file_hash
+                        )
+                    changes_detected += 1
 
             else:
-                log_event(
-                    event_type="NEW FILE",
-                    file_path=str_filepath,
-                    previous_metadata=None,
-                    new_metadata=metadata,
-                    previous_hash=None,
-                    new_hash=file_hash
-                )
+                # Only log during non-baseline operations
+                if not is_initial_baseline:
+                    log_event(
+                        event_type="NEW FILE",
+                        file_path=str_filepath,
+                        previous_metadata=None,
+                        new_metadata=metadata,
+                        previous_hash=None,
+                        new_hash=file_hash
+                    )
+                changes_detected += 1
 
-            new_file_hashes[str_filepath] = file_hash
             new_integrity_state[str_filepath] = metadata
 
-    # Detect deleted files
-    deleted_files = set(file_hashes.keys()) - existing_files
-    for deleted_file in deleted_files:
-        log_event(
-            event_type="DELETED",
-            file_path=deleted_file,
-            previous_metadata=integrity_state.get(deleted_file, None),
-            new_metadata=None,
-            previous_hash=file_hashes.get(deleted_file, None),
-            new_hash=None
-        )
-        new_file_hashes.pop(deleted_file, None)
-        new_integrity_state.pop(deleted_file, None)
+    # Detect deleted files (but not during initial baseline)
+    if not is_initial_baseline:
+        deleted_files = set(integrity_state.keys()) - existing_files
+        for deleted_file in deleted_files:
+            previous_metadata = integrity_state.get(deleted_file)
+            previous_hash = previous_metadata.get("hash") if previous_metadata else None
+            
+            log_event(
+                event_type="DELETED",
+                file_path=deleted_file,
+                previous_metadata=integrity_state.get(deleted_file, None),
+                new_metadata=None,
+                previous_hash=previous_hash,
+                new_hash=None
+            )
+            new_integrity_state.pop(deleted_file, None)
+            changes_detected += 1
 
-    save_file_hashes(new_file_hashes)
     save_integrity_state(new_integrity_state)
 
     # Add execution stats
     end_time = time.time()
     duration = end_time - start_time
+    
+    if is_initial_baseline:
+        print(f"[INFO] Initial baseline completed in {duration:.2f} seconds. Added {changes_detected} files to integrity state.")
+    else:
+        print(f"[INFO] Scan completed in {duration:.2f} seconds. Detected {changes_detected} changes.")
 
 def compare_metadata(prev_metadata, new_metadata):
     """Compare metadata and categorize changes into specific types."""
@@ -415,32 +471,6 @@ def get_file_hash(filepath, chunk_size=65536):
         return hash_sha256.hexdigest()
     except Exception:
         return None  # File may have been deleted before reading
-
-def load_file_hashes():
-    """Load previously stored file hashes."""
-    if os.path.exists(HASH_FILE):
-        with open(HASH_FILE, "r") as f:
-            return dict(line.strip().split(":") for line in f if ":" in line)
-    return {}
-
-def save_file_hashes(file_hashes):
-    """Save updated file hashes to file, keeping a backup of the old file."""
-    temp_hash_file = f"{HASH_FILE}.tmp"
-
-    # ✅ Write new hashes to a temporary file first
-    with open(temp_hash_file, "w") as f:
-        for file, file_hash in file_hashes.items():
-            f.write(f"{file}:{file_hash}\n")
-
-    # ✅ Only create a backup if the current file exists and is not empty
-    if os.path.exists(HASH_FILE) and os.stat(HASH_FILE).st_size > 0:
-        shutil.copy(HASH_FILE, f"{HASH_FILE}_old")  # ✅ Preserve previous state instead of moving
-
-    # ✅ Now, safely replace the existing file with the new version
-    shutil.copy(temp_hash_file, HASH_FILE)
-
-    # ✅ Explicitly set file permissions
-    os.chmod(HASH_FILE, 0o600)
 
 def load_integrity_state():
     """Load previous integrity state from the integrity_state.json file with error handling."""
@@ -583,111 +613,11 @@ def get_file_metadata(filepath):
     except Exception:
         return None
 
-class EventHandler(pyinotify.ProcessEvent):
-    """Enhanced event handler that includes process correlation, MITRE mapping, and anomaly detection."""
-
-    def process_IN_CREATE(self, event):
-        """Handles file creation."""
-        full_path = event.pathname
-        
-        # Skip directories and excluded files
-        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
-            return
-            
-        file_hash = get_file_hash(full_path)
-        metadata = get_file_metadata(full_path)
-
-        if file_hash and metadata:
-            log_event(
-                event_type="NEW FILE",
-                file_path=full_path,
-                previous_metadata=None,
-                new_metadata=metadata,
-                previous_hash=None,
-                new_hash=file_hash
-            )
-
-            update_file_tracking(full_path, file_hash, metadata)
-
-    def process_IN_DELETE(self, event):
-        """Handles file deletion. Avoid logging if the file was moved."""
-        full_path = event.pathname
-        
-        # Skip excluded files
-        if should_exclude_file(full_path, exclusions):
-            return
-            
-        previous_metadata = integrity_state.get(full_path, None)
-        previous_hash = file_hashes.get(full_path, None)
-
-        if previous_hash or previous_metadata:  # Only log if we were tracking this file
-            log_event(
-                event_type="DELETED",
-                file_path=full_path,
-                previous_metadata=previous_metadata,
-                new_metadata=None,
-                previous_hash=previous_hash,
-                new_hash=None
-            )
-
-            remove_file_tracking(full_path)
-
-    def process_IN_ATTRIB(self, event):
-        """Handles metadata changes like permission, ownership, and size updates."""
-        full_path = event.pathname
-        
-        # Skip directories and excluded files
-        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
-            return
-            
-        metadata = get_file_metadata(full_path)
-        previous_metadata = integrity_state.get(full_path)
-
-        if metadata and previous_metadata:
-            changes = compare_metadata(previous_metadata, metadata)
-
-            if changes:
-                log_event(
-                    event_type="METADATA_CHANGED",
-                    file_path=full_path,
-                    previous_metadata=previous_metadata,
-                    new_metadata=metadata,
-                    changes=changes
-                )
-
-                update_file_tracking(full_path, get_file_hash(full_path), metadata)
-
-    def process_IN_MODIFY(self, event):
-        """Handles file modifications and ensures metadata is logged correctly."""
-        full_path = event.pathname
-        
-        # Skip directories and excluded files
-        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
-            return
-            
-        file_hash = get_file_hash(full_path)
-        metadata = get_file_metadata(full_path)
-        previous_hash = file_hashes.get(full_path)
-        previous_metadata = integrity_state.get(full_path)
-
-        if file_hash and previous_hash and file_hash != previous_hash:
-            log_event(
-                event_type="MODIFIED",
-                file_path=full_path,
-                previous_metadata=previous_metadata,
-                new_metadata=metadata,
-                previous_hash=previous_hash,
-                new_hash=file_hash
-            )
-
-            update_file_tracking(full_path, file_hash, metadata)
-
 def monitor_changes(real_time_directories, exclusions):
-    """Monitors file system changes using pyinotify with enhanced detection and error handling."""
-    global file_hashes, integrity_state
+    """Monitors file system changes using pyinotify with error handling."""
+    global integrity_state, is_baseline_mode
     
     try:
-        file_hashes = load_file_hashes()
         integrity_state = load_integrity_state()
 
         wm = pyinotify.WatchManager()
@@ -720,59 +650,123 @@ def monitor_changes(real_time_directories, exclusions):
 
 def remove_file_tracking(file_path):
     """Remove deleted file from tracking."""
-    if file_path in file_hashes:
-        del file_hashes[file_path]
+    global integrity_state
     if file_path in integrity_state:
         del integrity_state[file_path]
-    save_file_hashes(file_hashes)
     save_integrity_state(integrity_state)
 
 def update_file_tracking(file_path, file_hash, metadata):
     """Update file tracking information for new or modified files."""
-    global file_hashes, integrity_state  # Ensure these are accessible
+    global integrity_state  # Ensure these are accessible
 
-    file_hashes[file_path] = file_hash
+    # Add hash to metadata
+    metadata["hash"] = file_hash
     integrity_state[file_path] = metadata
-
-    save_file_hashes(file_hashes)
+    
     save_integrity_state(integrity_state)
 
 def scan_files(scheduled_directories, scan_interval, exclusions):
     """Perform periodic file integrity scans."""
     print("[INFO] Periodic scanning started...")
-    file_hashes = load_file_hashes()
     integrity_state = load_integrity_state()
 
     while True:
+        start_time = time.time()
+        changes_detected = 0
+        
         for directory in scheduled_directories:
             if directory not in exclusions.get("directories", []):
                 for filepath in Path(directory).rglob("*"):
-                    if filepath.is_file() and str(filepath) not in exclusions.get("files", []):
+                    if filepath.is_file() and not should_exclude_file(filepath, exclusions):
                         file_hash = get_file_hash(filepath)
                         metadata = get_file_metadata(filepath)
 
                         if file_hash and metadata:
-                            previous_hash = file_hashes.get(str(filepath))
-                            previous_metadata = integrity_state.get(str(filepath))
+                            str_filepath = str(filepath)
+                            previous_metadata = integrity_state.get(str_filepath)
+                            previous_hash = previous_metadata.get("hash") if previous_metadata else None
 
-                            if previous_hash == file_hash and previous_metadata == metadata:
+                            # Skip if both hash and metadata are unchanged
+                            if previous_hash == file_hash and previous_metadata and \
+                               all(previous_metadata.get(k) == metadata.get(k) for k in metadata.keys() if k != "hash"):
                                 continue  # No changes, move to next file
 
-                            if previous_hash != file_hash or previous_metadata != metadata:
+                            # Add hash to metadata
+                            metadata["hash"] = file_hash
+                            
+                            # Detect if this is a new file or a modified one
+                            if not previous_metadata:
                                 log_event(
-                                    event_type="MODIFIED" if previous_hash else "NEW FILE",
-                                    file_path=str(filepath),
-                                    previous_metadata=previous_metadata,
+                                    event_type="NEW FILE",
+                                    file_path=str_filepath,
+                                    previous_metadata=None,
                                     new_metadata=metadata,
-                                    previous_hash=previous_hash,
+                                    previous_hash=None,
                                     new_hash=file_hash
                                 )
+                                changes_detected += 1
+                            else:
+                                # Check for metadata changes
+                                metadata_changes = compare_metadata(previous_metadata, metadata)
+                                if metadata_changes:
+                                    log_event(
+                                        event_type="METADATA_CHANGED",
+                                        file_path=str_filepath,
+                                        previous_metadata=previous_metadata,
+                                        new_metadata=metadata,
+                                        changes=metadata_changes
+                                    )
+                                    changes_detected += 1
+                                
+                                # Check for content changes (if metadata changes weren't detected)
+                                elif previous_hash != file_hash:
+                                    log_event(
+                                        event_type="MODIFIED",
+                                        file_path=str_filepath,
+                                        previous_metadata=previous_metadata,
+                                        new_metadata=metadata,
+                                        previous_hash=previous_hash,
+                                        new_hash=file_hash
+                                    )
+                                    changes_detected += 1
 
-                            file_hashes[str(filepath)] = file_hash
-                            integrity_state[str(filepath)] = metadata
+                            integrity_state[str_filepath] = metadata
 
-        save_file_hashes(file_hashes)
+        # Check for deleted files
+        existing_files = []
+        for directory in scheduled_directories:
+            if directory not in exclusions.get("directories", []):
+                for filepath in Path(directory).rglob("*"):
+                    if filepath.is_file():
+                        existing_files.append(str(filepath))
+        
+        deleted_files = set(integrity_state.keys()) - set(existing_files)
+        for deleted_file in deleted_files:
+            previous_metadata = integrity_state.get(deleted_file)
+            previous_hash = previous_metadata.get("hash") if previous_metadata else None
+            
+            log_event(
+                event_type="DELETED",
+                file_path=deleted_file,
+                previous_metadata=integrity_state.get(deleted_file, None),
+                new_metadata=None,
+                previous_hash=previous_hash,
+                new_hash=None
+            )
+            integrity_state.pop(deleted_file, None)
+            changes_detected += 1
+
         save_integrity_state(integrity_state)
+
+        # Report scan results
+        end_time = time.time()
+        duration = end_time - start_time
+        if changes_detected > 0:
+            print(f"[INFO] Scheduled scan completed in {duration:.2f} seconds. Detected {changes_detected} changes.")
+        else:
+            print(f"[INFO] Scheduled scan completed in {duration:.2f} seconds. No changes detected.")
+        
+        # Wait for next scan interval
         time.sleep(scan_interval)
 
 def should_exclude_file(file_path, exclusions):
@@ -808,7 +802,7 @@ def should_exclude_file(file_path, exclusions):
     return False
 
 def correlate_with_processes(file_path, event_type):
-    """Correlate file changes with process activity from PIM."""
+    """Correlate file changes with process activity."""
     pim_data_file = os.path.join(OUTPUT_DIR, "integrity_processes.json")
     correlation = {}
     
@@ -878,7 +872,9 @@ def parse_arguments():
     return parser.parse_args()
 
 def run_monitor():
-    """Run the file monitoring process with real-time monitoring and adaptive scheduled scans."""
+    """Run the file monitoring process with real-time monitoring and scheduled scans."""
+    global is_baseline_mode, integrity_state, exclusions, adv_content_analysis
+    
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -892,7 +888,7 @@ def run_monitor():
     exclusions = config.get("exclusions", {})
 
     scheduled_directories = scheduled_scan.get("directories", [])
-    scan_interval = scheduled_scan.get("scan_interval", 300)  # Still used as fallback
+    scan_interval = scheduled_scan.get("scan_interval", 300)  # Default scan interval
     real_time_directories = real_time_monitoring.get("directories", [])
 
     if not scheduled_directories and not real_time_directories:
@@ -902,36 +898,19 @@ def run_monitor():
     # Ensure enhanced_fim configuration exists
     config = ensure_enhanced_config()
     
-    # Load initial file hashes and integrity states
-    global file_hashes, integrity_state
-    file_hashes = load_file_hashes()
+    # Check if this is an initial baseline run
+    is_baseline_mode = not os.path.exists(INTEGRITY_STATE_FILE) or os.path.getsize(INTEGRITY_STATE_FILE) <= 2
+    
+    if is_baseline_mode:
+        print("\n[INFO] INITIAL BASELINE MODE - Creating baseline integrity state...")
+        print("[INFO] No alerts will be generated until baseline is complete\n")
+    
+    # Load initial integrity state
     integrity_state = load_integrity_state()
     
-    # Initialize context-aware detection
-    global context_detection
-    context_detection = ContextAwareDetection(config.get('enhanced_fim', {}))
-    print("[INFO] Context-aware detection initialized")
-    
     # Initialize advanced content analysis
-    global adv_content_analysis
     adv_content_analysis = AdvancedFileContentAnalysis(config.get('enhanced_fim', {}).get('content_analysis', {}))
     print("[INFO] Advanced content analysis initialized")
-    
-    # Initialize adaptive scanner
-    adaptive_scanner = AdaptiveScanner(config.get('enhanced_fim', {}).get('performance', {}))
-    print("[INFO] Adaptive scanner initialized")
-
-    # Initialize ML model for anomaly detection
-    try:
-        global ml_model_info
-        ml_model_info = implement_file_activity_baselining()
-        if ml_model_info:
-            print("[INFO] ML-based anomaly detection initialized.")
-        else:
-            print("[INFO] ML-based anomaly detection not available - insufficient data or missing libraries.")
-    except Exception as e:
-        print(f"[WARNING] Failed to initialize ML component: {e}")
-        ml_model_info = None
 
     # Start real-time monitoring in a background thread
     if real_time_directories:
@@ -939,97 +918,20 @@ def run_monitor():
         rt_monitor.start()
         print("[INFO] Real-time monitoring started.")
 
-    # Periodically retrain ML model
-    try:
-        ml_retraining_thread = Thread(target=periodic_ml_retraining, daemon=True)
-        ml_retraining_thread.start()
-        print("[INFO] ML model periodic retraining scheduled.")
-    except Exception as e:
-        print(f"[WARNING] ML retraining setup failed: {e}")
-
-    # Define callback function for adaptive scanner
-    def process_files_callback(file_list, scan_type):
-        """Callback for adaptive scanner to process files and return changes."""
-        changes = []
-        
-        for file_path in file_list:
-            # Skip excluded files
-            if should_exclude_file(file_path, exclusions):
-                continue
-                
-            # Get file hash and metadata
-            file_hash = get_file_hash(file_path)
-            metadata = get_file_metadata(file_path)
-            
-            if not file_hash or not metadata:
-                continue
-                
-            str_file_path = str(file_path)
-            previous_hash = file_hashes.get(str_file_path)
-            previous_metadata = integrity_state.get(str_file_path)
-            
-            # Detect changes
-            if previous_hash and previous_metadata:
-                # Check for metadata changes
-                metadata_changes = compare_metadata(previous_metadata, metadata)
-                if metadata_changes:
-                    log_event(
-                        event_type="METADATA_CHANGED",
-                        file_path=str_file_path,
-                        previous_metadata=previous_metadata,
-                        new_metadata=metadata,
-                        changes=metadata_changes
-                    )
-                    changes.append(str_file_path)
-                
-                # Check for content changes
-                if previous_hash != file_hash:
-                    log_event(
-                        event_type="MODIFIED",
-                        file_path=str_file_path,
-                        previous_metadata=previous_metadata,
-                        new_metadata=metadata,
-                        previous_hash=previous_hash,
-                        new_hash=file_hash
-                    )
-                    changes.append(str_file_path)
-            else:
-                # New file
-                log_event(
-                    event_type="NEW FILE",
-                    file_path=str_file_path,
-                    previous_metadata=None,
-                    new_metadata=metadata,
-                    previous_hash=None,
-                    new_hash=file_hash
-                )
-                changes.append(str_file_path)
-            
-            # Update tracking data
-            file_hashes[str_file_path] = file_hash
-            integrity_state[str_file_path] = metadata
-        
-        # If changes were detected, save updated tracking data
-        if changes:
-            save_file_hashes(file_hashes)
-            save_integrity_state(integrity_state)
-            
-            # Log summary based on scan type
-            scan_type_desc = {
-                "critical": "Critical system files",
-                "standard": "Standard monitoring",
-                "minimal": "Low-priority files"
-            }
-            print(f"[INFO] {scan_type_desc.get(scan_type, 'File scan')} detected {len(changes)} changes")
-            
-        return changes
-
-    # Run the scheduled scan with adaptive scanning
+    # Run the scheduled scan
     if scheduled_directories:
         try:
-            print("[INFO] Starting adaptive file scanning")
-            # Use adaptive scheduling instead of fixed interval
-            adaptive_scanner.adaptive_scan_scheduler(scheduled_directories, process_files_callback)
+            print("[INFO] Starting scheduled file scanning")
+            # Run an initial scan
+            generate_file_hashes(scheduled_directories, real_time_directories, exclusions, config)
+            
+            # Then perform periodic scans
+            scan_thread = Thread(target=scan_files, args=(scheduled_directories, scan_interval, exclusions), daemon=True)
+            scan_thread.start()
+            
+            # Keep main thread alive
+            while True:
+                time.sleep(60)
         except KeyboardInterrupt:
             handle_shutdown()
     else:
@@ -1040,8 +942,10 @@ def run_monitor():
         except KeyboardInterrupt:
             handle_shutdown()
 
+############################################################################################################
+
 def is_binary_file(file_path):
-    """Check if a file is likely binary based on extension or sampling the content."""
+    """Check if a file is likely binary based on extension or content sampling."""
     if not file_path or file_path == "N/A":
         return False
         
@@ -1090,193 +994,6 @@ def is_system_directory(file_path):
     system_dirs = ['/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/', '/lib/', '/usr/lib/', '/etc/']
     
     return any(file_path.startswith(d) for d in system_dirs)
-
-def implement_file_activity_baselining():
-    """Implement ML-based behavioral baselining for file activity."""
-    try:
-        # Import required libraries
-        from sklearn.ensemble import IsolationForest
-        import numpy as np
-        import pandas as pd
-        
-        print("[INFO] Initializing ML-based anomaly detection for file activity...")
-        
-        # Read historical file events
-        events = []
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r") as f:
-                for line in f:
-                    try:
-                        event = json.loads(line.strip())
-                        if isinstance(event, dict) and "event_type" in event and "file_path" in event:
-                            events.append(event)
-                    except json.JSONDecodeError:
-                        continue
-        
-        if len(events) < 10:  # Need minimum data
-            print("[WARNING] Not enough historical data for ML model training. Need at least 10 events.")
-            return None
-        
-        # Extract features from events
-        features = []
-        for event in events:
-            timestamp = event.get("timestamp", "")
-            try:
-                dt_parts = timestamp.split(" ")
-                if len(dt_parts) >= 2:
-                    time_parts = dt_parts[1].split(":")
-                    if len(time_parts) >= 1:
-                        event_hour = int(time_parts[0])
-                    else:
-                        event_hour = 12
-                else:
-                    event_hour = 12
-            except:
-                event_hour = 12  # Default if parsing fails
-                
-            event_type_mapping = {
-                "NEW FILE": 1,
-                "MODIFIED": 2,
-                "DELETED": 3,
-                "METADATA_CHANGED": 4
-            }
-            
-            file_path = event.get("file_path", "")
-            
-            event_feature = {
-                "event_hour": event_hour,
-                "event_type": event_type_mapping.get(event.get("event_type"), 0),
-                "is_binary": 1 if is_binary_file(file_path) else 0,
-                "is_config": 1 if is_config_file(file_path) else 0,
-                "is_system_dir": 1 if is_system_directory(file_path) else 0,
-            }
-            
-            # Add metadata features if available
-            new_metadata = event.get("new_metadata", None)
-            if isinstance(new_metadata, dict):
-                if "size" in new_metadata and new_metadata["size"] != "N/A":
-                    try:
-                        event_feature["file_size"] = float(new_metadata["size"])
-                    except:
-                        pass
-            
-            features.append(event_feature)
-            
-        # Create dataframe and train model
-        df = pd.DataFrame(features)
-        
-        # Ensure we have enough data and features
-        if len(df) < 10:
-            print("[WARNING] Not enough valid events for ML model training.")
-            return None
-            
-        # Select only numeric columns
-        numeric_cols = [col for col in df.columns if df[col].dtype.kind in 'ifc']
-        if len(numeric_cols) < 2:
-            print("[WARNING] Not enough numeric features for ML model training.")
-            return None
-            
-        # Train isolation forest
-        model = IsolationForest(contamination=0.1, random_state=42)
-        model.fit(df[numeric_cols])
-        
-        print(f"[INFO] ML model trained successfully with {len(df)} events and {len(numeric_cols)} features.")
-        
-        return {
-            "model": model,
-            "features": numeric_cols,
-            "event_type_mapping": event_type_mapping
-        }
-    except ImportError:
-        print("[WARNING] scikit-learn, numpy, or pandas not available. ML-based anomaly detection disabled.")
-        return None
-    except Exception as e:
-        print(f"[ERROR] Failed to initialize ML model: {e}")
-        return None
-
-def detect_file_anomalies(event, ml_model_info):
-    """Detect anomalies in file events using the ML model."""
-    if not ml_model_info or not ml_model_info.get("model"):
-        return None
-        
-    try:
-        import pandas as pd
-        
-        model = ml_model_info["model"]
-        feature_names = ml_model_info["features"]
-        event_type_mapping = ml_model_info["event_type_mapping"]
-        
-        # Extract features from the event
-        timestamp = event.get("timestamp", "")
-        try:
-            dt_parts = timestamp.split(" ")
-            if len(dt_parts) >= 2:
-                time_parts = dt_parts[1].split(":")
-                if len(time_parts) >= 1:
-                    event_hour = int(time_parts[0])
-                else:
-                    event_hour = 12
-            else:
-                event_hour = 12
-        except:
-            event_hour = 12
-            
-        event_type = event_type_mapping.get(event.get("event_type"), 0)
-        file_path = event.get("file_path", "")
-        
-        # Prepare features similar to training data
-        features = {
-            "event_hour": event_hour,
-            "event_type": event_type,
-            "is_binary": 1 if is_binary_file(file_path) else 0,
-            "is_config": 1 if is_config_file(file_path) else 0,
-            "is_system_dir": 1 if is_system_directory(file_path) else 0,
-        }
-        
-        # Add metadata features if available
-        new_metadata = event.get("new_metadata", None)
-        if isinstance(new_metadata, dict) and new_metadata != "N/A":
-            if "size" in new_metadata and new_metadata["size"] != "N/A":
-                try:
-                    features["file_size"] = float(new_metadata["size"])
-                except:
-                    pass
-        
-        # Create a dataframe with only the features used during training
-        df_features = {}
-        for feature in feature_names:
-            df_features[feature] = [features.get(feature, 0)]
-            
-        df = pd.DataFrame(df_features)
-        
-        # Predict anomaly
-        prediction = model.predict(df)[0]
-        anomaly_score = model.decision_function(df)[0]
-        
-        if prediction == -1:  # Anomaly
-            return {
-                "is_anomaly": True,
-                "anomaly_score": float(anomaly_score),
-                "anomaly_features": features
-            }
-        return None
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to detect anomalies: {e}")
-        return None
-
-def periodic_ml_retraining():
-    """Periodically retrain the ML model for improved anomaly detection."""
-    global ml_model_info
-    
-    while True:
-        time.sleep(3600)  # Retrain every hour
-        print("[INFO] Retraining ML model for anomaly detection...")
-        ml_model_info = implement_file_activity_baselining()
-        if ml_model_info:
-            print("[INFO] ML model retraining completed successfully.")
-        else:
-            print("[WARNING] ML model retraining failed or insufficient data.")
 
 def get_mitre_mapping(event_type, file_path, changes=None):
     """Map file events to MITRE ATT&CK techniques."""
@@ -1419,24 +1136,15 @@ def ensure_enhanced_config():
                 "io_threshold": 80,
                 "worker_threads": 4
             },
-            "behavioral": {
-                "training_samples": 100,
-                "retraining_interval": 86400,
-                "max_baseline_samples": 10000
-            },
             "content_analysis": {
                 "diff_threshold": 0.3,
                 "max_file_size": 10485760
-            },
-            "detection": {
-                "risk_multiplier": 1.5,
-                "alert_threshold": 70
             }
         }
         
         # Also update instructions if they exist
         if 'instructions' in config:
-            config['instructions']['enhanced_fim'] = "Configure enhanced file integrity monitoring capabilities including performance optimization, behavioral analysis, content analysis, and detection."
+            config['instructions']['enhanced_fim'] = "Configure enhanced file integrity monitoring capabilities."
         
         # Save updated config
         with open(CONFIG_FILE, "w") as f:
@@ -1446,601 +1154,8 @@ def ensure_enhanced_config():
         
     return config
 
-#################### FIM PERFORMANCE #######################
-class AdaptiveScanner:
-    def __init__(self, config=None):
-        self.config = config or {}
-        self.system_load_threshold = self.config.get('system_load_threshold', 75)  # Default 75% CPU load
-        self.io_threshold = self.config.get('io_threshold', 80)  # Default 80% I/O utilization
-        self.scan_history = defaultdict(lambda: {'last_scan': 0, 'change_frequency': 0})
-        self.critical_paths = self.config.get('critical_paths', ['/etc', '/bin', '/sbin', '/usr/bin'])
-        self.is_paused = False
-        self.backoff_multiplier = 1.0
-
-    def get_system_load(self):
-        """Get current system load metrics"""
-        cpu_percent = psutil.cpu_percent(interval=0.5)
-        io_counters = psutil.disk_io_counters()
-        memory_percent = psutil.virtual_memory().percent
-        
-        return {
-            'cpu': cpu_percent,
-            'memory': memory_percent,
-            'io': io_counters
-        }
-    
-    def should_throttle(self):
-        """Determine if scanning should be throttled based on system load"""
-        system_load = self.get_system_load()
-        
-        # Check if system is under heavy load
-        if system_load['cpu'] > self.system_load_threshold:
-            self.backoff_multiplier = min(self.backoff_multiplier * 1.5, 10.0)
-            return True
-        else:
-            self.backoff_multiplier = max(self.backoff_multiplier * 0.8, 1.0)
-            return False
-    
-    def prioritize_scan_targets(self, directories):
-        """Prioritize directories to scan based on criticality and change history"""
-        prioritized = []
-        
-        # First tier: Critical system paths
-        critical = [d for d in directories if any(d.startswith(cp) for cp in self.critical_paths)]
-        
-        # Second tier: Frequently changing directories
-        current_time = time.time()
-        change_frequency = {d: self.scan_history[d]['change_frequency'] for d in directories}
-        sorted_by_frequency = sorted(
-            [d for d in directories if d not in critical],
-            key=lambda d: change_frequency.get(d, 0),
-            reverse=True
-        )
-        
-        # Third tier: Directories not scanned recently
-        time_since_scan = {d: current_time - self.scan_history[d]['last_scan'] for d in directories}
-        sorted_by_time = sorted(
-            [d for d in directories if d not in critical and d not in sorted_by_frequency[:10]],
-            key=lambda d: time_since_scan.get(d, float('inf')),
-            reverse=True
-        )
-        
-        # Combine tiers with appropriate scanning intensity
-        return {
-            'high_intensity': critical,
-            'medium_intensity': sorted_by_frequency[:10],  # Top 10 frequently changing dirs
-            'low_intensity': sorted_by_time  # Remaining dirs sorted by scan age
-        }
-    
-    def differential_scan(self, directory, file_index):
-        """Focus scanning on recently modified files"""
-        # Get all files in directory with modification times
-        current_files = {}
-        for root, _, files in os.walk(directory):
-            for file in files:
-                full_path = os.path.join(root, file)
-                try:
-                    mtime = os.path.getmtime(full_path)
-                    current_files[full_path] = mtime
-                except (OSError, IOError):
-                    continue
-        
-        # Identify new and modified files since last scan
-        if directory not in file_index:
-            # First scan of this directory - all files are "new"
-            file_index[directory] = current_files
-            return list(current_files.keys()), []
-        
-        previous_files = file_index[directory]
-        
-        # Find new and modified files
-        new_files = []
-        modified_files = []
-        
-        for path, mtime in current_files.items():
-            if path not in previous_files:
-                new_files.append(path)
-            elif mtime > previous_files[path]:
-                modified_files.append(path)
-        
-        # Update the file index
-        file_index[directory] = current_files
-        
-        return new_files, modified_files
-    
-    def update_scan_history(self, directory, changes_detected):
-        """Update scan history and change frequency metrics"""
-        current_time = time.time()
-        
-        # Get previous values
-        previous = self.scan_history[directory]
-        last_scan_time = previous['last_scan']
-        change_frequency = previous['change_frequency']
-        
-        # Calculate time since last scan
-        time_delta = current_time - last_scan_time if last_scan_time > 0 else 86400  # Default to 1 day
-        
-        # Exponential moving average for change frequency
-        if changes_detected:
-            # If changes were detected, increase the frequency score
-            new_frequency = change_frequency * 0.7 + 0.3 * (1 / max(time_delta, 1))
-        else:
-            # If no changes, decay the frequency score
-            new_frequency = change_frequency * 0.9
-        
-        # Update history
-        self.scan_history[directory] = {
-            'last_scan': current_time,
-            'change_frequency': new_frequency
-        }
-    
-    def adaptive_scan_scheduler(self, scheduled_directories, scan_callback):
-        """Run scanning with adaptive scheduling based on system load and directory priority"""
-        file_index = {}  # Track files and their modification times
-        
-        while True:
-            # Check if scanning should be throttled
-            if self.should_throttle():
-                print(f"[INFO] System under load, throttling scans (backoff: {self.backoff_multiplier:.2f}x)")
-                time.sleep(5 * self.backoff_multiplier)  # Adaptive backoff
-                continue
-            
-            # Prioritize directories
-            prioritized = self.prioritize_scan_targets(scheduled_directories)
-            
-            # Process high-priority directories first, with full scanning
-            for directory in prioritized['high_intensity']:
-                if self.should_throttle():
-                    break  # Recheck system load between directories
-                
-                print(f"[INFO] High-intensity scanning of critical directory: {directory}")
-                # For critical directories, do a full scan
-                all_files = []
-                for root, _, files in os.walk(directory):
-                    for file in files:
-                        all_files.append(os.path.join(root, file))
-                
-                changes = scan_callback(all_files, "critical")
-                self.update_scan_history(directory, len(changes) > 0)
-            
-            # Medium priority directories - scan frequently changed files
-            for directory in prioritized['medium_intensity']:
-                if self.should_throttle():
-                    break
-                
-                print(f"[INFO] Medium-intensity scanning of frequently changing directory: {directory}")
-                # Use differential scanning for these directories
-                new_files, modified_files = self.differential_scan(directory, file_index)
-                changes = scan_callback(new_files + modified_files, "standard")
-                self.update_scan_history(directory, len(changes) > 0)
-            
-            # Low priority directories - scan minimally
-            for directory in prioritized['low_intensity']:
-                if self.should_throttle():
-                    break
-                
-                print(f"[INFO] Low-intensity scanning of infrequently changing directory: {directory}")
-                # For low priority, only scan new files
-                new_files, _ = self.differential_scan(directory, file_index)
-                changes = scan_callback(new_files, "minimal")
-                self.update_scan_history(directory, len(changes) > 0)
-            
-            # Sleep between full scan cycles, with adaptive timing
-            sleep_time = 60 * self.backoff_multiplier  # Base: 1 minute, scales with load
-            print(f"[INFO] Completed scan cycle, sleeping for {sleep_time:.1f} seconds")
-            time.sleep(sleep_time)
-
-############################################################
-
-##################### Machine Leanrning Code ###############
-class EnhancedBehavioralBaselining:
-    def __init__(self, config=None):
-        self.config = config or {}
-        self.models = {}
-        self.feature_scalers = {}
-        self.baseline_data = defaultdict(list)
-        self.model_dir = self.config.get('model_dir', os.path.join(os.getcwd(), 'ml_models'))
-        self.training_samples_required = self.config.get('training_samples', 100)
-        self.retraining_interval = self.config.get('retraining_interval', 86400)  # 24 hours
-        self.last_training_time = 0
-        self.feature_importance = {}
-        
-        # Ensure model directory exists
-        os.makedirs(self.model_dir, exist_ok=True)
-        
-        # Load existing models if available
-        self.load_models()
-    
-    def load_models(self):
-        """Load pre-trained models if available"""
-        model_types = ['temporal', 'contextual', 'content']
-        
-        for model_type in model_types:
-            model_path = os.path.join(self.model_dir, f"{model_type}_model.joblib")
-            scaler_path = os.path.join(self.model_dir, f"{model_type}_scaler.joblib")
-            
-            if os.path.exists(model_path) and os.path.exists(scaler_path):
-                try:
-                    self.models[model_type] = joblib.load(model_path)
-                    self.feature_scalers[model_type] = joblib.load(scaler_path)
-                    print(f"[INFO] Loaded {model_type} model and scaler")
-                except Exception as e:
-                    print(f"[ERROR] Failed to load {model_type} model: {e}")
-    
-    def extract_temporal_features(self, event):
-        """Extract time-based features from event data"""
-        # Parse timestamp
-        timestamp = event.get('timestamp', '')
-        try:
-            if timestamp:
-                dt = time.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                hour = dt.tm_hour
-                minute = dt.tm_min
-                weekday = dt.tm_wday  # 0-6, Monday is 0
-                is_weekend = 1 if weekday >= 5 else 0
-                is_business_hours = 1 if (8 <= hour <= 18 and weekday < 5) else 0
-                is_night = 1 if (hour < 6 or hour >= 22) else 0
-            else:
-                # Default values if timestamp is missing
-                hour, minute, weekday = 12, 0, 0
-                is_weekend, is_business_hours, is_night = 0, 1, 0
-        except ValueError:
-            # Default values if timestamp format is invalid
-            hour, minute, weekday = 12, 0, 0
-            is_weekend, is_business_hours, is_night = 0, 1, 0
-        
-        # Event type encoding
-        event_type_map = {
-            'NEW FILE': 1,
-            'MODIFIED': 2,
-            'DELETED': 3,
-            'METADATA_CHANGED': 4
-        }
-        event_type_code = event_type_map.get(event.get('event_type', ''), 0)
-        
-        # Extract features
-        features = {
-            'hour': hour,
-            'minute': minute,
-            'weekday': weekday,
-            'is_weekend': is_weekend,
-            'is_business_hours': is_business_hours,
-            'is_night': is_night,
-            'event_type_code': event_type_code
-        }
-        
-        return features
-    
-    def extract_contextual_features(self, event):
-        """Extract context-related features from event data"""
-        # File path features
-        file_path = event.get('file_path', '')
-        is_system_file = 1 if any(file_path.startswith(d) for d in ['/bin', '/sbin', '/lib', '/etc', '/usr/bin', '/usr/sbin', '/usr/lib']) else 0
-        is_home_file = 1 if '/home/' in file_path else 0
-        is_temp_file = 1 if any(t in file_path for t in ['/tmp/', '/var/tmp/', '/dev/shm/']) else 0
-        is_config_file = 1 if any(file_path.endswith(ext) for ext in ['.conf', '.cfg', '.ini', '.json', '.yaml', '.yml']) else 0
-        is_executable = 1 if any(file_path.endswith(ext) for ext in ['', '.sh', '.py', '.rb', '.pl']) and (is_system_file or '/bin/' in file_path) else 0
-        
-        # Process correlation features
-        process_correlation = event.get('process_correlation', {})
-        has_process_correlation = 1 if process_correlation and process_correlation != 'N/A' else 0
-        
-        process_info = {}
-        if has_process_correlation:
-            related_process = process_correlation.get('related_process', {})
-            process_info = {
-                'pid': related_process.get('pid', 0),
-                'process_name': related_process.get('process_name', ''),
-                'user': related_process.get('user', '')
-            }
-        
-        is_root_process = 1 if process_info.get('user') == 'root' else 0
-        is_system_process = 1 if process_info.get('process_name') in ['systemd', 'init', 'cron', 'sshd'] else 0
-        
-        # File metadata features
-        new_metadata = event.get('new_metadata', {})
-        if isinstance(new_metadata, str):
-            new_metadata = {}
-        
-        file_size = 0
-        try:
-            file_size = int(new_metadata.get('size', 0))
-        except (ValueError, TypeError):
-            pass
-        
-        features = {
-            'is_system_file': is_system_file,
-            'is_home_file': is_home_file,
-            'is_temp_file': is_temp_file,
-            'is_config_file': is_config_file,
-            'is_executable': is_executable,
-            'has_process_correlation': has_process_correlation,
-            'is_root_process': is_root_process,
-            'is_system_process': is_system_process,
-            'file_size': file_size
-        }
-        
-        return features
-    
-    def extract_content_features(self, event):
-        """Extract content-related features from file changes"""
-        # Check for hash changes
-        previous_hash = event.get('previous_hash', '')
-        new_hash = event.get('new_hash', '')
-        hash_changed = 1 if previous_hash and new_hash and previous_hash != new_hash else 0
-        
-        # Check for metadata changes
-        changes = event.get('changes', {})
-        if isinstance(changes, str):
-            changes = {}
-        
-        permission_changed = 1 if 'Permissions changed' in changes else 0
-        ownership_changed = 1 if 'Ownership changed' in changes else 0
-        size_changed = 1 if 'Size changed' in changes else 0
-        timestamp_changed = 1 if 'Last modified timestamp changed' in changes else 0
-        
-        # Metadata details
-        new_metadata = event.get('new_metadata', {})
-        if isinstance(new_metadata, str):
-            new_metadata = {}
-            
-        previous_metadata = event.get('previous_metadata', {})
-        if isinstance(previous_metadata, str):
-            previous_metadata = {}
-        
-        size_delta = 0
-        try:
-            new_size = int(new_metadata.get('size', 0))
-            prev_size = int(previous_metadata.get('size', 0))
-            size_delta = new_size - prev_size
-        except (ValueError, TypeError):
-            pass
-        
-        features = {
-            'hash_changed': hash_changed,
-            'permission_changed': permission_changed,
-            'ownership_changed': ownership_changed,
-            'size_changed': size_changed,
-            'timestamp_changed': timestamp_changed,
-            'size_delta': size_delta
-        }
-        
-        return features
-    
-    def combine_features(self, event):
-        """Combine all feature types for comprehensive analysis"""
-        temporal = self.extract_temporal_features(event)
-        contextual = self.extract_contextual_features(event)
-        content = self.extract_content_features(event)
-        
-        # Combine all features
-        features = {}
-        features.update(temporal)
-        features.update(contextual)
-        features.update(content)
-        
-        return features
-    
-    def train_models(self, events):
-        """Train or update anomaly detection models based on collected events"""
-        if len(events) < self.training_samples_required:
-            print(f"[INFO] Not enough samples for training. Have {len(events)}, need {self.training_samples_required}")
-            return False
-        
-        print(f"[INFO] Training anomaly detection models with {len(events)} events")
-        
-        # Extract all feature types
-        all_features = []
-        for event in events:
-            features = self.combine_features(event)
-            all_features.append(features)
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(all_features)
-        
-        # Replace NaN values with 0
-        df.fillna(0, inplace=True)
-        
-        # Train different models for different feature types
-        model_configs = {
-            'temporal': {
-                'features': [col for col in df.columns if col in self.extract_temporal_features({})],
-                'model': IsolationForest(contamination=0.05, random_state=42)
-            },
-            'contextual': {
-                'features': [col for col in df.columns if col in self.extract_contextual_features({})],
-                'model': IsolationForest(contamination=0.05, random_state=42)
-            },
-            'content': {
-                'features': [col for col in df.columns if col in self.extract_content_features({})],
-                'model': IsolationForest(contamination=0.05, random_state=42)
-            }
-        }
-        
-        # Train each model
-        for model_name, config in model_configs.items():
-            feature_cols = config['features']
-            if not feature_cols:
-                continue  # Skip if no features available
-            
-            # Get feature subset
-            X = df[feature_cols]
-            
-            # Scale features
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
-            
-            # Train model
-            model = config['model']
-            model.fit(X_scaled)
-            
-            # Save model and scaler
-            self.models[model_name] = model
-            self.feature_scalers[model_name] = scaler
-            
-            # Save to disk
-# Save feature scaler
-            joblib.dump(scaler, os.path.join(self.model_dir, f"{model_name}_scaler.joblib"))
-            
-            # Calculate feature importance for interpretability (for RandomForest only)
-            if hasattr(model, 'feature_importances_'):
-                importances = model.feature_importances_
-                self.feature_importance[model_name] = dict(zip(feature_cols, importances))
-        
-        self.last_training_time = time.time()
-        return True
-    
-    def detect_anomalies(self, event):
-        """Detect anomalies using all trained models"""
-        if not self.models:
-            return None  # No trained models available
-        
-        # Extract and combine features
-        features = self.combine_features(event)
-        
-        # Run detection for each model
-        anomaly_results = {}
-        for model_name, model in self.models.items():
-            # Get relevant features for this model
-            if model_name == 'temporal':
-                model_features = self.extract_temporal_features(event)
-            elif model_name == 'contextual':
-                model_features = self.extract_contextual_features(event)
-            elif model_name == 'content':
-                model_features = self.extract_content_features(event)
-            else:
-                continue
-            
-            # Create feature vector
-            feature_names = list(model_features.keys())
-            feature_values = list(model_features.values())
-            
-            # Skip if no features available
-            if not feature_names:
-                continue
-            
-            # Scale features
-            scaler = self.feature_scalers.get(model_name)
-            if not scaler:
-                continue
-                
-            X = np.array(feature_values).reshape(1, -1)
-            X_scaled = scaler.transform(X)
-            
-            # Predict anomaly
-            prediction = model.predict(X_scaled)[0]
-            anomaly_score = model.decision_function(X_scaled)[0]
-            
-            # Score interpretation:
-            # Isolation Forest: negative = anomaly, positive = normal
-            # Convert to standard range [-1, 1] where -1 is most anomalous
-            norm_score = anomaly_score
-            
-            anomaly_results[model_name] = {
-                'is_anomaly': prediction == -1,
-                'score': norm_score,
-                'contributing_features': self.get_contributing_features(model_name, X_scaled[0], feature_names)
-            }
-        
-        # Combine results for final decision
-        if anomaly_results:
-            combined_score = np.mean([r['score'] for r in anomaly_results.values()])
-            is_anomaly = any(r['is_anomaly'] for r in anomaly_results.values())
-            
-            return {
-                'is_anomaly': is_anomaly,
-                'anomaly_score': combined_score,
-                'model_scores': anomaly_results,
-                'summary': f"Anomaly detected with score {combined_score:.4f}" if is_anomaly else "Normal activity"
-            }
-        
-        return None
-    
-    def get_contributing_features(self, model_name, features_scaled, feature_names):
-        """Identify which features contributed most to the anomaly score"""
-        if model_name not in self.feature_importance or not self.feature_importance[model_name]:
-            return []
-            
-        # Get feature importance
-        importance = self.feature_importance[model_name]
-        
-        # Find features with highest deviation from norm, weighted by importance
-        contributors = []
-        for i, feature in enumerate(feature_names):
-            if feature in importance:
-                # Calculate contribution: absolute scaled value * feature importance
-                contrib = abs(features_scaled[i]) * importance[feature]
-                contributors.append((feature, contrib))
-        
-        # Sort by contribution and return top 3
-        return [f for f, _ in sorted(contributors, key=lambda x: x[1], reverse=True)[:3]]
-    
-    def update_baseline(self, event):
-        """Update baseline with new event data"""
-        # Add to baseline data
-        self.baseline_data['events'].append(event)
-        
-        # Limit size of baseline data
-        max_samples = self.config.get('max_baseline_samples', 10000)
-        if len(self.baseline_data['events']) > max_samples:
-            self.baseline_data['events'] = self.baseline_data['events'][-max_samples:]
-        
-        # Check if retraining is needed
-        current_time = time.time()
-        if current_time - self.last_training_time > self.retraining_interval:
-            # Retrain models with updated data
-            print("[INFO] Retraining anomaly detection models with updated baseline data")
-            self.train_models(self.baseline_data['events'])
-    
-    def analyze_time_series(self, events, window_size=60):
-        """Analyze time series patterns in events"""
-        if not events:
-            return None
-            
-        # Group events by time window
-        time_windows = defaultdict(list)
-        
-        for event in events:
-            timestamp = event.get('timestamp', '')
-            if not timestamp:
-                continue
-                
-            try:
-                dt = time.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                # Round to the nearest window
-                window_key = time.strftime("%Y-%m-%d %H:00:00", dt)  # Hourly windows
-                time_windows[window_key].append(event)
-            except ValueError:
-                continue
-        
-        # Analyze frequency patterns
-        window_counts = {window: len(events) for window, events in time_windows.items()}
-        
-        if len(window_counts) < 3:
-            return None  # Not enough data for meaningful analysis
-            
-        # Detect frequency anomalies
-        values = list(window_counts.values())
-        mean_count = np.mean(values)
-        std_count = np.std(values)
-        
-        # Detect windows with unusual activity
-        z_scores = {window: (count - mean_count) / max(std_count, 0.001) for window, count in window_counts.items()}
-        anomalous_windows = {window: z for window, z in z_scores.items() if abs(z) > 2.0}
-        
-        if anomalous_windows:
-            return {
-                'anomalous_windows': anomalous_windows,
-                'window_counts': window_counts,
-                'mean_count': mean_count,
-                'std_count': std_count
-            }
-        
-        return None
-
-############################################################
-
 ################## ADV ANALYSIS CODE #######################
+
 class AdvancedFileContentAnalysis:
     def __init__(self, config=None):
         self.config = config or {}
@@ -2750,545 +1865,12 @@ class AdvancedFileContentAnalysis:
 
 ############################################################
 
-################## CONTEXT ANALYSIS CODE ###################
-class ContextAwareDetection:
-    def __init__(self, config=None):
-        self.config = config or {}
-        self.event_history = deque(maxlen=1000)  # Keep last 1000 events
-        self.attack_chains = defaultdict(list)
-        self.environment = self.config.get('environment', 'production')
-        self.ip_blocklist = set()
-        self.suspicious_processes = set()
-        self.mitre_techniques = self.load_mitre_techniques()
-        
-        # Environment-specific settings
-        self.thresholds = {
-            'production': {'risk_multiplier': 1.5, 'alert_threshold': 70},
-            'staging': {'risk_multiplier': 1.2, 'alert_threshold': 75},
-            'development': {'risk_multiplier': 1.0, 'alert_threshold': 80}
-        }
-        
-        # Load critical file mappings
-        self.file_criticality = self.load_file_criticality()
-    
-    def load_mitre_techniques(self):
-        """Load detailed MITRE ATT&CK technique information"""
-        # This would typically load from a JSON file containing full technique details
-        # Simplified example included here
-        techniques = {
-            "T1222": {
-                "name": "File and Directory Permissions Modification",
-                "tactic": "Defense Evasion",
-                "severity": 70,
-                "detection_difficulty": "Medium",
-                "related_techniques": ["T1222.001", "T1222.002", "T1574"],
-                "common_tools": ["chmod", "chown", "icacls", "attrib"]
-            },
-            "T1565": {
-                "name": "Data Manipulation",
-                "tactic": "Impact",
-                "severity": 75,
-                "detection_difficulty": "High",
-                "related_techniques": ["T1565.001", "T1565.002", "T1565.003"],
-                "common_tools": ["hex editor", "sed", "awk", "vim"]
-            },
-            # Add more techniques as needed
-        }
-        return techniques
-    
-    def load_file_criticality(self):
-        """Load file criticality mappings based on environment"""
-        # This would typically load from a configuration file
-        # Simplified example included here
-        base_criticality = {
-            "/etc/passwd": 95,
-            "/etc/shadow": 95,
-            "/etc/sudoers": 90,
-            "/etc/ssh/sshd_config": 85,
-            "/etc/hosts": 80,
-            "/var/www/html": 75,
-            "/bin": 70,
-            "/sbin": 70,
-            "/usr/bin": 70,
-            "/usr/sbin": 70,
-            "/boot": 90,
-            "/lib": 70,
-            "/etc/crontab": 85,
-            "/etc/cron.d": 85,
-            "/.ssh/authorized_keys": 90
-        }
-        
-        # Adjust criticality based on environment
-        if self.environment == 'development':
-            return {k: max(v * 0.7, 50) for k, v in base_criticality.items()}
-        elif self.environment == 'staging':
-            return {k: max(v * 0.9, 60) for k, v in base_criticality.items()}
-        else:  # production
-            return base_criticality
-    
-    def calculate_file_criticality(self, file_path):
-        """Calculate criticality score for a file based on path and content"""
-        # Direct match for known critical files
-        for critical_path, score in self.file_criticality.items():
-            if file_path.startswith(critical_path):
-                return score
-        
-        # Criticality based on file type and location
-        if file_path.startswith('/etc/'):
-            return 70
-        elif file_path.startswith(('/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/')):
-            return 65
-        elif '/www/' in file_path:
-            if any(ext in file_path.lower() for ext in ['.php', '.asp', '.jsp']):
-                return 75  # Web executable content
-            return 60
-        elif '.ssh/' in file_path:
-            return 85
-        elif any(file_path.endswith(ext) for ext in ['.sh', '.py', '.pl', '.rb']):
-            return 60  # Scripts
-        elif any(file_path.endswith(ext) for ext in ['.conf', '.cfg', '.ini', '.json']):
-            return 65  # Config files
-        
-        # Default criticality
-        return 50
-    
-    def correlate_attack_chain(self, event):
-        """Identify potential attack chains by correlating multiple events"""
-        # Extract key information
-        event_type = event.get('event_type')
-        file_path = event.get('file_path')
-        timestamp = event.get('timestamp')
-        technique_id = event.get('mitre_mapping', {}).get('technique_id', 'unknown')
-        process_info = event.get('process_correlation', {}).get('related_process', {})
-        
-        # Create event identifier for grouping
-        host_id = event.get('host_id', 'localhost')
-        user_id = process_info.get('user', 'unknown')
-        process_name = process_info.get('process_name', 'unknown')
-        
-        # Group identifier to track related events
-        group_key = f"{host_id}_{user_id}_{process_name}"
-        
-        # Add to event history
-        self.event_history.append(event)
-        
-        # Add to potential attack chain
-        self.attack_chains[group_key].append({
-            'timestamp': timestamp,
-            'event_type': event_type,
-            'file_path': file_path,
-            'technique_id': technique_id,
-            'process_pid': process_info.get('pid', 'unknown')
-        })
-        
-        # Prune old events from attack chains (events older than 30 minutes)
-        if timestamp:
-            try:
-                event_time = time.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
-                event_time = time.mktime(event_time)
-                
-                # Remove events older than 30 minutes
-                cutoff_time = event_time - (30 * 60)
-                self.attack_chains[group_key] = [
-                    e for e in self.attack_chains[group_key] 
-                    if time.mktime(time.strptime(e['timestamp'], "%Y-%m-%d %H:%M:%S")) >= cutoff_time
-                ]
-                
-                # Remove empty chains
-                if not self.attack_chains[group_key]:
-                    del self.attack_chains[group_key]
-            except (ValueError, TypeError):
-                pass  # Skip time-based pruning if timestamp format is invalid
-        
-        # Check for attack patterns in this chain
-        return self.detect_attack_patterns(group_key)
-    
-    def detect_attack_patterns(self, group_key):
-        """Detect known attack patterns in event chains"""
-        if group_key not in self.attack_chains:
-            return None
-        
-        chain = self.attack_chains[group_key]
-        if len(chain) < 2:
-            return None  # Need at least 2 events for a chain
-        
-        # Common attack patterns to check for
-        patterns = [
-            {
-                'name': 'Reconnaissance and Data Theft',
-                'severity': 85,
-                'techniques': ['T1083', 'T1005', 'T1039', 'T1020'],
-                'min_match': 2
-            },
-            {
-                'name': 'Credential Access',
-                'severity': 90,
-                'techniques': ['T1003', 'T1552', 'T1555', 'T1212'],
-                'min_match': 1
-            },
-            {
-                'name': 'Defense Evasion',
-                'severity': 85,
-                'techniques': ['T1222', 'T1562', 'T1070', 'T1036', 'T1027'],
-                'min_match': 2
-            },
-            {
-                'name': 'Persistence',
-                'severity': 80,
-                'techniques': ['T1053', 'T1543', 'T1546', 'T1098', 'T1136'],
-                'min_match': 1
-            }
-        ]
-        
-        # Check each pattern against our chain
-        chain_techniques = [event['technique_id'] for event in chain]
-        detected_patterns = []
-        
-        for pattern in patterns:
-            matches = [tech for tech in chain_techniques if any(tech.startswith(pt) for pt in pattern['techniques'])]
-            if len(matches) >= pattern['min_match']:
-                detected_patterns.append({
-                    'pattern': pattern['name'],
-                    'severity': pattern['severity'],
-                    'matched_techniques': matches,
-                    'events': chain
-                })
-        
-        return detected_patterns if detected_patterns else None
-    
-    def calculate_risk_score(self, event):
-        """Calculate risk score based on multiple factors including file criticality"""
-        # Base score starts from file criticality
-        file_path = event.get('file_path', '')
-        base_score = self.calculate_file_criticality(file_path)
-        
-        # Adjust for MITRE technique severity
-        mitre_mapping = event.get('mitre_mapping', {})
-        # Check if mitre_mapping is a dictionary
-        if not isinstance(mitre_mapping, dict):
-            mitre_mapping = {}
-        technique_id = mitre_mapping.get('technique_id', '')
-        
-        technique_severity = 50  # Default value
-        if technique_id in self.mitre_techniques:
-            technique_severity = self.mitre_techniques[technique_id].get('severity', 50)
-        
-        # Adjust for anomaly detection results
-        anomaly_data = event.get('anomaly_detection', {})
-        # Check if anomaly_data is a dictionary
-        if not isinstance(anomaly_data, dict):
-            anomaly_data = {}
-        anomaly_score = anomaly_data.get('anomaly_score', 0)
-        
-        # Consider process correlation
-        process_correlation = event.get('process_correlation', {})
-        # Check if process_correlation is a dictionary
-        if not isinstance(process_correlation, dict):
-            process_correlation = {}
-        process_factor = 1.0  # Default neutral factor
-        
-        if process_correlation and process_correlation != "N/A":
-            process = process_correlation.get('related_process', {})
-            if not isinstance(process, dict):
-                process = {}
-            
-            # Check for suspicious processes
-            process_name = process.get('process_name', '').lower()
-            if process_name in self.suspicious_processes:
-                process_factor = 1.5
-            
-            # Check for unusual execution paths
-            cmd_line = process.get('cmdline', '').lower()
-            if cmd_line and ('/tmp/' in cmd_line or '/dev/shm/' in cmd_line):
-                process_factor = 1.4
-        
-        # Calculate final risk score
-        risk_multiplier = self.thresholds[self.environment]['risk_multiplier']
-        
-        # Combine all factors: base criticality, technique severity, anomaly score, and process factor
-        risk_score = (
-            (base_score * 0.3) +                      # 30% from file criticality
-            (technique_severity * 0.3) +              # 30% from MITRE technique severity
-            (anomaly_score * 50 * 0.2) +              # 20% from anomaly score (scaled from [-1,1] to [0,100])
-            (base_score * process_factor * 0.2)       # 20% from process context
-        ) * risk_multiplier
-        
-        # Cap at 100
-        risk_score = min(max(risk_score, 0), 100)
-        
-        return {
-            'score': risk_score,
-            'components': {
-                'file_criticality': base_score,
-                'technique_severity': technique_severity,
-                'anomaly_factor': anomaly_score * 50,
-                'process_factor': process_factor,
-                'environment_multiplier': risk_multiplier
-            },
-            'is_alert': risk_score >= self.thresholds[self.environment]['alert_threshold']
-        }
-
-    def calculate_risk_score(self, event):
-        """Calculate risk score based on multiple factors including file criticality"""
-        # Base score starts from file criticality
-        file_path = event.get('file_path', '')
-        base_score = self.calculate_file_criticality(file_path)
-        
-        # Adjust for MITRE technique severity
-        mitre_mapping = event.get('mitre_mapping', {})
-        # Check if mitre_mapping is a dictionary
-        if not isinstance(mitre_mapping, dict):
-            mitre_mapping = {}
-        technique_id = mitre_mapping.get('technique_id', '')
-        
-        technique_severity = 50  # Default value
-        if technique_id in self.mitre_techniques:
-            technique_severity = self.mitre_techniques[technique_id].get('severity', 50)
-        
-        # Adjust for anomaly detection results
-        anomaly_data = event.get('anomaly_detection', {})
-        # Check if anomaly_data is a dictionary
-        if not isinstance(anomaly_data, dict):
-            anomaly_data = {}
-        anomaly_score = anomaly_data.get('anomaly_score', 0)
-        
-        # Consider process correlation
-        process_correlation = event.get('process_correlation', {})
-        # Check if process_correlation is a dictionary
-        if not isinstance(process_correlation, dict):
-            process_correlation = {}
-        process_factor = 1.0  # Default neutral factor
-        
-        if process_correlation and process_correlation != "N/A":
-            process = process_correlation.get('related_process', {})
-            if not isinstance(process, dict):
-                process = {}
-            
-            # Check for suspicious processes
-            process_name = process.get('process_name', '').lower()
-            if process_name in self.suspicious_processes:
-                process_factor = 1.5
-            
-            # Check for unusual execution paths
-            cmd_line = process.get('cmdline', '').lower()
-            if cmd_line and ('/tmp/' in cmd_line or '/dev/shm/' in cmd_line):
-                process_factor = 1.4
-        
-        # Calculate final risk score
-        risk_multiplier = self.thresholds[self.environment]['risk_multiplier']
-        
-        # Combine all factors: base criticality, technique severity, anomaly score, and process factor
-        risk_score = (
-            (base_score * 0.3) +                      # 30% from file criticality
-            (technique_severity * 0.3) +              # 30% from MITRE technique severity
-            (anomaly_score * 50 * 0.2) +              # 20% from anomaly score (scaled from [-1,1] to [0,100])
-            (base_score * process_factor * 0.2)       # 20% from process context
-        ) * risk_multiplier
-        
-        # Cap at 100
-        risk_score = min(max(risk_score, 0), 100)
-        
-        return {
-            'score': risk_score,
-            'components': {
-                'file_criticality': base_score,
-                'technique_severity': technique_severity,
-                'anomaly_factor': anomaly_score * 50,
-                'process_factor': process_factor,
-                'environment_multiplier': risk_multiplier
-            },
-            'is_alert': risk_score >= self.thresholds[self.environment]['alert_threshold']
-        }
-
-############################################################
-
-################## FIM CONTROLLER CODE ENHANCEMENT #########
-
-def should_alert(event):
-    """Determine if an event should trigger an alert"""
-    # Check risk score
-    risk_assessment = event.get('risk_analysis', {})
-    if not isinstance(risk_assessment, dict):
-        risk_assessment = {}
-    if risk_assessment.get('is_alert', False):
-        return True
-    
-    # Check anomaly detection
-    anomaly = event.get('anomaly_detection', {})
-    if not isinstance(anomaly, dict):
-        anomaly = {}
-    if anomaly and anomaly.get('is_anomaly', False) and anomaly.get('anomaly_score', 0) < -0.7:
-        return True
-        
-    # Check attack chains
-    attack_patterns = event.get('attack_patterns', [])
-    if attack_patterns:
-        return True
-        
-    # Check malware indicators
-    indicators = event.get('malware_indicators', {})
-    if not isinstance(indicators, dict):
-        indicators = {}
-    if indicators and indicators.get('high_entropy', False):
-        return True
-        
-    # Check content analysis criticality
-    content = event.get('content_analysis', {})
-    if not isinstance(content, dict):
-        content = {}
-    type_specific = content.get('type_specific', {})
-    if not isinstance(type_specific, dict):
-        type_specific = {}
-    if content and type_specific.get('criticality', 'low') == 'high':
-        return True
-        
-    return False
-
-def get_alert_reasons(event):
-    """Get human-readable reasons for an alert"""
-    reasons = []
-    
-    # Risk score reason
-    risk = event.get('risk_analysis', {})
-    if risk.get('is_alert', False):
-        reasons.append(f"High risk score ({risk.get('score', 0):.2f})")
-        
-        # Add risk components
-        components = risk.get('components', {})
-        if components.get('file_criticality', 0) > 80:
-            reasons.append("Critical file modified")
-        if components.get('technique_severity', 0) > 80:
-            reasons.append("Severe MITRE technique detected")
-        if components.get('process_factor', 1.0) > 1.2:
-            reasons.append("Suspicious process involvement")
-    
-    # Anomaly reasons
-    anomaly = event.get('anomaly_detection', {})
-    if anomaly and anomaly.get('is_anomaly', False):
-        reasons.append(f"Behavioral anomaly ({anomaly.get('anomaly_score', 0):.2f})")
-        
-        # Add model-specific reasons
-        if 'model_scores' in anomaly:
-            for model, result in anomaly.get('model_scores', {}).items():
-                if result.get('is_anomaly', False):
-                    features = result.get('contributing_features', [])
-                    if features:
-                        reasons.append(f"Unusual {model} pattern: {', '.join(features)}")
-    
-    # Attack chain reasons
-    attack_patterns = event.get('attack_patterns', [])
-    if attack_patterns:
-        for pattern in attack_patterns:
-            reasons.append(f"Part of attack pattern: {pattern.get('pattern', 'Unknown')}")
-    
-    # Content analysis reasons
-    content = event.get('content_analysis', {})
-    if content:
-        if content.get('type_specific', {}).get('criticality', 'low') == 'high':
-            reasons.append("Critical content changes detected")
-            
-        # Add specific content reasons
-        if content.get('type_specific', {}).get('suspicious_patterns', {}):
-            patterns = content.get('type_specific', {}).get('suspicious_patterns', {})
-            for category in patterns:
-                reasons.append(f"Suspicious {category} found in content")
-    
-    # Malware indicators
-    indicators = event.get('malware_indicators', {})
-    if indicators and indicators.get('high_entropy', False):
-        reasons.append(f"High entropy content ({indicators.get('entropy', 0):.2f})")
-        
-    return reasons
-
-def get_suggested_actions(event):
-    """Get suggested actions based on the event"""
-    actions = []
-    risk_score = event.get('risk_analysis', {}).get('score', 0)
-    event_type = event.get('event_type', '')
-    file_path = event.get('file_path', '')
-    
-    # Basic actions based on risk
-    if risk_score > 90:
-        actions.append("Isolate host immediately")
-        actions.append("Initiate incident response procedure")
-    elif risk_score > 80:
-        actions.append("Terminate suspicious processes")
-        actions.append("Take file backup for forensic analysis")
-    elif risk_score > 70:
-        actions.append("Increase monitoring on this host")
-        
-    # Content-specific actions
-    content = event.get('content_analysis', {})
-    if content:
-        if content.get('type_specific', {}).get('format', '') == 'config':
-            actions.append("Review configuration changes")
-            
-        if content.get('type_specific', {}).get('format', '') == 'script':
-            suspicious = content.get('type_specific', {}).get('suspicious_patterns', {})
-            if suspicious:
-                actions.append("Review script for malicious code")
-    
-    # File-specific actions
-    if event_type == 'NEW FILE' and 'bin' in file_path:
-        actions.append("Verify executable authenticity")
-    
-    if event_type == 'MODIFIED' and any(ext in file_path for ext in ['.conf', '.cfg', '.ini']):
-        actions.append("Verify configuration changes with admin")
-        
-    # Malware indicators
-    indicators = event.get('malware_indicators', {})
-    if indicators and indicators.get('high_entropy', False):
-        actions.append("Scan file with anti-virus")
-        
-    # Minimal default action
-    if not actions:
-        actions.append("Investigate file changes")
-        
-    return actions
-
-def trigger_alert(event):
-    """Trigger an alert for a high-risk event"""
-    alert_file = os.path.join(OUTPUT_DIR, "fim_alerts.json")
-    
-    # Create alert object
-    alert = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "event_id": event.get("uuid", str(time.time())),
-        "file_path": event.get("file_path", ""),
-        "event_type": event.get("event_type", ""),
-        "risk_score": event.get("risk_analysis", {}).get("score", 0),
-        "anomaly_score": event.get("anomaly_detection", {}).get("anomaly_score", 0),
-        "alert_reasons": get_alert_reasons(event),
-        "suggested_actions": get_suggested_actions(event),
-        "raw_event": event
-    }
-    
-    # Write alert to file
-    try:
-        with open(alert_file, "a") as f:
-            f.write(json.dumps(alert) + "\n")
-    except Exception as e:
-        print(f"[ERROR] Failed to write alert: {e}")
-        
-    # Print alert to console
-    print(f"\n[ALERT] High-risk file integrity event detected!")
-    print(f"[ALERT] File: {alert['file_path']}")
-    print(f"[ALERT] Event: {alert['event_type']}")
-    print(f"[ALERT] Risk Score: {alert['risk_score']:.2f}")
-    print(f"[ALERT] Reasons: {', '.join(alert['alert_reasons'])}")
-    print(f"[ALERT] Suggested Actions: {', '.join(alert['suggested_actions'])}")
-    
-############################################################
-
 def handle_shutdown(signum=None, frame=None):
     """Cleanly handle shutdown signals."""
     print("[INFO] Caught termination signal. Cleaning up...")
     
-    # Clean up context detection resources if needed
-    global context_detection, adv_content_analysis
-    if context_detection:
-        print("[INFO] Context-aware detection shut down.")
-    
+    # Clean up resources
+    global adv_content_analysis
     if adv_content_analysis:
         print("[INFO] Advanced content analysis shut down.")
 
@@ -3303,23 +1885,18 @@ def print_help():
 File Integrity Monitor (FIM) Client
 
 Usage:
-  python fim_client.py [option]
+  python fim.py [option]
 
 Options:
   help               Show this help message and exit
   -d or daemon       Run FIM in background (daemon) mode
   -s or stop         Stop FIM daemon process
-  -l or log-config   Configure SIEM logging (interactive)
 """)
 
 if __name__ == "__main__":
     args = sys.argv[1:]  # Get command-line arguments
 
-    # Check ML libraries
-    if not ML_LIBRARIES_AVAILABLE:
-        print("[WARNING] Running without machine learning capability - some advanced detection features will be unavailable")
-        
-    print("Enhanced with machine learning, MITRE ATT&CK mapping, and process correlation")
+    print("FIM Security Tool")
 
     if not args:
         print("[INFO] Running in foreground mode...")
@@ -3330,10 +1907,6 @@ if __name__ == "__main__":
 
     if arg in ("help", "-h", "--help"):
         print_help()
-        sys.exit(0)
-
-    elif arg in ("-l", "log-config"):
-        audit.configure_siem()
         sys.exit(0)
 
     elif arg in ("-s", "stop"):
