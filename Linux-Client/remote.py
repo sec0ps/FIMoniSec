@@ -42,7 +42,7 @@ import subprocess
 import select
 from pathlib import Path
 from client_crypt import encrypt_data, decrypt_data
-from monisec_client import start_process, stop_process, restart_process, is_process_running, PROCESSES
+from fimonisec_client import start_process, stop_process, restart_process, is_process_running, PROCESSES
 
 # Global flag to track if an IR shell is currently active
 ir_shell_active = False
@@ -56,16 +56,15 @@ websocket_shutdown_event = threading.Event()
 websocket_client_started = False
 websocket_client_lock = threading.Lock()
 
-def get_base_dir():
-    """Get the base directory for the application based on script location"""
-    return os.path.dirname(os.path.abspath(__file__))
-
-# Define BASE_DIR statically
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
-# Update LOG_FILES and LOG_FILE paths
-LOG_FILES = [os.path.join(BASE_DIR, "logs/file_monitor.json")]
-LOG_FILE = os.path.join(BASE_DIR, "logs/file_monitor.json")
+LOG_FILES = [
+    os.path.join(LOG_DIR, "file_monitor.json"),
+    os.path.join(LOG_DIR, "pim_monitor.json"),
+    os.path.join(OUTPUT_DIR, "integrity_processes.json")
+]
 
 # Update AUTH_TOKEN_FILE path
 AUTH_TOKEN_FILE = os.path.join(BASE_DIR, "auth_token.json")
@@ -298,6 +297,28 @@ def send_chunked_data(sock, data):
         logging.error(f"Error sending chunked data: {e}")
         return False
 
+def save_file_positions(positions):
+    """Save file positions to disk for persistence across restarts."""
+    positions_file = os.path.join(OUTPUT_DIR, "log_positions.json")
+    try:
+        with open(positions_file, "w") as f:
+            # Convert dict keys to strings since all keys are paths anyway
+            serializable_positions = {str(k): v for k, v in positions.items()}
+            json.dump(serializable_positions, f)
+    except Exception as e:
+        logging.error(f"[LOGS] Failed to save file positions: {e}")
+
+def load_file_positions():
+    """Load file positions from disk."""
+    positions_file = os.path.join(OUTPUT_DIR, "log_positions.json")
+    if os.path.exists(positions_file):
+        try:
+            with open(positions_file, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"[LOGS] Failed to load file positions: {e}")
+    return {}
+
 def send_logs_to_server():
     """Continuously monitor log files and send new entries to the server."""
     RETRIES = 5
@@ -371,10 +392,25 @@ def send_logs_to_server():
             logging.critical("[LOGS] Could not connect to server after multiple attempts.")
             return
 
-        file_positions = {
-            log_file: os.path.getsize(log_file) if os.path.exists(log_file) else 0
-            for log_file in LOG_FILES
-        }
+        # Load saved positions from disk or initialize
+        saved_positions = load_file_positions()
+        file_positions = {}
+        
+        # Initialize each file with saved position or current size
+        for log_file in LOG_FILES:
+            if str(log_file) in saved_positions and os.path.exists(log_file):
+                file_size = os.path.getsize(log_file)
+                saved_pos = int(saved_positions[str(log_file)])
+                
+                # Validate the saved position against file size
+                if saved_pos <= file_size:
+                    file_positions[log_file] = saved_pos
+                else:
+                    logging.warning(f"[LOGS] Saved position {saved_pos} exceeds file size {file_size} for {log_file}. Using file size.")
+                    file_positions[log_file] = file_size
+            else:
+                file_positions[log_file] = os.path.getsize(log_file) if os.path.exists(log_file) else 0
+        
         for log_file, pos in file_positions.items():
             logging.info(f"[LOGS] Initial position for {log_file}: {pos}")
 
@@ -447,6 +483,9 @@ def send_logs_to_server():
                         logging.info(f"[LOGS] Logs sent and ACK received.")
                         for log_file, data in logs_to_send.items():
                             file_positions[log_file] = data["new_position"]
+                        
+                        # Save positions to disk for persistence
+                        save_file_positions(file_positions)
                     else:
                         logging.warning(f"[LOGS] Unexpected server response: {ack}")
                         if not ack:
@@ -484,6 +523,10 @@ def send_logs_to_server():
     except Exception as e:
         logging.error(f"[LOGS] Fatal client error: {e}")
     finally:
+        # Save positions before exiting
+        if 'file_positions' in locals():
+            save_file_positions(file_positions)
+            
         if sock:
             sock.close()
             logging.info("[LOGS] Connection to server closed.")
@@ -535,7 +578,7 @@ def extract_valid_json_objects(buffer):
         except Exception:
             pass
     
-    logging.info(f"Successfully extracted {len(logs)} log entries")
+    #logging.info(f"Successfully extracted {len(logs)} log entries")
     return logs
 
 def send_chunked_data(sock, data):
@@ -626,13 +669,11 @@ def handle_server_commands(client_socket):
             command = command_data.get("command")
             params = command_data.get("params", {})
             
-            logging.info(f"[COMMAND] Received command: {command} with params: {params}")
+            #logging.info(f"[COMMAND] Received command: {command} with params: {params}")
             
             # Process the command
             if command == "restart":
                 result = handle_restart_command(params)
-            elif command == "yara-scan":
-                result = handle_yara_scan_command(params)
             elif command == "ir-shell-init":
                 result = handle_ir_shell_init_command(params)
             elif command == "ir-shell-command":
@@ -715,56 +756,6 @@ def handle_restart_command(params):
         return {
             "status": "error",
             "message": f"Failed to restart {service}: {e}"
-        }
-
-def handle_yara_scan_command(params):
-    """Handle a YARA scan command."""
-    target_path = params.get("target_path")
-    rule_name = params.get("rule_name")
-    
-    if not target_path:
-        return {"status": "error", "message": "Missing target_path parameter"}
-    
-    try:
-        logging.info(f"[COMMAND] Running YARA scan on path: {target_path}")
-        
-        # Import the YARA manager
-        from malscan_yara import YaraManager
-        yara_manager = YaraManager()
-        
-        # Ensure YARA rules are loaded
-        if not yara_manager.ensure_rules_exist():
-            return {"status": "error", "message": "Failed to load YARA rules"}
-            
-        # Run the scan
-        if rule_name:
-            # Scan with a specific rule
-            matches = yara_manager.scan_with_rule(target_path, rule_name)
-        else:
-            # Scan with all rules
-            matches = yara_manager.scan_path(target_path)
-        
-        # Format results
-        results = []
-        for match in matches:
-            results.append({
-                "rule": match.rule,
-                "namespace": match.namespace,
-                "tags": match.tags,
-                "meta": match.meta,
-                "file": match.file
-            })
-        
-        return {
-            "status": "success",
-            "message": f"YARA scan completed. Found {len(results)} matches.",
-            "results": results
-        }
-    except Exception as e:
-        logging.error(f"[ERROR] YARA scan failed: {e}")
-        return {
-            "status": "error",
-            "message": f"YARA scan failed: {e}"
         }
 
 def handle_ir_shell_init_command(params):
@@ -1267,20 +1258,6 @@ def get_basic_log_info():
         except Exception as e:
             info.append(f"\nRecent authentication logs unavailable: {e}")
             
-        # FIMonsec logs
-        try:
-            fimsec_log = LOG_FILE  # Using the global LOG_FILE from the script
-            if os.path.exists(fimsec_log):
-                fimsec_logs = subprocess.check_output(
-                    f"/usr/bin/tail -n 10 {fimsec_log}", shell=True
-                ).decode("utf-8")
-                info.append(f"\nRecent FIMonsec Logs ({fimsec_log}):")
-                info.append(fimsec_logs)
-            else:
-                info.append("\nFIMonsec log file not found or not accessible")
-        except Exception as e:
-            info.append(f"\nRecent FIMonsec logs unavailable: {e}")
-        
         return "\n".join(info)
     except Exception as e:
         return f"Error retrieving log information: {e}"
@@ -1397,7 +1374,7 @@ async def websocket_client_connect(server_ip, client_name, psk):
                     await asyncio.sleep(local_reconnect_delay)
                     continue
 
-                logging.info(f"[WEBSOCKET] Auth success for {client_name}")
+                #logging.info(f"[WEBSOCKET] Auth success for {client_name}")
 
                 # Launch command poller and heartbeat tasks
                 poll_task = asyncio.create_task(poll_for_commands(client_name, websocket))
@@ -1449,7 +1426,6 @@ async def websocket_heartbeat(websocket):
                 "type": "heartbeat",
                 "timestamp": time.time()
             }))
-            # Removed DEBUG log
 
             # Wait for response with timeout
             try:
@@ -1461,7 +1437,6 @@ async def websocket_heartbeat(websocket):
                 if response_data.get("type") == "heartbeat_ack":
                     # Reset counter on successful heartbeat
                     missed_heartbeats = 0
-                    # Removed DEBUG log
                 # If it's not a heartbeat_ack, we still got a response, so connection is alive
                 
             except asyncio.TimeoutError:
@@ -1489,12 +1464,10 @@ async def maintain_heartbeat(websocket):
                     "type": "heartbeat",
                     "timestamp": time.time()
                 }))
-                # Removed DEBUG log
                 
                 # Wait for the next interval
                 await asyncio.sleep(30)  # Send heartbeat every 30 seconds
             except asyncio.CancelledError:
-                # Removed DEBUG log
                 return
             except Exception as e:
                 logging.error(f"[WEBSOCKET] Heartbeat error: {e}")
@@ -1547,7 +1520,7 @@ async def process_shell_command(websocket, client_name, command, command_id):
             "command_id": command_id,
             "response": response
         }))
-        logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
+        #logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
         
     except Exception as e:
         logging.error(f"[WEBSOCKET] Error processing command {command}: {e}")
@@ -1569,14 +1542,11 @@ async def process_websocket_command(websocket, message):
     global ir_shell_active
 
     try:
-        # Log incoming message but truncate if too long
-       # logging.info(f"[WEBSOCKET-DEBUG] Received message: {message[:100]}..." if len(message) > 100 else f"[WEBSOCKET-DEBUG] Received message: {message}")
-
         # Parse the message as JSON
         data = json.loads(message)
         command_type = data.get("type")
         
-        logging.info(f"[WEBSOCKET] Processing message type: {command_type}")
+        #logging.info(f"[WEBSOCKET] Processing message type: {command_type}")
         
         # Handle different message types
         if command_type == "ir_shell_command":
@@ -1636,11 +1606,10 @@ async def process_websocket_command(websocket, message):
                 "type": "heartbeat",
                 "timestamp": time.time()
             }))
-            logging.debug("[WEBSOCKET] Replied to heartbeat from server")
             
         elif command_type == "heartbeat_ack":
             # Just acknowledge the receipt
-            logging.debug("[WEBSOCKET] Received heartbeat acknowledgment")
+            pass
             
         else:
             logging.warning(f"[WEBSOCKET] Unknown command type received: {command_type}")
@@ -1657,7 +1626,6 @@ async def process_websocket_message(websocket, message):
     global ir_shell_active
     
     try:
-        # Removed DEBUG log
         
         data = json.loads(message)
         message_type = data.get("type")
@@ -1666,10 +1634,10 @@ async def process_websocket_message(websocket, message):
             commands = data.get("commands", [])
             
             if not commands:
-                # Removed DEBUG log
+
                 return
                 
-            logging.info(f"[WEBSOCKET] Received {len(commands)} pending commands")
+            #logging.info(f"[WEBSOCKET] Received {len(commands)} pending commands")
             
             # Process each command
             for cmd in commands:
@@ -1681,7 +1649,7 @@ async def process_websocket_message(websocket, message):
                     logging.warning(f"[WEBSOCKET] Incomplete command data: {cmd}")
                     continue
                     
-                logging.info(f"[WEBSOCKET] Processing command: {command} (ID: {command_id})")
+                #logging.info(f"[WEBSOCKET] Processing command: {command} (ID: {command_id})")
                 
                 # Handle the command based on type
                 if command == "ir-shell-init":
@@ -1734,7 +1702,7 @@ async def process_websocket_message(websocket, message):
                         "response": response
                     }
                     await websocket.send(json.dumps(response_msg))
-                    logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
+                    #logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
                 except Exception as e:
                     logging.error(f"[WEBSOCKET] Failed to send response for command {command_id}: {e}")
         
@@ -1743,11 +1711,9 @@ async def process_websocket_message(websocket, message):
                 "type": "heartbeat_ack",
                 "timestamp": time.time()
             }))
-            # Removed DEBUG log
             
         elif message_type == "heartbeat_ack":
-            # Just acknowledge the receipt
-            # Removed DEBUG log
+
             pass
             
         else:
@@ -1918,7 +1884,6 @@ async def poll_for_commands(client_name, websocket):
                     "client_name": client_name,
                     "timestamp": time.time()
                 }))
-                # Removed DEBUG log
             except Exception as e:
                 logging.error(f"[COMMAND-POLL] Failed to send poll request: {e}")
                 
@@ -1949,6 +1914,6 @@ async def poll_for_commands_now(websocket):
             "client_name": client_name,
             "timestamp": time.time()
         }))
-        # Removed DEBUG log
+
     except Exception as e:
         logging.error(f"[COMMAND-POLL] Poll request error: {e}")
