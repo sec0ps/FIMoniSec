@@ -39,13 +39,12 @@ import atexit
 import json
 import remote
 import updater
-#import yara
-#from malscan_yara import ensure_rules_exist, update_rules, compile_rules, yara_scan_file
+import json
+import socket
 from pathlib import Path
 from utils.process_guardian import ProcessGuardian
 
 # Define BASE_DIR as a static path
-# In monisec_client.py
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
 UTILS_DIR = os.path.join(BASE_DIR, "utils")
 sys.path.append(UTILS_DIR)
@@ -65,7 +64,8 @@ def ensure_directories_and_files(base_dir):
         os.path.join(base_dir, "logs", "file_monitor.json"),
         os.path.join(base_dir, "logs", "monisec-endpoint.log"),
         os.path.join(base_dir, "logs", "process_monitor.log"),
-        os.path.join(base_dir, "logs", "log_monitor.log")
+        os.path.join(base_dir, "logs", "log_monitor.log"),
+        os.path.join(base_dir, "logs", "pim_monitor.json")
     ]
     
     # Create directories if they don't exist
@@ -106,7 +106,7 @@ ensure_directories_and_files(BASE_DIR)
 LOG_FILE = os.path.join(BASE_DIR, "logs", "monisec-endpoint.log")
 log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)
+root_logger.setLevel(logging.INFO)
 
 # Clear any existing handlers to avoid duplication
 for handler in root_logger.handlers[:]:
@@ -115,7 +115,7 @@ for handler in root_logger.handlers[:]:
 # Add file handler
 log_handler = logging.FileHandler(LOG_FILE)
 log_handler.setFormatter(log_formatter)
-log_handler.setLevel(logging.DEBUG)
+log_handler.setLevel(logging.INFO)
 root_logger.addHandler(log_handler)
 logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('asyncio').setLevel(logging.WARNING)
@@ -124,7 +124,7 @@ logging.getLogger('asyncio').setLevel(logging.WARNING)
 if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(log_formatter)
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     root_logger.addHandler(console_handler)
 
 # List of monitored processes
@@ -461,7 +461,6 @@ def monitor_processes():
         # Adaptive sleep: shorter interval if there were issues, longer if stable
         if processes_checked > 0:  # Only sleep if we're monitoring at least one process
             sleep_time = 60 if all_running else 10
-            # Removed debug logging here
             time.sleep(sleep_time)
         else:
             # If no processes to monitor, use a longer sleep
@@ -878,6 +877,69 @@ def list_exclusions(exclusion_type=None):
             print(f"\n{current_type.upper()} EXCLUSIONS:")
             print("  None (section not found in configuration)")
 
+def configure_siem():
+
+    config = load_or_create_config()  # Load existing configuration
+    siem_ip = input("Enter SIEM server IP address: ").strip()
+    siem_port = input("Enter TCP port for log transmission: ").strip()
+
+    try:
+        siem_port = int(siem_port)
+    except ValueError:
+        print("[ERROR] Invalid port number. Please enter a numeric value.")
+        return
+
+    # Update configuration with SIEM settings
+    config["siem_settings"] = {
+        "enabled": True,
+        "siem_server": siem_ip,
+        "siem_port": siem_port
+    }
+
+    # Save the updated configuration
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+    print(f"[INFO] SIEM server configuration saved in {CONFIG_FILE}.")
+
+def load_siem_config():
+    """Load SIEM server configuration from fim.config."""
+    if not os.path.exists(CONFIG_FILE):
+        print("[ERROR] Configuration file not found.")
+        return None
+
+    with open(CONFIG_FILE, "r") as f:
+        try:
+            config = json.load(f)
+            return config.get("siem_settings", None)  # ✅ Correct key
+        except json.JSONDecodeError:
+            print("[ERROR] Invalid JSON format in fim.config.")
+            return None
+
+def send_to_siem(log_entry):
+    """Send log entry to the configured SIEM server via TCP if enabled."""
+    siem_config = load_siem_config()
+
+    if not siem_config or not siem_config.get("enabled", False):
+        return  # Do nothing if SIEM is disabled
+
+    siem_host = siem_config.get("siem_server")
+    siem_port = siem_config.get("siem_port")
+
+    if not siem_host or not siem_port:
+        print("[ERROR] SIEM server or port not configured, skipping log transmission.")
+        return
+
+    log_data = json.dumps(log_entry) + "\n"
+
+    try:
+        with socket.create_connection((siem_host, siem_port), timeout=5) as sock:
+            sock.sendall(log_data.encode("utf-8"))
+    except socket.timeout:
+        print(f"[ERROR] Timeout while sending log to SIEM {siem_host}:{siem_port}")
+    except Exception as e:
+        print(f"[ERROR] Failed to send log to SIEM: {e}")
+
 if __name__ == "__main__":
     # Define flag to skip guardian initialization for stop/restart commands
     no_guardian = len(sys.argv) <= 1 or sys.argv[1] != "start"
@@ -931,7 +993,11 @@ if __name__ == "__main__":
             else:
                 print(f"[ERROR] Invalid command. Usage: monisec_client {action} start|stop|restart")
                 sys.exit(1)
-                
+
+        elif action == "config-siem":
+            configure_siem()
+            sys.exit(0)
+    
         # Daemon mode
         elif action == "-d":
             # Run updater in daemon mode
@@ -1058,19 +1124,20 @@ if __name__ == "__main__":
         else:
             print(
                 """Usage:
-            monisec_client restart                                # Restart monisec_client
-            monisec_client stop                                   # Stop monisec_client daemon
-            monisec_client pim start|stop|restart                 # Control PIM process
-            monisec_client fim start|stop|restart                 # Control FIM process
-            monisec_client lim start|stop|restart                 # Control LIM process
-            monisec_client import-psk                             # Import PSK for authentication
-            monisec_client auth test                              # Test authentication, then exit
-            monisec_client exclusion add <type> <value>           # Add an exclusion
-            monisec_client exclusion remove <type> <value>        # Remove an exclusion
-            monisec_client exclusion list [type]                  # List all exclusions or of a specific type
-            
-            Exclusion types: ip, user, file, directory, pattern, extension
-        """
+                monisec_client restart                                # Restart monisec_client
+                monisec_client stop                                   # Stop monisec_client daemon
+                monisec_client pim start|stop|restart                 # Control PIM process
+                monisec_client fim start|stop|restart                 # Control FIM process
+                monisec_client lim start|stop|restart                 # Control LIM process
+                monisec_client import-psk                             # Import PSK for authentication
+                monisec_client auth test                              # Test authentication, then exit
+                monisec_client config-siem                            # Configure SIEM integration
+                monisec_client exclusion add <type> <value>           # Add an exclusion
+                monisec_client exclusion remove <type> <value>        # Remove an exclusion
+                monisec_client exclusion list [type]                  # List all exclusions or of a specific type
+                
+                Exclusion types: ip, user, file, directory, pattern, extension
+            """
             )
             sys.exit(1)
 
