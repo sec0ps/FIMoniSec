@@ -235,8 +235,6 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
     """Log file change events with exact details of what changed."""
     global integrity_state, is_baseline_mode
     
-    print(f"[DEBUG] log_event called for {event_type} on {file_path}")
-    
     # Skip alerts during baseline mode
     if is_baseline_mode:
         return None
