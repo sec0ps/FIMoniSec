@@ -65,6 +65,7 @@ def ensure_directories_and_files(base_dir):
         os.path.join(base_dir, "logs", "monisec-endpoint.log"),
         os.path.join(base_dir, "logs", "process_monitor.log"),
         os.path.join(base_dir, "logs", "log_monitor.log"),
+        os.path.join(base_dir, "logs", "lim_monitor.json"),
         os.path.join(base_dir, "logs", "pim_monitor.json")
     ]
     
@@ -199,7 +200,7 @@ def initialize_process_protection():
     """Initialize process protection mechanisms."""
     # Protected processes to monitor
     protected_processes = [
-        "monisec_client.py",
+        "fimonisec_client.py",
         "fim.py",
         "lim.py",
         "pim.py"
@@ -208,7 +209,7 @@ def initialize_process_protection():
     # Create and start the process guardian
     guardian = ProcessGuardian(
         process_names=protected_processes,
-        pid_file=os.path.join(BASE_DIR, "output", "monisec_client.pid"),
+        pid_file=os.path.join(BASE_DIR, "output", "fimonisec_client.pid"),
         foreground_mode=True,
         install_signals=False
     )
@@ -438,8 +439,8 @@ def monitor_processes():
         processes_checked = 0
         
         for name in PROCESSES:
-            # Skip monisec_client as it shouldn't be self-monitored
-            if name == "monisec_client":
+            # Skip fimonisec_client as it shouldn't be self-monitored
+            if name == "fimonisec_client":
                 continue
                 
             processes_checked += 1
@@ -466,9 +467,9 @@ def monitor_processes():
             # If no processes to monitor, use a longer sleep
             time.sleep(300)
 
-def stop_monisec_client_daemon():
+def stop_fimonisec_client_daemon():
     """Stop the MoniSec client running in daemon mode and its watchdog."""
-    pidfile = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+    pidfile = os.path.join(BASE_DIR, "output", "fimonisec_client.pid")
     watchdog_pidfile = os.path.join(BASE_DIR, "output", "enhanced_watchdog.pid")
     
     # Create control file to stop ProcessGuardian monitoring
@@ -583,7 +584,7 @@ def stop_monisec_client_daemon():
 
 def start_daemon():
     """Start MoniSec client in daemon mode with PID file tracking."""
-    pidfile = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+    pidfile = os.path.join(BASE_DIR, "output", "fimonisec_client.pid")
     
     pid = os.fork()
     if pid > 0:
@@ -718,7 +719,7 @@ def handle_exit(signum, frame):
             pass
     
     # Cleanup pid file
-    pid_file = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+    pid_file = os.path.join(BASE_DIR, "output", "fimonisec_client.pid")
     if os.path.exists(pid_file):
         try:
             os.remove(pid_file)
@@ -735,7 +736,7 @@ def handle_exit(signum, frame):
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
-# Add these functions to your existing monisec_client.py file
+# Add these functions to your existing fimonisec_client.py file
 
 def manage_exclusions(command, exclusion_type, value=None):
     """
@@ -817,7 +818,7 @@ def manage_exclusions(command, exclusion_type, value=None):
         
         # If we're working with file/directory exclusions, we may need to restart the FIM service
         if exclusion_type in ['file', 'directory', 'pattern', 'extension']:
-            print("[INFO] File exclusions changed. Consider restarting the FIM service with: monisec_client fim restart")
+            print("[INFO] File exclusions changed. Consider restarting the FIM service with: fimonisec_client fim restart")
         
         return True
     except Exception as e:
@@ -967,17 +968,17 @@ if __name__ == "__main__":
                     print("[ERROR] Authentication failed.")
                     sys.exit(1)
             else:
-                print("[ERROR] Invalid command. Usage: monisec_client auth test")
+                print("[ERROR] Invalid command. Usage: fimonisec_client auth test")
                 sys.exit(1)
 
         # Command processing continues here
         if action == "restart":
-            stop_monisec_client_daemon()
+            stop_fimonisec_client_daemon()
             time.sleep(2)
-            start_process("monisec_client")
+            start_process("fimonisec_client")
 
         elif action == "stop":
-            stop_monisec_client_daemon()
+            stop_fimonisec_client_daemon()
             sys.exit(0)  # Exit immediately after stopping
 
         elif action in ["pim", "fim", "lim"]:
@@ -991,7 +992,7 @@ if __name__ == "__main__":
                 elif sys.argv[2] == "restart":
                     restart_process(target_process)
             else:
-                print(f"[ERROR] Invalid command. Usage: monisec_client {action} start|stop|restart")
+                print(f"[ERROR] Invalid command. Usage: fimonisec_client {action} start|stop|restart")
                 sys.exit(1)
 
         elif action == "config-siem":
@@ -1007,7 +1008,7 @@ if __name__ == "__main__":
                 logging.warning(f"Updater failed: {e}")
             
             # Check if already running - with improved stale PID detection
-            pid_file = os.path.join(BASE_DIR, "output", "monisec_client.pid")
+            pid_file = os.path.join(BASE_DIR, "output", "fimonisec_client.pid")
             
             # Force remove any existing PID file regardless of content
             if os.path.exists(pid_file):
@@ -1023,7 +1024,7 @@ if __name__ == "__main__":
                 try:
                     cmdline = " ".join(proc.info['cmdline'] or [])
                     # Only count it if it's not our current process
-                    if "monisec_client.py" in cmdline and "-d" in cmdline and proc.info['pid'] != os.getpid():
+                    if "fimonisec_client.py" in cmdline and "-d" in cmdline and proc.info['pid'] != os.getpid():
                         running_monisec_processes.append(proc.info['pid'])
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
@@ -1052,7 +1053,7 @@ if __name__ == "__main__":
             sys.stdin = open(os.devnull, 'r')
         
             # Set path to PID file using absolute path
-            pid_file = os.path.abspath(os.path.join(output_dir, "monisec_client.pid"))
+            pid_file = os.path.abspath(os.path.join(output_dir, "fimonisec_client.pid"))
             
             # Write PID to file with error handling
             try:
@@ -1091,7 +1092,7 @@ if __name__ == "__main__":
     
         elif action == "exclusion":
             if len(sys.argv) < 3:
-                print("[ERROR] Invalid command. Usage: monisec_client exclusion add|remove|list [type] [value]")
+                print("[ERROR] Invalid command. Usage: fimonisec_client exclusion add|remove|list [type] [value]")
                 sys.exit(1)
                 
             excl_action = sys.argv[2]
@@ -1108,7 +1109,7 @@ if __name__ == "__main__":
                 
             elif excl_action in ["add", "remove"]:
                 if len(sys.argv) < 5:
-                    print(f"[ERROR] Invalid command. Usage: monisec_client exclusion {excl_action} <type> <value>")
+                    print(f"[ERROR] Invalid command. Usage: fimonisec_client exclusion {excl_action} <type> <value>")
                     print("Valid types: ip, user, file, directory, pattern, extension")
                     sys.exit(1)
                     
@@ -1124,17 +1125,17 @@ if __name__ == "__main__":
         else:
             print(
                 """Usage:
-                monisec_client restart                                # Restart monisec_client
-                monisec_client stop                                   # Stop monisec_client daemon
-                monisec_client pim start|stop|restart                 # Control PIM process
-                monisec_client fim start|stop|restart                 # Control FIM process
-                monisec_client lim start|stop|restart                 # Control LIM process
-                monisec_client import-psk                             # Import PSK for authentication
-                monisec_client auth test                              # Test authentication, then exit
-                monisec_client config-siem                            # Configure SIEM integration
-                monisec_client exclusion add <type> <value>           # Add an exclusion
-                monisec_client exclusion remove <type> <value>        # Remove an exclusion
-                monisec_client exclusion list [type]                  # List all exclusions or of a specific type
+                fimonisec_client restart                                # Restart fimonisec_client
+                fimonisec_client stop                                   # Stop fimonisec_client daemon
+                fimonisec_client pim start|stop|restart                 # Control PIM process
+                fimonisec_client fim start|stop|restart                 # Control FIM process
+                fimonisec_client lim start|stop|restart                 # Control LIM process
+                fimonisec_client import-psk                             # Import PSK for authentication
+                fimonisec_client auth test                              # Test authentication, then exit
+                fimonisec_client config-siem                            # Configure SIEM integration
+                fimonisec_client exclusion add <type> <value>           # Add an exclusion
+                fimonisec_client exclusion remove <type> <value>        # Remove an exclusion
+                fimonisec_client exclusion list [type]                  # List all exclusions or of a specific type
                 
                 Exclusion types: ip, user, file, directory, pattern, extension
             """
