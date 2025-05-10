@@ -63,6 +63,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_FILES = [
     os.path.join(LOG_DIR, "file_monitor.json"),
     os.path.join(LOG_DIR, "pim_monitor.json"),
+    os.path.join(LOG_DIR, "lim_monitor.json"),
     os.path.join(OUTPUT_DIR, "integrity_processes.json")
 ]
 
