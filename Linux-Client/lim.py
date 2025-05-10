@@ -1066,6 +1066,10 @@ class LogIntegrityMonitor:
                 size_proc.terminate()
                 size_proc.wait()
                 
+            except KeyboardInterrupt:
+                self.logger.info("Operation interrupted by user")
+                self.running = False
+                raise
             except Exception as e:
                 self.logger.warning(f"Error getting file size for {log_file}: {str(e)}")
                 # If we can't get the file size, use a safer approach
@@ -1115,10 +1119,18 @@ class LogIntegrityMonitor:
                 alerts = self.analyze_log_entries(entries, log_file, log_category)
                 
                 return alerts
+            except KeyboardInterrupt:
+                self.logger.info("Operation interrupted by user")
+                self.running = False
+                raise
             except Exception as e:
                 self.logger.warning(f"Error reading content from {log_file}: {str(e)}")
                 return []
                 
+        except KeyboardInterrupt:
+            self.logger.info("Operation interrupted by user")
+            self.running = False
+            raise
         except Exception as e:
             self.logger.error(f"Error processing log file {log_file}: {str(e)}")
             return []
@@ -1433,7 +1445,7 @@ class LogIntegrityMonitor:
         
         logs_dir = os.path.join(self.base_dir, "logs")
         os.makedirs(logs_dir, exist_ok=True)
-        output_file = os.path.join(logs_dir, "lim.json")
+        output_file = os.path.join(logs_dir, "lim_monitor.json")
 
         # Read existing alerts if file exists
         existing_alerts = []
@@ -1464,23 +1476,28 @@ class LogIntegrityMonitor:
         """Scan log files, update config, and analyze current state"""
         self.logger.info("Starting log scan")
         
-        # Find log files
-        log_files = self.find_log_files()
-        
-        # Update config with found logs
-        self.update_config_with_logs(log_files)
-        
-        # Analyze all logs
-        alerts = self.process_monitored_logs()
-        
-        # Write alerts
-        self.write_alerts(alerts)
-        
-        # Save log positions
-        self.save_log_positions()
-        
-        self.logger.info(f"Log scan completed, {len(alerts)} alerts generated")
-        return len(alerts)
+        try:
+            # Find log files
+            log_files = self.find_log_files()
+            
+            # Update config with found logs
+            self.update_config_with_logs(log_files)
+            
+            # Analyze all logs
+            alerts = self.process_monitored_logs()
+            
+            # Write alerts
+            self.write_alerts(alerts)
+            
+            # Save log positions
+            self.save_log_positions()
+            
+            self.logger.info(f"Log scan completed, {len(alerts)} alerts generated")
+            return len(alerts)
+        except KeyboardInterrupt:
+            self.logger.info("Scan interrupted by user")
+            self.running = False
+            return 0
     
     def monitoring_loop(self):
         """Main monitoring loop"""
@@ -1489,20 +1506,23 @@ class LogIntegrityMonitor:
         
         try:
             while self.running:
-                # Process logs
-                alerts = self.process_monitored_logs()
-                
-                # Write alerts
-                self.write_alerts(alerts)
-                
-                # Save log positions periodically
-                self.save_log_positions()
-                
-                # Sleep
-                time.sleep(10)  # Check logs every 10 seconds
-                
-        except KeyboardInterrupt:
-            self.logger.info("Monitoring stopped by user")
+                try:
+                    # Process logs
+                    alerts = self.process_monitored_logs()
+                    
+                    # Write alerts
+                    self.write_alerts(alerts)
+                    
+                    # Save log positions periodically
+                    self.save_log_positions()
+                    
+                    # Sleep
+                    time.sleep(10)  # Check logs every 10 seconds
+                except KeyboardInterrupt:
+                    self.logger.info("Monitoring stopped by user")
+                    self.running = False
+                    break
+                    
         except Exception as e:
             self.logger.error(f"Error in monitoring loop: {str(e)}")
         finally:
@@ -1511,11 +1531,16 @@ class LogIntegrityMonitor:
     
     def start(self):
         """Start monitoring in foreground"""
-        # Initial scan
-        self.scan_logs()
-        
-        # Start monitoring
-        self.monitoring_loop()
+        try:
+            # Initial scan
+            self.scan_logs()
+            
+            # Start monitoring
+            self.monitoring_loop()
+        except KeyboardInterrupt:
+            self.logger.info("Process interrupted by user")
+            self.running = False
+            print("\nMonitoring stopped by user interrupt (Ctrl+C)")
 
     @staticmethod
     def stop_daemon(pid_file=None):
