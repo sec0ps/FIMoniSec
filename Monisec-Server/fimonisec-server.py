@@ -533,7 +533,7 @@ async def websocket_server(host="0.0.0.0", port=8765):
     logging.info(f"[WEBSOCKET] Server started on {host}:{port}")
     return server
 
-def show_connected_clients():
+def show_connected_agents():
     """
     Display all clients connected to the server (both direct and WebSocket).
     This consolidates functionality from the previous debug-websocket and websocket-status commands.
@@ -668,9 +668,7 @@ Remote Commands:
   
   Valid modules: monisec_client, fim_client, pim, lim
   
-  yara-scan <client> <path>      Run a YARA scan on a client.
   ir-shell <client>              Spawn an incident response shell on a client.
-  update <client>                Trigger a client update.
 
 Server Control:
   -d                             Launch the MoniSec Server as a daemon.
@@ -706,15 +704,15 @@ if __name__ == "__main__":
             sys.exit(0)
 
         elif action == "list-agents":
-            clients.list_clients()
+            clients.list_agents()
             sys.exit(0)
 
         elif action == "add-agent":
-            clients.add_client()
+            clients.add_agent()
             sys.exit(0)
             
-        elif action == "list-connected-clients":
-            show_connected_clients()
+        elif action == "list-connected-agents":
+            show_connected_agents()
             sys.exit(0) 
 
         elif action == "remove-agent":
@@ -741,31 +739,6 @@ if __name__ == "__main__":
             else:
                 sys.exit(1)
 
-        elif action == "yara-scan":
-            if len(sys.argv) < 4:
-                print("[ERROR] Usage: python monisec-server.py yara-scan <client_name> <target_path> [rule_name]")
-                sys.exit(1)
-            client_name = sys.argv[2]
-            target_path = sys.argv[3]
-            rule_name = sys.argv[4] if len(sys.argv) > 4 else None
-            print(f"[INFO] Triggering YARA scan on {client_name} for path {target_path}...")
-            result = clients.run_yara_scan(client_name, target_path, rule_name)
-            if result.get("status") == "success":
-                print(f"[SUCCESS] YARA scan completed on {client_name}")
-                scan_results = result.get("results", [])
-                if scan_results:
-                    print(f"Found {len(scan_results)} matches:")
-                    for match in scan_results:
-                        print(f"  - Rule: {match.get('rule')}")
-                        print(f"    File: {match.get('file')}")
-                        print(f"    Tags: {', '.join(match.get('tags', []))}")
-                        print("")
-                else:
-                    print("No YARA matches found.")
-            else:
-                print(f"[ERROR] YARA scan failed on {client_name}: {result.get('message')}")
-            sys.exit(0)
-
         elif action == "ir-shell":
             if len(sys.argv) < 3:
                 print("[ERROR] Usage: python monisec-server.py ir-shell <client_name>")
@@ -773,21 +746,6 @@ if __name__ == "__main__":
             client_name = sys.argv[2]
             print(f"[INFO] Establishing IR shell with {client_name}...")
             clients.spawn_ir_shell(client_name)
-            sys.exit(0)
-
-        elif action == "update":
-            if len(sys.argv) < 3:
-                print("[ERROR] Usage: python monisec-server.py update <client_name>")
-                sys.exit(1)
-            client_name = sys.argv[2]
-            print(f"[INFO] Triggering update on {client_name}...")
-            result = clients.update_client(client_name)
-            if result.get("status") == "success":
-                print(f"[SUCCESS] Update triggered on {client_name}")
-                update_info = result.get("update_info", {})
-                print(f"New version: {update_info.get('version', 'Unknown')}")
-            else:
-                print(f"[ERROR] Failed to update {client_name}: {result.get('message')}")
             sys.exit(0)
 
         elif action == "-d":
@@ -849,37 +807,27 @@ if __name__ == "__main__":
                     except ProcessLookupError:
                         pass
                 
-                # Force clean up ports if still in use
+                # Force clean up ports if still in use - using safer approach
                 try:
                     import socket
-                    import psutil
                     
                     # Load config to get the ports
                     config = load_config()
                     main_port = config["PORT"]
                     ws_port = config["WEBSOCKET_PORT"]
                     
-                    # Check for processes using these ports
-                    for process in psutil.process_iter(['pid', 'name', 'connections']):
+                    # Try to bind to the ports to check if they're available
+                    for port in [main_port, ws_port]:
                         try:
-                            connections = process.connections()
-                            for conn in connections:
-                                if conn.status == psutil.CONN_LISTEN and conn.laddr.port in [main_port, ws_port]:
-                                    print(f"[WARNING] Port {conn.laddr.port} still in use by PID {process.pid}. Attempting to force close...")
-                                    
-                                    # Try to force the port to close by binding to it
-                                    try:
-                                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                                        sock.bind(('0.0.0.0', conn.laddr.port))
-                                        sock.close()
-                                        print(f"[INFO] Successfully freed port {conn.laddr.port}")
-                                    except Exception as e:
-                                        print(f"[ERROR] Failed to free port {conn.laddr.port}: {e}")
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                            pass
+                            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                            sock.bind(('0.0.0.0', port))
+                            sock.close()
+                            print(f"[INFO] Port {port} is now available")
+                        except OSError:
+                            print(f"[WARNING] Port {port} may still be in use")
                 except Exception as e:
-                    print(f"[ERROR] Error while cleaning up ports: {e}")
+                    print(f"[WARNING] Error while checking ports: {e}")
                 
                 # Check if PID file still exists and remove it
                 if os.path.exists(PID_FILE):
