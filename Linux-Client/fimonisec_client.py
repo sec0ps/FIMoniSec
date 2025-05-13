@@ -73,7 +73,6 @@ def ensure_directories_and_files(base_dir):
     for directory in directories:
         if not os.path.exists(directory):
             os.makedirs(directory, mode=0o700, exist_ok=True)
-            logging.info(f"Created directory: {directory} with 700 permissions")
         else:
             # Ensure existing directories have correct permissions
             os.chmod(directory, 0o700)
@@ -93,7 +92,6 @@ def ensure_directories_and_files(base_dir):
                 
             # Set permissions to 600
             os.chmod(log_file, 0o600)
-            logging.info(f"Created file: {log_file} with 600 permissions")
         else:
             # Ensure existing files have correct permissions
             os.chmod(log_file, 0o600)
@@ -243,7 +241,6 @@ def load_or_create_config():
             else:
                 config["client_settings"]["BASE_DIR"] = BASE_DIR
                 
-            print(f"Loaded configuration from {CONFIG_FILE}")
             return config
             
         except Exception as e:
@@ -252,7 +249,6 @@ def load_or_create_config():
     else:
         # Config doesn't exist, create a new one
         default_config = create_default_config()
-        print(f"Created default configuration at {CONFIG_FILE}")
         return default_config
 
 #create default config
@@ -265,19 +261,15 @@ def start_process(name):
         
         if instances > 0:
             pid = is_process_running(name)
-            logging.info(f"{name} is already running with PID {pid}.")
             
             # If multiple instances are running, terminate the newer ones
             if instances > 1:
                 logging.warning(f"Multiple {name} instances detected. Cleaning up duplicates...")
                 cleanup_duplicate_processes(name)
         else:
-            logging.info(f"Starting {name}...")
             process = subprocess.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             time.sleep(2)  # Wait for process to start
-            if is_process_running(name):
-                logging.info(f"{name} started successfully with PID {process.pid}.")
-            else:
+            if not is_process_running(name):
                 logging.error(f"Failed to start {name}.")
 
 def stop_process(name):
@@ -301,15 +293,12 @@ def restart_process(name):
     Returns:
         bool: True if restart was successful, False otherwise
     """
-    logging.info(f"Attempting to restart {name}...")
-    
     # First, ensure the process is stopped
     stop_process(name)
     
     # Wait for process to fully terminate
     attempts = 0
     while is_process_running(name) and attempts < 5:
-        logging.info(f"Waiting for {name} to terminate...")
         time.sleep(1)
         attempts += 1
     
@@ -326,7 +315,6 @@ def restart_process(name):
     pid = is_process_running(name)
     
     if pid:
-        logging.info(f"{name} successfully restarted with PID {pid}")
         return True
     else:
         # Try one more time
@@ -336,7 +324,6 @@ def restart_process(name):
         
         pid = is_process_running(name)
         if pid:
-            logging.info(f"{name} successfully restarted on second attempt with PID {pid}")
             return True
         else:
             logging.error(f"Failed to restart {name} after multiple attempts")
@@ -424,16 +411,12 @@ def cleanup_duplicate_processes(name):
                 os.kill(proc['pid'], signal.SIGTERM)
             except Exception as e:
                 logging.error(f"Failed to terminate process {proc['pid']}: {e}")
-                
-        logging.info(f"Kept oldest instance of {name} with PID {kept_pid}")
 
 def monitor_processes():
     """
     Monitor all required processes and restart any that aren't running.
     Maintains a health check loop to ensure continuous operation.
     """
-    logging.info("Starting process monitoring service")
-    
     while True:
         all_running = True
         processes_checked = 0
@@ -453,9 +436,7 @@ def monitor_processes():
                 
                 # Verify the process actually started
                 new_pid = is_process_running(name)
-                if new_pid:
-                    logging.info(f"{name} successfully restarted with PID {new_pid}")
-                else:
+                if not new_pid:
                     logging.error(f"Failed to restart {name} after multiple attempts")
                     all_running = False
         
@@ -477,7 +458,6 @@ def stop_fimonisec_client_daemon():
     try:
         with open(control_file, 'w') as f:
             f.write(str(os.getpid()))
-        logging.info("Signal sent to stop ProcessGuardian monitoring")
     except Exception as e:
         logging.error(f"Failed to create control file: {e}")
     
@@ -495,7 +475,6 @@ def stop_fimonisec_client_daemon():
             continue
     
     for pid in watchdog_processes:
-        logging.info(f"Stopping watchdog process with PID {pid}...")
         try:
             os.kill(pid, signal.SIGTERM)
             # Wait briefly to see if it terminates
@@ -506,7 +485,6 @@ def stop_fimonisec_client_daemon():
             
             # Force kill if still running
             if psutil.pid_exists(pid):
-                logging.info(f"Forcing termination of watchdog process with PID {pid}")
                 os.kill(pid, signal.SIGKILL)
         except OSError as e:
             logging.error(f"Error stopping watchdog: {e}")
@@ -515,7 +493,6 @@ def stop_fimonisec_client_daemon():
     for name in ["fim", "pim", "lim"]:
         pid = is_process_running(name)
         if pid:
-            logging.info(f"Stopping {name} with PID {pid}...")
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError as e:
@@ -524,7 +501,6 @@ def stop_fimonisec_client_daemon():
     # Wait briefly for children to exit         
     time.sleep(1)
     
-    # Rest of the function remains the same...
     try:
         if os.path.exists(pidfile):
             with open(pidfile, 'r') as f:
@@ -533,7 +509,6 @@ def stop_fimonisec_client_daemon():
             # Check if process is actually running
             try:
                 os.kill(pid, 0)  # Signal 0 doesn't kill but checks if process exists
-                logging.info(f"Sending SIGTERM to MoniSec client daemon (PID: {pid})")
                 os.kill(pid, signal.SIGTERM)
                 
                 # Wait for process to terminate
@@ -542,7 +517,6 @@ def stop_fimonisec_client_daemon():
                         os.kill(pid, 0)
                         time.sleep(1)
                     except OSError:
-                        logging.info("MoniSec client daemon stopped successfully.")
                         # Remove the control file
                         if os.path.exists(control_file):
                             os.remove(control_file)
@@ -560,11 +534,9 @@ def stop_fimonisec_client_daemon():
                     os.remove(watchdog_pidfile)
                 if os.path.exists(control_file):
                     os.remove(control_file)
-                logging.warning("MoniSec client daemon forcefully terminated.")
                 return True
             
             except OSError:
-                logging.warning("No running MoniSec client daemon found.")
                 if os.path.exists(pidfile):
                     os.remove(pidfile)
                 if os.path.exists(watchdog_pidfile):
@@ -573,7 +545,6 @@ def stop_fimonisec_client_daemon():
                     os.remove(control_file)
                 return False
         else:
-            logging.warning("No PID file found. MoniSec client daemon might not be running.")
             if os.path.exists(control_file):
                 os.remove(control_file)
             return False
@@ -597,8 +568,6 @@ def start_daemon():
     with open(pidfile, 'w') as f:
         f.write(str(os.getpid()))
 
-    logging.info("MoniSec Endpoint Monitor started in daemon mode.")
-
     listener_thread = threading.Thread(target=remote.start_client_listener, daemon=True)
     listener_thread.start()
 
@@ -616,7 +585,6 @@ def start_watchdog(delay=15):
     try:
         # Create a thread to handle the delayed execution
         def delayed_start():
-            logging.info(f"Waiting {delay} seconds before starting watchdog...")
             time.sleep(delay)
             
             # Start the watchdog in daemon mode
@@ -626,21 +594,16 @@ def start_watchdog(delay=15):
                 stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
-            logging.info(f"Started watchdog process after {delay} second delay with PID {process.pid}")
         
         # Start the delayed execution in a separate thread
         start_thread = threading.Thread(target=delayed_start, daemon=True)
         start_thread.start()
-        logging.info(f"Scheduled watchdog to start with {delay} second delay")
         
     except Exception as e:
         logging.error(f"Failed to start watchdog process: {e}")
 
-# Handle graceful shutdown on keyboard interrupt
 def handle_exit(signum, frame):
     """Handle graceful shutdown on keyboard interrupt or termination signal."""
-    logging.info(f"Signal {signum} received. Stopping MoniSec client and all related processes...")
-
     # Prevent double SIGINT behavior
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -652,7 +615,6 @@ def handle_exit(signum, frame):
     try:
         with open(control_file, 'w') as f:
             f.write(str(os.getpid()))
-        logging.info("Signal sent to stop ProcessGuardian monitoring")
         
         # Remove the monisec manages file
         if os.path.exists(monisec_manages_file):
@@ -669,7 +631,6 @@ def handle_exit(signum, frame):
         pid = is_process_running(name)
         if pid:
             child_processes.append((name, pid))
-            logging.info(f"Stopping {name} with PID {pid}...")
             try:
                 # Send SIGTERM first for graceful shutdown
                 os.kill(pid, signal.SIGTERM)
@@ -687,7 +648,6 @@ def handle_exit(signum, frame):
                 # Process still running, continue waiting
             except OSError:
                 # Process no longer exists
-                logging.info(f"{name} (PID {pid}) terminated.")
                 child_processes.remove((name, pid))
         
         if child_processes:
@@ -695,7 +655,6 @@ def handle_exit(signum, frame):
     
     # Force kill any remaining processes
     for name, pid in child_processes:
-        logging.warning(f"{name} (PID {pid}) did not terminate gracefully. Forcing...")
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
@@ -705,7 +664,6 @@ def handle_exit(signum, frame):
     for name in ["fim", "pim", "lim"]:
         pid = is_process_running(name)
         if pid:
-            logging.warning(f"Process {name} still running with PID {pid}. Force killing...")
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
@@ -723,20 +681,16 @@ def handle_exit(signum, frame):
     if os.path.exists(pid_file):
         try:
             os.remove(pid_file)
-            logging.info(f"Removed PID file: {pid_file}")
         except OSError:
             pass
     
     time.sleep(1)  # Brief pause to allow final cleanups
     
-    logging.info("MoniSec client shutdown complete.")
     sys.exit(0)
     
 # Register signal handler for graceful shutdown
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
-
-# Add these functions to your existing fimonisec_client.py file
 
 def manage_exclusions(command, exclusion_type, value=None):
     """
@@ -799,26 +753,17 @@ def manage_exclusions(command, exclusion_type, value=None):
     # Add or remove the value
     if command == 'add':
         if value in exclusions:
-            print(f"[INFO] {value} is already in {exclusion_type} exclusions.")
             return True
         exclusions.append(value)
-        print(f"[INFO] Added {value} to {exclusion_type} exclusions.")
     else:  # remove
         if value not in exclusions:
-            print(f"[WARNING] {value} not found in {exclusion_type} exclusions.")
             return False
         exclusions.remove(value)
-        print(f"[INFO] Removed {value} from {exclusion_type} exclusions.")
     
     # Save the updated configuration
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=4)
-        print(f"[INFO] Configuration saved to {CONFIG_FILE}")
-        
-        # If we're working with file/directory exclusions, we may need to restart the FIM service
-        if exclusion_type in ['file', 'directory', 'pattern', 'extension']:
-            print("[INFO] File exclusions changed. Consider restarting the FIM service with: fimonisec_client fim restart")
         
         return True
     except Exception as e:
