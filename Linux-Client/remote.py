@@ -89,7 +89,6 @@ def start_listener_if_authorized():
     # Validate authentication token
     is_valid, error_message = validate_auth_token()
     if not is_valid:
-        logging.info(f"{error_message}. Running in local-only mode.")
         return False
         
     # Authentication token is valid, proceed with connection setup
@@ -97,28 +96,25 @@ def start_listener_if_authorized():
         with open(AUTH_TOKEN_FILE, 'r') as f:
             auth_data = json.load(f)
             
+        server_ip = auth_data.get("server_ip")
+        if not server_ip:
+            logging.error("No server IP found in authentication token")
+            return False
+            
         # Detect NAT status to decide on connection method
         use_websocket = detect_nat_and_set_connection_mode()
         
-        # Log connection information
-        logging.info(f"Authentication verified. Starting client connectivity to server {auth_data['server_ip']}...")
-        
         if use_websocket:
-            logging.info("[CONN] NAT detected or connection issue - using WebSocket as primary connection")
-            
             # Start the WebSocket client in a thread
             websocket_thread = threading.Thread(target=start_websocket_client, daemon=True)
             websocket_thread.start()
             
-            # Also try direct connection as backup
-            listener_thread = threading.Thread(target=start_client_listener, daemon=True)
-            listener_thread.start()
+            # No need to start TCP listener when using WebSocket due to NAT
+            logging.info("NAT detected - using only WebSocket connection, TCP listener disabled")
             
         else:
-            logging.info("[CONN] Direct connectivity available - using TCP as primary connection")
-            
-            # Start the listener in a thread for direct commands
-            listener_thread = threading.Thread(target=start_client_listener, daemon=True)
+            # Start the listener in a thread for direct commands with server IP restriction
+            listener_thread = threading.Thread(target=lambda: start_client_listener(server_ip), daemon=True)
             listener_thread.start()
             
             # Also start WebSocket as a secondary channel
@@ -131,10 +127,13 @@ def start_listener_if_authorized():
         logging.error(f"Error starting authorized listener: {e}")
         return False
         
-def start_client_listener():
-    """Starts a TCP server to receive and execute remote commands from monisec-server."""
+def start_client_listener(allowed_server_ip=None):
+    """
+    Starts a TCP server to receive and execute remote commands from monisec-server.
+    Only accepts connections from the specified allowed_server_ip if provided.
+    """
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Ensure this is working
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     
     # Add a small delay to ensure the socket is properly released
     time.sleep(1)
@@ -144,9 +143,20 @@ def start_client_listener():
         server_socket.listen(5)
         logging.info(f"MoniSec client listening for commands on {CLIENT_HOST}:{CLIENT_PORT}")
 
+        if allowed_server_ip:
+            logging.info(f"Only accepting connections from authorized server: {allowed_server_ip}")
+
         while True:
             client_socket, addr = server_socket.accept()
-            logging.info(f"Received connection from {addr}")
+            client_ip = addr[0]
+            
+            # Check if connection is from authorized server IP
+            if allowed_server_ip and client_ip != allowed_server_ip:
+                logging.warning(f"Rejected unauthorized connection from {client_ip}")
+                client_socket.close()
+                continue
+                
+            logging.info(f"Accepted connection from authorized server: {client_ip}")
             client_thread = threading.Thread(target=handle_server_commands, args=(client_socket,))
             client_thread.start()
     except OSError as e:
@@ -226,7 +236,6 @@ def authenticate_with_server():
         handshake = json.dumps({ "client_name": client_name })
         sock.sendall(handshake.encode("utf-8"))
 
-        logging.info("Handshake sent to server.")
         sock.close()
         return True
 
@@ -327,15 +336,6 @@ def send_logs_to_server():
     CHUNKING_THRESHOLD = 4000
 
     try:
-        logging.info(f"[LOGS] Starting log transmission service with files: {LOG_FILES}")
-
-        # Log file diagnostics
-        for log_file in LOG_FILES:
-            exists = os.path.exists(log_file)
-            size = os.path.getsize(log_file) if exists else 0
-            permissions = oct(os.stat(log_file).st_mode & 0o777) if exists else "N/A"
-            logging.info(f"[LOGS] Log file: {log_file}, Exists: {exists}, Size: {size}, Permissions: {permissions}")
-
         with open(AUTH_TOKEN_FILE, "r") as f:
             token_data = json.load(f)
             server_ip = token_data["server_ip"]
@@ -344,13 +344,10 @@ def send_logs_to_server():
 
         # NAT Detection
         try:
-            logging.info("[NAT-DETECT] Connecting to server at {}:5555...".format(server_ip))
             sock_nat = socket.create_connection((server_ip, 5555), timeout=5)
             sock_nat.sendall(json.dumps({"command": "get_client_ip"}).encode("utf-8"))
             response = sock_nat.recv(1024)
             server_view = json.loads(response.decode("utf-8"))
-            if "client_ip" in server_view:
-                logging.info(f"[NAT-DETECT] Server sees us as: {server_view['client_ip']}")
             sock_nat.close()
         except Exception as e:
             logging.warning(f"[NAT-DETECT] NAT detection failed: {e}")
@@ -373,15 +370,12 @@ def send_logs_to_server():
 
                 sock.settimeout(5)
                 response = sock.recv(1024)
-                logging.info(f"[LOGS] Handshake response from server: {response}")
 
                 if not response or response != b"OK":
-                    logging.warning(f"[LOGS] Bad handshake response: {response}")
                     if attempt < RETRIES - 1:  # Don't raise on the last attempt to allow the outer loop to handle it
                         continue
                     raise ConnectionError("Bad handshake response")
 
-                logging.info(f"[LOGS] Connected to server and authenticated. Attempt {attempt + 1}")
                 break
             except Exception as e:
                 logging.error(f"[LOGS] Connection attempt {attempt + 1} failed: {e}")
@@ -411,9 +405,6 @@ def send_logs_to_server():
                     file_positions[log_file] = file_size
             else:
                 file_positions[log_file] = os.path.getsize(log_file) if os.path.exists(log_file) else 0
-        
-        for log_file, pos in file_positions.items():
-            logging.info(f"[LOGS] Initial position for {log_file}: {pos}")
 
         while True:
             logs_to_send = {}
@@ -435,12 +426,8 @@ def send_logs_to_server():
 
                             if new_logs:
                                 entries = extract_valid_json_objects(new_logs)
-                                logging.info(f"[LOGS] Extracted {len(entries)} entries from {log_file}")
 
                                 if entries:
-                                    sample = str(entries[0])[:100]
-                                    logging.info(f"[LOGS] Sample entry: {sample}...")
-
                                     if log_file not in logs_to_send:
                                         logs_to_send[log_file] = {
                                             "entries": [],
@@ -465,13 +452,11 @@ def send_logs_to_server():
                         "client_name": client_name
                     })
 
-                    logging.info(f"[LOGS] Sending {len(all_logs)} logs to server...")
                     # Import client_crypt here to avoid circular imports
                     from client_crypt import encrypt_data
                     encrypted = encrypt_data(message)
                     
                     if len(encrypted) > CHUNKING_THRESHOLD:
-                        logging.info(f"[LOGS] Sending chunked data ({len(encrypted)} bytes)")
                         success = send_chunked_data(sock, encrypted)
                         if not success:
                             raise ConnectionError("Chunked data send failed")
@@ -481,7 +466,6 @@ def send_logs_to_server():
                     sock.settimeout(5)
                     ack = sock.recv(1024)
                     if ack == b"ACK":
-                        logging.info(f"[LOGS] Logs sent and ACK received.")
                         for log_file, data in logs_to_send.items():
                             file_positions[log_file] = data["new_position"]
                         
@@ -510,7 +494,6 @@ def send_logs_to_server():
 
                         sock.settimeout(5)
                         response = sock.recv(1024)
-                        logging.info(f"[LOGS] Reconnected. Handshake response: {response}")
                         
                         if not response or response != b"OK":
                             logging.warning(f"[LOGS] Reconnection failed: {response}")
@@ -530,7 +513,6 @@ def send_logs_to_server():
             
         if sock:
             sock.close()
-            logging.info("[LOGS] Connection to server closed.")
 
 def extract_valid_json_objects(buffer):
     """Extract valid JSON objects from a buffer, handling complete JSON objects at the root level."""
@@ -579,7 +561,6 @@ def extract_valid_json_objects(buffer):
         except Exception:
             pass
     
-    #logging.info(f"Successfully extracted {len(logs)} log entries")
     return logs
 
 def send_chunked_data(sock, data):
@@ -619,15 +600,12 @@ def check_auth_and_send_logs():
     # Validate authentication token
     is_valid, error_message = validate_auth_token()
     if not is_valid:
-        logging.info(f"{error_message}. Logging locally only.")
         return False
 
     try:
         # Authenticate with server and proceed if successful
         success = authenticate_with_server()
         if success:
-            logging.info("Authentication successful. Starting real-time log transmission...")
-            
             # Start regular log transmission thread
             log_thread = threading.Thread(target=send_logs_to_server, daemon=True)
             log_thread.start()
@@ -636,7 +614,6 @@ def check_auth_and_send_logs():
             start_websocket_client()
             return True
         else:
-            logging.warning("Authentication failed. Logging locally only.")
             return False
     except Exception as e:
         logging.error(f"Failed to initialize log transmission: {e}")
@@ -669,8 +646,6 @@ def handle_server_commands(client_socket):
             # Extract command and parameters
             command = command_data.get("command")
             params = command_data.get("params", {})
-            
-            #logging.info(f"[COMMAND] Received command: {command} with params: {params}")
             
             # Process the command
             if command == "restart":
@@ -1345,7 +1320,6 @@ async def websocket_client_connect(server_ip, client_name, psk):
             async with websockets.connect(uri, ping_interval=15, ping_timeout=10) as websocket:
                 # Connection successful
                 if connection_error_logged:
-                    logging.info("[WEBSOCKET] Connection successfully established")
                     connection_error_logged = False
                 
                 websocket_client = websocket
@@ -1375,8 +1349,6 @@ async def websocket_client_connect(server_ip, client_name, psk):
                     await asyncio.sleep(local_reconnect_delay)
                     continue
 
-                #logging.info(f"[WEBSOCKET] Auth success for {client_name}")
-
                 # Launch command poller and heartbeat tasks
                 poll_task = asyncio.create_task(poll_for_commands(client_name, websocket))
                 heartbeat_task = asyncio.create_task(maintain_heartbeat(websocket))
@@ -1391,7 +1363,6 @@ async def websocket_client_connect(server_ip, client_name, psk):
                 except websockets.exceptions.ConnectionClosed:
                     websocket_connected = False
                     if not connection_error_logged:
-                        logging.info("[WEBSOCKET] Connection closed")
                         connection_error_logged = True
                 finally:
                     # Cancel the background tasks when connection is closed
@@ -1547,15 +1518,11 @@ async def process_websocket_command(websocket, message):
         data = json.loads(message)
         command_type = data.get("type")
         
-        #logging.info(f"[WEBSOCKET] Processing message type: {command_type}")
-        
         # Handle different message types
         if command_type == "ir_shell_command":
             # Extract command details
             command_id = data.get("command_id")
             command = data.get("command")
-            
-            logging.info(f"[WEBSOCKET] Received IR shell command: {command} (ID: {command_id})")
             
             # Process different IR shell commands
             if command == "ir-shell-init":
@@ -1565,7 +1532,6 @@ async def process_websocket_command(websocket, message):
                     "status": "success",
                     "message": "IR shell initialized"
                 }
-                logging.info("[WEBSOCKET] IR shell initialized")
                 
             elif command == "ir-shell-exit":
                 # Terminate IR shell
@@ -1574,7 +1540,6 @@ async def process_websocket_command(websocket, message):
                     "status": "success",
                     "message": "IR shell terminated"
                 }
-                logging.info("[WEBSOCKET] IR shell terminated")
                 
             else:
                 # Execute command if IR shell is active
@@ -1591,7 +1556,6 @@ async def process_websocket_command(websocket, message):
                         "status": "success",
                         "output": output
                     }
-                    logging.info(f"[WEBSOCKET] Executed IR shell command: {command}")
             
             # Send the response
             await websocket.send(json.dumps({
@@ -1599,7 +1563,6 @@ async def process_websocket_command(websocket, message):
                 "command_id": command_id,
                 "response": response
             }))
-            logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
             
         elif command_type == "heartbeat":
             # Simply respond to the heartbeat with our own
@@ -1627,7 +1590,6 @@ async def process_websocket_message(websocket, message):
     global ir_shell_active
     
     try:
-        
         data = json.loads(message)
         message_type = data.get("type")
         
@@ -1635,10 +1597,7 @@ async def process_websocket_message(websocket, message):
             commands = data.get("commands", [])
             
             if not commands:
-
                 return
-                
-            #logging.info(f"[WEBSOCKET] Received {len(commands)} pending commands")
             
             # Process each command
             for cmd in commands:
@@ -1649,8 +1608,6 @@ async def process_websocket_message(websocket, message):
                 if not command or not command_id:
                     logging.warning(f"[WEBSOCKET] Incomplete command data: {cmd}")
                     continue
-                    
-                #logging.info(f"[WEBSOCKET] Processing command: {command} (ID: {command_id})")
                 
                 # Handle the command based on type
                 if command == "ir-shell-init":
@@ -1660,7 +1617,6 @@ async def process_websocket_message(websocket, message):
                         "status": "success",
                         "message": "IR shell initialized"
                     }
-                    logging.info("[WEBSOCKET] Virtual IR shell initialized")
                     
                 elif command == "ir-shell-exit":
                     # Terminate IR shell
@@ -1669,7 +1625,6 @@ async def process_websocket_message(websocket, message):
                         "status": "success",
                         "message": "IR shell terminated"
                     }
-                    logging.info("[WEBSOCKET] Virtual IR shell terminated")
                     
                 else:
                     # Execute command if IR shell is active
@@ -1687,7 +1642,6 @@ async def process_websocket_message(websocket, message):
                                 "status": "success",
                                 "output": output
                             }
-                            logging.info(f"[WEBSOCKET] Executed command: {command}")
                         except Exception as e:
                             response = {
                                 "status": "error",
@@ -1703,7 +1657,6 @@ async def process_websocket_message(websocket, message):
                         "response": response
                     }
                     await websocket.send(json.dumps(response_msg))
-                    #logging.info(f"[WEBSOCKET] Sent response for command ID: {command_id}")
                 except Exception as e:
                     logging.error(f"[WEBSOCKET] Failed to send response for command {command_id}: {e}")
         
@@ -1714,7 +1667,6 @@ async def process_websocket_message(websocket, message):
             }))
             
         elif message_type == "heartbeat_ack":
-
             pass
             
         else:
@@ -1734,7 +1686,6 @@ def maintain_websocket_connection():
     # First check if authentication is valid before attempting to maintain connection
     is_valid, _ = validate_auth_token()
     if not is_valid:
-        logging.info("[WEBSOCKET] No valid authentication token. WebSocket connection monitor will not run.")
         return
     
     # Track state to minimize logging
@@ -1747,14 +1698,12 @@ def maintain_websocket_connection():
             if not websocket_connected and not websocket_client_started:
                 # Only log the initial disconnection, not every retry
                 if last_connection_state or not connection_error_shown:
-                    logging.info("[WEBSOCKET] Connection not active, will retry every 15 seconds...")
                     connection_error_shown = True
                 
                 # Start connection attempt
                 start_websocket_client()
             elif websocket_connected and connection_error_shown:
                 # We've reconnected, reset the error flag
-                logging.info("[WEBSOCKET] Connection restored successfully")
                 connection_error_shown = False
             
             # Store current state for next comparison
@@ -1774,7 +1723,6 @@ def start_websocket_client():
 
     with websocket_client_lock:
         if websocket_client_started:
-            logging.info("[WEBSOCKET] Already running")
             return
 
         # Validate authentication token before starting WebSocket client
@@ -1805,7 +1753,6 @@ def start_websocket_client():
                     loop.close()
 
             threading.Thread(target=run, daemon=True).start()
-            logging.info("[WEBSOCKET] WebSocket client started")
 
         except Exception as e:
             logging.error(f"[WEBSOCKET] Launch error: {e}")
@@ -1817,11 +1764,8 @@ def detect_nat_and_set_connection_mode():
     Returns True if WebSocket should be used, False if direct TCP is sufficient.
     """
     try:
-        logging.info("[NAT-DETECT] Checking for NAT situation...")
-        
         # Load auth token to get server details
         if not os.path.exists(AUTH_TOKEN_FILE):
-            logging.info("[NAT-DETECT] No auth token found. Cannot determine NAT status.")
             return False
             
         with open(AUTH_TOKEN_FILE, "r") as f:
@@ -1829,7 +1773,6 @@ def detect_nat_and_set_connection_mode():
             server_ip = token_data.get("server_ip")
             
         if not server_ip:
-            logging.info("[NAT-DETECT] No server IP in auth token. Cannot determine NAT status.")
             return False
         
         # Step 1: Try to establish a TCP connection to the server
@@ -1837,12 +1780,10 @@ def detect_nat_and_set_connection_mode():
         test_socket.settimeout(5)
         
         try:
-            logging.info(f"[NAT-DETECT] Connecting to server at {server_ip}:5555...")
             test_socket.connect((server_ip, 5555))
             
             # Step 2: Get our local IP address from this connection
             local_ip, local_port = test_socket.getsockname()
-            logging.info(f"[NAT-DETECT] Local connection info: {local_ip}:{local_port}")
             
             # Step 3: Ask the server what IP it sees for us
             handshake = json.dumps({"command": "get_client_ip"})
@@ -1852,21 +1793,16 @@ def detect_nat_and_set_connection_mode():
             remote_view = json.loads(response)
             remote_ip = remote_view.get("client_ip")
             
-            logging.info(f"[NAT-DETECT] Server sees us as: {remote_ip}")
-            
             # Compare the IPs - if different, we're likely behind NAT
             is_natted = (local_ip != remote_ip)
             
-            logging.info(f"[NAT-DETECT] NAT detected: {is_natted}")
             return is_natted
             
         except Exception as e:
-            logging.warning(f"[NAT-DETECT] Connection error during NAT detection: {e}")
             # If we can't connect, assume we need WebSocket for reliability
             return True
             
     except Exception as e:
-        logging.error(f"[NAT-DETECT] Error detecting NAT: {e}")
         return True  # Default to WebSocket on error for reliability
     finally:
         if 'test_socket' in locals():
@@ -1874,8 +1810,6 @@ def detect_nat_and_set_connection_mode():
             
 async def poll_for_commands(client_name, websocket):
     """Poll the server for pending commands on a regular interval."""
-    logging.info("[COMMAND-POLL] Starting WebSocket command poller")
-
     try:
         while True:
             try:
@@ -1891,12 +1825,12 @@ async def poll_for_commands(client_name, websocket):
             # Wait before next poll
             await asyncio.sleep(5)  # Poll every 5 seconds
     except asyncio.CancelledError:
-        logging.info("[COMMAND-POLL] Polling task cancelled")
+        pass
     except Exception as e:
         logging.error(f"[COMMAND-POLL] Error in polling task: {e}")
         import traceback
         logging.error(traceback.format_exc())
-
+        
 async def poll_for_commands_now(websocket):
     """Send an immediate request to poll for pending commands."""
     try:
