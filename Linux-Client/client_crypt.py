@@ -44,7 +44,6 @@ def load_psks():
             raise ValueError("[ERROR] PSK format invalid. Expected 64-character hex string.")
         try:
             psk = bytes.fromhex(raw_psk)
-            logging.info(f"[INFO] Loaded PSK from auth_token.json")
             return psk
         except ValueError as e:
             logging.error(f"[ERROR] Failed to convert PSK to bytes: {e}")
