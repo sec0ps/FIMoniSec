@@ -264,6 +264,18 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
     if changes:
         log_entry["changes"] = changes
     
+    # Enhanced logging for config file changes
+    # Process both MODIFIED and METADATA_CHANGED events for config files
+    if (event_type == "MODIFIED" or event_type == "METADATA_CHANGED") and is_config_file(file_path):
+        # Get config diff
+        config_diff = get_config_diff(file_path)
+        
+        # Add diff to log entry if available
+        if config_diff:
+            log_entry["config_changes"] = {
+                "diff": config_diff[:20]  # Limit to 20 lines
+            }
+    
     # Write to log file
     with open(LOG_FILE, "a") as log:
         log.write(json.dumps(log_entry, indent=4) + "\n")
@@ -285,14 +297,32 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
     # Print a single line alert based on event type
     if event_type == "NEW FILE":
         print(f"[NEW FILE] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+        if is_config_file(file_path):
+            backup_config_file(file_path)  # Backup new config files immediately
     elif event_type == "DELETED":
         print(f"[DELETED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
     elif event_type == "MODIFIED":
         print(f"[MODIFIED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+        # Print config changes if available
+        if "config_changes" in log_entry and "diff" in log_entry["config_changes"]:
+            print(f"[CONFIG CHANGES for {file_path}]:")
+            for diff_line in log_entry["config_changes"]["diff"][:5]:  # Show first 5 lines only
+                print(f"  {diff_line}")
+            if len(log_entry["config_changes"]["diff"]) > 5:
+                print(f"  ... and {len(log_entry['config_changes']['diff']) - 5} more changes")
     elif event_type == "METADATA_CHANGED":
         print(f"[METADATA] {file_path}{changes_text} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+        # Print config changes if available for metadata changes too
+        if "config_changes" in log_entry and "diff" in log_entry["config_changes"]:
+            print(f"[CONFIG CHANGES for {file_path}]:")
+            for diff_line in log_entry["config_changes"]["diff"][:5]:  # Show first 5 lines only
+                print(f"  {diff_line}")
+            if len(log_entry["config_changes"]["diff"]) > 5:
+                print(f"  ... and {len(log_entry['config_changes']['diff']) - 5} more changes")
     elif event_type == "MOVED":
         print(f"[MOVED] {old_path} -> {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+        if is_config_file(file_path):
+            backup_config_file(file_path)  # Backup moved config files
     
     return log_entry
 
@@ -362,8 +392,19 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     file_count = len(all_files)
     print(f"[INFO] Found {file_count} files to process")
     
+    # Create a separate function for processing each file
+    def process_file_with_backup(filepath):
+        result = process_file(filepath, integrity_state)
+        
+        # Backup config files during the scan
+        str_filepath = str(filepath)
+        if is_config_file(str_filepath):
+            backup_config_file(str_filepath)
+            
+        return result
+    
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        results = executor.map(lambda fp: process_file(fp, integrity_state), all_files)
+        results = executor.map(process_file_with_backup, all_files)
 
     changes_detected = 0
     
@@ -445,6 +486,8 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     
     if is_initial_baseline:
         print(f"[INFO] Initial baseline completed in {duration:.2f} seconds. Added {changes_detected} files to integrity state.")
+        print("[INFO] Config files have been backed up for future comparison.")
+        is_baseline_mode = False  # Reset baseline mode after completion
     else:
         print(f"[INFO] Scan completed in {duration:.2f} seconds. Detected {changes_detected} changes.")
 
@@ -1052,19 +1095,299 @@ def is_binary_file(file_path):
     return False
 
 def is_config_file(file_path):
-    """Check if a file is likely a configuration file."""
+    """
+    Check if a file is likely a configuration file based on monitored directories
+    and file characteristics. 
+    Returns True if it's a config file, False otherwise.
+    """
     if not file_path or file_path == "N/A":
         return False
-        
+    
+    # Load the configuration to get monitored directories
+    config = load_config()
+    scheduled_dirs = config.get("scheduled_scan", {}).get("directories", [])
+    real_time_dirs = config.get("real_time_monitoring", {}).get("directories", [])
+    excluded_dirs = config.get("exclusions", {}).get("directories", [])
+    
+    # Combine all monitored directories
+    monitored_dirs = scheduled_dirs + real_time_dirs
+    
+    # Check if the file is in a monitored directory
+    in_monitored_dir = False
+    for directory in monitored_dirs:
+        if file_path.startswith(directory):
+            # Make sure it's not in an excluded directory
+            if not any(file_path.startswith(excluded) for excluded in excluded_dirs):
+                in_monitored_dir = True
+                break
+    
+    if not in_monitored_dir:
+        return False
+    
+    # Explicitly exclude archive and compressed files
+    archive_extensions = [
+        '.gz', '.zip', '.tar', '.tgz', '.bz2', '.xz', '.7z', '.rar', 
+        '.deb', '.rpm', '.iso', '.img', '.bin', '.jar', '.war'
+    ]
+    
+    if any(file_path.lower().endswith(ext) for ext in archive_extensions):
+        return False
+    
+    # Define config file extensions and patterns
     config_extensions = ['.conf', '.cfg', '.ini', '.json', '.yaml', '.yml', '.xml', '.properties']
-    config_patterns = ['config', 'conf', 'settings', '.rc']
+    config_patterns = ['config', 'conf', 'settings', '.rc', '_config']
     
     file_path_lower = file_path.lower()
+    file_name = os.path.basename(file_path_lower)
     
+    # Check extensions first (most reliable)
     has_config_ext = any(file_path_lower.endswith(ext) for ext in config_extensions)
-    has_config_pattern = any(pattern in file_path_lower for pattern in config_patterns)
+    # Check for *_config pattern in filename
+    ends_with_config = file_name.endswith('_config')
     
-    return has_config_ext or has_config_pattern
+    if has_config_ext or ends_with_config:
+        # Even if it has a config extension, make sure it's not a binary
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(512)
+                
+            # Skip empty files
+            if not header:
+                return False
+                
+            # Check for binary signatures and common compressed file signatures
+            if (header.startswith(b'\x7fELF') or 
+                header.startswith(b'MZ') or 
+                header.startswith(b'\x1f\x8b') or  # gzip
+                header.startswith(b'PK\x03\x04') or  # zip
+                header.startswith(b'BZh') or  # bz2
+                header.startswith(b'\xFD\x37\x7A\x58\x5A\x00')):  # xz
+                return False
+                
+        except (IOError, OSError, PermissionError):
+            # If we can't read the file, be cautious
+            pass
+            
+        return True
+    
+    # Special case for /etc directory - most files here are configs
+    if file_path.startswith('/etc/'):
+        # Exclude known non-config files in /etc
+        non_config_patterns = ['.cache', '.lock', '.socket', '.pid', '.placeholder']
+        if not any(pattern in file_path_lower for pattern in non_config_patterns):
+            # Check if it's a binary
+            is_binary = False
+            try:
+                with open(file_path, 'rb') as f:
+                    header = f.read(512)
+                    
+                # Skip empty files
+                if not header:
+                    return False
+                    
+                # Check for binary signatures and compressed file signatures
+                if (header.startswith(b'\x7fELF') or 
+                    header.startswith(b'MZ') or 
+                    header.startswith(b'\x1f\x8b') or  # gzip
+                    header.startswith(b'PK\x03\x04') or  # zip
+                    header.startswith(b'BZh') or  # bz2
+                    header.startswith(b'\xFD\x37\x7A\x58\x5A\x00')):  # xz
+                    is_binary = True
+                else:
+                    # Count non-text characters
+                    text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7f})
+                    binary_chars = bytearray(set(range(256)) - set(text_chars))
+                    
+                    binary_count = len([b for b in header if b in binary_chars])
+                    if binary_count > 0 and len(header) > 0:  # Ensure we don't divide by zero
+                        if float(binary_count) / len(header) > 0.3:
+                            is_binary = True
+            except (IOError, OSError, PermissionError):
+                # If we can't read the file, skip it
+                return False
+                
+            # If it's not binary and is in /etc, it's likely a config
+            if not is_binary:
+                return True
+    
+    # For other directories, need both a config pattern and not be a binary
+    if any(pattern in file_path_lower for pattern in config_patterns):
+        # Check if it's a binary
+        try:
+            # Skip if not readable
+            if not os.path.exists(file_path) or not os.access(file_path, os.R_OK):
+                return False
+                
+            with open(file_path, 'rb') as f:
+                header = f.read(512)
+                
+            # Skip empty files
+            if not header:
+                return False
+                
+            # Binary file and compressed file checks
+            if (header.startswith(b'\x7fELF') or 
+                header.startswith(b'MZ') or 
+                header.startswith(b'\x1f\x8b') or  # gzip
+                header.startswith(b'PK\x03\x04') or  # zip
+                header.startswith(b'BZh') or  # bz2
+                header.startswith(b'\xFD\x37\x7A\x58\x5A\x00')):  # xz
+                return False
+                
+            # Count non-text characters
+            text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7f})
+            binary_chars = bytearray(set(range(256)) - set(text_chars))
+            
+            # Ensure we don't divide by zero
+            binary_count = len([b for b in header if b in binary_chars])
+            if binary_count > 0 and len(header) > 0:
+                # If >30% non-text chars, likely binary
+                if float(binary_count) / len(header) > 0.3:
+                    return False
+                
+            # If it's in /var/www and has "config" in the name, it's likely a config file
+            if file_path.startswith('/var/www/'):
+                return True
+                
+            # Apply more restrictive pattern matching for system directories
+            if file_path.startswith(('/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/')):
+                # For these directories, require the filename to be exactly "config" or end with ".conf" or "_config"
+                basename = os.path.basename(file_path)
+                return basename == "config" or basename.endswith(".conf") or basename.endswith("_config")
+                
+            # For all other monitored directories, accept any config pattern
+            return True
+            
+        except (IOError, OSError, PermissionError):
+            return False
+    
+    return False
+
+def get_config_diff(file_path):
+    """Get diff between current config file and its backup using sudo if necessary."""
+    if not is_config_file(file_path):
+        return None
+        
+    try:
+        # Get the backup path
+        config_backup_dir = os.path.join(OUTPUT_DIR, "config_backups")
+        safe_filename = file_path.replace("/", "_").replace("\\", "_")
+        backup_path = os.path.join(config_backup_dir, f"{safe_filename}.bak")
+        
+        # If we don't have a backup yet, create one and return None (no diff available)
+        if not os.path.exists(backup_path):
+            backup_config_file(file_path)
+            return None
+        
+        # Read backup content
+        try:
+            with open(backup_path, 'r', encoding='utf-8') as f:
+                old_content = f.read()
+        except UnicodeDecodeError:
+            with open(backup_path, 'rb') as f:
+                old_content = f.read().decode('latin1')  # Use latin1 as fallback
+                
+        # Read current content - first try normal access
+        new_content = None
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                new_content = f.read()
+        except (IOError, PermissionError, UnicodeDecodeError):
+            try:
+                # Try using sudo cat
+                result = subprocess.run(['sudo', '/bin/cat', file_path], 
+                                     capture_output=True, 
+                                     text=True, 
+                                     check=True)
+                new_content = result.stdout
+            except subprocess.SubprocessError as se:
+                print(f"[WARNING] Failed to read config file {file_path} even with sudo: {str(se)}")
+                return None
+        
+        if not new_content:
+            return None
+            
+        # Calculate diff
+        old_lines = old_content.splitlines()
+        new_lines = new_content.splitlines()
+        diff = list(difflib.unified_diff(old_lines, new_lines, n=2))
+        
+        # Process the diff to make it more readable
+        readable_diff = []
+        for line in diff[3:] if len(diff) > 3 else []:  # Skip the header lines
+            if line.startswith('+'):
+                readable_diff.append(f"Added: {line[1:]}")
+            elif line.startswith('-'):
+                readable_diff.append(f"Removed: {line[1:]}")
+        
+        # After getting diff, update the backup
+        backup_config_file(file_path)
+        
+        return readable_diff if readable_diff else None
+        
+    except Exception as e:
+        print(f"[WARNING] Failed to generate config diff for {file_path}: {str(e)}")
+        return None
+
+def backup_config_file(file_path):
+    """Create or update a backup of a config file using sudo if necessary."""
+    try:
+        # Create config backup directory if it doesn't exist
+        config_backup_dir = os.path.join(OUTPUT_DIR, "config_backups")
+        
+        # Create directory if it doesn't exist
+        if not os.path.exists(config_backup_dir):
+            os.makedirs(config_backup_dir, exist_ok=True)
+            # Set secure permissions (0700) on the directory
+            os.chmod(config_backup_dir, 0o700)
+            print(f"[INFO] Created config backup directory with secure permissions (0700)")
+        else:
+            # Ensure the directory has the correct permissions
+            current_mode = os.stat(config_backup_dir).st_mode & 0o777
+            if current_mode != 0o700:
+                os.chmod(config_backup_dir, 0o700)
+                print(f"[INFO] Updated config backup directory permissions from {oct(current_mode)} to 0700")
+        
+        # Create a safe filename for the backup
+        safe_filename = file_path.replace("/", "_").replace("\\", "_")
+        backup_path = os.path.join(config_backup_dir, f"{safe_filename}.bak")
+        
+        # Only create backup if file exists
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            # First try binary mode to be safe
+            try:
+                # Try using sudo cat with binary output
+                result = subprocess.run(['sudo', '/bin/cat', file_path], 
+                                     capture_output=True, 
+                                     check=True)
+                
+                # Write the output to our backup file in binary mode
+                with open(backup_path, 'wb') as dst:
+                    dst.write(result.stdout)
+                    
+                print(f"[INFO] Successfully backed up config file: {file_path}")
+                    
+            except subprocess.SubprocessError as se:
+                print(f"[WARNING] Failed to backup config file {file_path} with sudo: {str(se)}")
+                
+                # Try normal file access if sudo fails
+                try:
+                    with open(file_path, 'rb') as src:
+                        content = src.read()
+                        
+                    with open(backup_path, 'wb') as dst:
+                        dst.write(content)
+                except (IOError, PermissionError) as e:
+                    print(f"[WARNING] Failed to backup config file {file_path}: {str(e)}")
+                    return None
+                    
+            # Set secure permissions on backup
+            os.chmod(backup_path, 0o600)
+            return backup_path
+    except Exception as e:
+        print(f"[WARNING] Failed to backup config file {file_path}: {str(e)}")
+    
+    return None
 
 def is_system_directory(file_path):
     """Check if a file is in a system directory."""
