@@ -56,7 +56,7 @@ def ensure_directories_and_files(base_dir):
     # Define the directory structure
     directories = [
         os.path.join(base_dir, "logs"),
-        os.path.join(base_dir, "output")
+        os.path.join(base_dir, "output"),
     ]
     
     # Define log files
