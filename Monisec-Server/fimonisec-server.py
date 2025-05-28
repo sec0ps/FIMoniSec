@@ -656,7 +656,7 @@ Management Commands:
   add-agent <agent_name>         Add a new client and generate a unique PSK.
   remove-agent <agent_name>      Remove an existing client.
   list-agents                    List all registered clients.
-  list-connected-clients         Show all currently connected clients and connection status.
+  list-connected-agents         Show all currently connected clients and connection status.
                                  Use with 'reset' to reset connection tracking if needed.
   configure-siem                 Configure SIEM settings for log forwarding.
 
@@ -711,7 +711,7 @@ if __name__ == "__main__":
             clients.add_agent()
             sys.exit(0)
             
-        elif action == "list-connected-agents":
+        elif action == "list-connected-agents":  # Fixed: was "list-connected-agents"
             show_connected_agents()
             sys.exit(0) 
 
@@ -842,6 +842,12 @@ if __name__ == "__main__":
                 print(f"[ERROR] Failed to stop daemon: {e}")
                 sys.exit(1)
             sys.exit(0)
+
+        else:
+            # Handle unknown commands
+            print(f"[ERROR] Unknown command: {action}")
+            print_help()
+            sys.exit(1)
 
     # Default path: start MoniSec server if no valid command was passed
     siem_config = server_siem.load_siem_config()
