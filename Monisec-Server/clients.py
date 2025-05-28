@@ -222,11 +222,9 @@ def receive_chunked_data(client_socket):
             
             # Convert size bytes to integer
             chunk_size = int.from_bytes(size_bytes, byteorder='big')
-            #logging.debug(f"[CHUNK] Received size header: {chunk_size} bytes")
             
             # End of message marker
             if chunk_size == 0:
-                #logging.debug(f"[CHUNK] End of chunked message marker received")
                 break
             
             # Sanity check on chunk size
@@ -288,15 +286,13 @@ def is_chunked_message(client_socket):
 
 def handle_client(client_socket, client_address):
     """Handles encrypted log reception and NAT detection from authenticated client."""
-    logging.info(f"[DEBUG] → 1. Starting client handler for {client_address}")
     logging.info(f"New connection from {client_address[0]}:{client_address[1]}")
 
     try:
         raw = client_socket.recv(1024)
-        logging.info(f"[DEBUG] → 2. Received initial data: {raw[:50]!r}")
 
         if raw and (raw[0] < 32 or raw[0] > 126):
-            logging.debug(f"[CONN-DEBUG] Received binary data from {client_address}, first 20 bytes: {raw[:20].hex()}")
+            pass  # Binary data detection - no logging needed
 
         try:
             try:
@@ -328,12 +324,10 @@ def handle_client(client_socket, client_address):
                         logging.info(f"[AUTH] Client '{client_name}' authenticated. Ready to receive logs.")
                         client_socket.sendall(b"OK")
 
-                        # ✅ Retain PSK for log decryption
+                        # Retain PSK for log decryption
                         psk = server_crypt.load_psks(client_name)
-                        logging.info(f"[DEBUG] → 3. Sent OK to client {client_address}, entering log receive loop")
 
                         while True:
-                            logging.info(f"[DEBUG] → 4. Inside log receive loop for {client_address}")
                             readable, _, _ = select.select([client_socket], [], [], 0.5)
                             if not readable:
                                 continue
@@ -407,7 +401,6 @@ def handle_client(client_socket, client_address):
                                     server_siem.forward_log_to_siem(log_entry, client_name)
 
                                 client_socket.sendall(b"ACK")
-                                logging.debug(f"[RECV] Sent ACK for {log_count} logs to {client_name}")
 
                             except Exception as e:
                                 logging.error(f"[RECV] Unexpected processing error from {client_name}: {e}")
@@ -421,8 +414,6 @@ def handle_client(client_socket, client_address):
                         logging.error(f"[CLIENT] Exception handling client {client_name}: {e}")
 
             except json.JSONDecodeError:
-                logging.debug(f"[CONN-DEBUG] Received non-JSON data from {client_address[0]}, length: {len(raw)}")
-
                 try:
                     parts = raw.decode("utf-8").split(":")
                     if len(parts) == 3:
@@ -452,7 +443,7 @@ def handle_client(client_socket, client_address):
                     return
 
         except UnicodeDecodeError:
-            logging.debug(f"[CONN-DEBUG] Non-UTF8 data received from {client_address[0]}, length: {len(raw)}")
+            pass  # Non-UTF8 data - no logging needed
 
     except Exception as e:
         logging.error(f"[ERROR] Unexpected top-level error from {client_address}: {e}")
