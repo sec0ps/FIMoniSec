@@ -29,20 +29,20 @@ import socket
 import time
 import logging
 
-CONFIG_FILE = "monisec-server.config"
-SIEM_LOG_FILE = "./logs/siem-forwarding.log"
+base_dir = "/opt/FIMoniSec/Monisec-Server"
+logs_dir = os.path.join(base_dir, "logs")
+CONFIG_FILE = os.path.join(base_dir, "monisec-server.config")
+SIEM_LOG_FILE = os.path.join(logs_dir, "siem-forwarding.log")
 
 def ensure_siem_log():
     """Ensure the SIEM log directory and log file exist with correct permissions."""
-    log_dir = os.path.dirname(SIEM_LOG_FILE)
-
     # Create logs directory if it doesn't exist
-    os.makedirs(log_dir, mode=0o700, exist_ok=True)
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir, mode=0o700, exist_ok=True)
 
     # Create log file if it doesn't exist
     if not os.path.exists(SIEM_LOG_FILE):
         open(SIEM_LOG_FILE, "w").close()  # Create empty file
-
 
 # ✅ Ensure SIEM log file exists before setting up logging
 ensure_siem_log()
