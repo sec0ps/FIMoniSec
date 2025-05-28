@@ -131,20 +131,68 @@ def forward_log_to_siem(log_entry, client_name):
         siem_logger.error("[ERROR] Received malformed log entry; expected dictionary.")
         return
 
-    formatted_log = {
-        "timestamp": log_entry.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
-        "event_type": log_entry.get("event_type", "UNKNOWN"),
-        "client_name": client_name,  # ✅ Ensure correct client_name is forwarded
-        "file_path": log_entry.get("file_path", "N/A"),
-        "metadata": {
-            "previous": log_entry.get("previous_metadata", {}) if isinstance(log_entry.get("previous_metadata", {}), dict) else {},
-            "new": log_entry.get("new_metadata", {}) if isinstance(log_entry.get("new_metadata", {}), dict) else {},
-        },
-        "hashes": {
-            "previous": log_entry.get("previous_hash", "N/A"),
-            "new": log_entry.get("new_hash", "N/A"),
-        },
-        "changes": log_entry.get("changes", "N/A"),
-    }
+    # Detect log type and format accordingly
+    if "process_hash" in log_entry or ("previous_metadata" in log_entry and "new_metadata" in log_entry):
+        # PIM log format - extract data from nested metadata
+        current_data = log_entry.get("new_metadata", {})
+        previous_data = log_entry.get("previous_metadata", {})
+        
+        formatted_log = {
+            "timestamp": log_entry.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
+            "log_source": "PIM",
+            "client_name": client_name,
+            "event_type": log_entry.get("event_type", "UNKNOWN"),
+            "process_hash": log_entry.get("process_hash", "N/A"),
+            "process_name": current_data.get("process_name", "N/A"),
+            "pid": current_data.get("pid", "N/A"),
+            "exe_path": current_data.get("exe_path", "N/A"),
+            "user": current_data.get("user", "N/A"),
+            "cmdline": current_data.get("cmdline", "N/A"),
+            "port": current_data.get("port", "N/A"),
+            "is_listening": current_data.get("is_listening", False),
+            "lineage": current_data.get("lineage", []),
+            "changes_description": log_entry.get("changes_description", "N/A"),
+            "mitre_mapping": log_entry.get("mitre_mapping", {}),
+            "previous_metadata": previous_data,
+            "new_metadata": current_data,
+            "runtime_seconds": current_data.get("runtime_seconds", "N/A"),
+            "ppid": current_data.get("ppid", "N/A"),
+            "state": current_data.get("state", "N/A")
+        }
+    elif any(field in log_entry for field in ["attack_name", "mitre_id", "log_category"]):
+        # LIM log format
+        formatted_log = {
+            "timestamp": log_entry.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
+            "log_source": "LIM", 
+            "client_name": client_name,
+            "attack_name": log_entry.get("attack_name", "UNKNOWN"),
+            "mitre_id": log_entry.get("mitre_id", "N/A"),
+            "severity": log_entry.get("severity", "low"),
+            "detection_type": log_entry.get("detection_type", "signature"),
+            "log_file": log_entry.get("log_file", "N/A"),
+            "log_category": log_entry.get("log_category", "other"),
+            "entry": log_entry.get("entry", "N/A"),
+            "parsed": log_entry.get("parsed", {}),
+            "anomaly_score": log_entry.get("anomaly_score", "N/A")
+        }
+    else:
+        # FIM log format (original format)
+        formatted_log = {
+            "timestamp": log_entry.get("timestamp", time.strftime("%Y-%m-%d %H:%M:%S")),
+            "log_source": "FIM",
+            "client_name": client_name,
+            "event_type": log_entry.get("event_type", "UNKNOWN"),
+            "file_path": log_entry.get("file_path", "N/A"),
+            "previous_hash": log_entry.get("previous_hash", "N/A"),
+            "new_hash": log_entry.get("new_hash", "N/A"),
+            "changes": log_entry.get("changes", "N/A"),
+            "old_path": log_entry.get("old_path", "N/A"),
+            "mitre_mapping": log_entry.get("mitre_mapping", {}),
+            "config_changes": log_entry.get("config_changes", {}),
+            "metadata": {
+                "previous": log_entry.get("previous_metadata", {}) if isinstance(log_entry.get("previous_metadata", {}), dict) else {},
+                "new": log_entry.get("new_metadata", {}) if isinstance(log_entry.get("new_metadata", {}), dict) else {},
+            }
+        }
 
     send_to_siem(formatted_log)
