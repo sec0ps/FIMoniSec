@@ -445,33 +445,33 @@ class LogIntegrityMonitor:
         """Scan system for common security audit log files excluding archives"""
         log_files = []
         
-        # Common log file locations
-        log_dirs = [
+        # Common log file locations (including both directories and individual files)
+        log_paths = [
             "/var/log",
             "/var/log/audit",
-            "/var/log/apache2",
+            "/var/log/apache2", 
             "/var/log/nginx",
             "/var/log/httpd",
             "/var/log/syslog",
             "/var/log/secure",
-            "/var/log/auth.log",
+            "/var/log/auth.log", 
             "/var/log/messages"
         ]
         
         # Use find command (which is in NOPASSWD list)
-        for log_dir in log_dirs:
+        for log_path in log_paths:
             try:
-                # Check if directory exists first
-                check_cmd = ["sudo", "find", log_dir, "-maxdepth", "0", "-type", "d"]
-                check_result = subprocess.run(check_cmd, capture_output=True, text=True)
+                # Check if path exists first (works for both files and directories)
+                check_cmd = ["sudo", "find", log_path, "-maxdepth", "0"]
+                check_result = subprocess.run(check_cmd, capture_output=True, text=True, timeout=30)
                 
                 if check_result.returncode != 0:
-                    # Skip directories that don't exist or can't be accessed
+                    # Skip paths that don't exist or can't be accessed
                     continue
                     
-                # Use find to get all regular files
-                find_cmd = ["sudo", "find", log_dir, "-type", "f"]
-                find_result = subprocess.run(find_cmd, capture_output=True, text=True)
+                # Use find to get all regular files (if it's a directory, find files in it; if it's a file, return it)
+                find_cmd = ["sudo", "find", log_path, "-type", "f"]
+                find_result = subprocess.run(find_cmd, capture_output=True, text=True, timeout=60)
                 
                 if find_result.returncode == 0 and find_result.stdout:
                     found_files = find_result.stdout.strip().split('\n')
@@ -487,8 +487,11 @@ class LogIntegrityMonitor:
                             if not re.search(r'\.(gz|zip|bz2|\d+)$', file_path):
                                 log_files.append(file_path)
                                 
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"Timeout finding logs in {log_path}")
+                continue
             except Exception as e:
-                self.logger.error(f"Error finding logs in {log_dir}: {str(e)}")
+                self.logger.error(f"Error finding logs in {log_path}: {str(e)}")
         
         # Deduplicate and sort
         log_files = sorted(list(set(log_files)))
@@ -600,48 +603,34 @@ class LogIntegrityMonitor:
             try:
                 # Use head to check if file is accessible
                 check_cmd = ["sudo", "head", "-c", "1", log_file]
-                check_result = subprocess.run(check_cmd, capture_output=True)
+                check_result = subprocess.run(check_cmd, capture_output=True, timeout=10)
                 
                 if check_result.returncode != 0:
                     self.logger.warning(f"Cannot access {log_file}: {check_result.stderr}")
                     return 0
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"Timeout checking access to {log_file}")
+                return 0
             except Exception:
                 self.logger.warning(f"Cannot access {log_file}")
                 return 0
                 
-            # For new files, start from end (don't analyze existing logs on first run)
-            # Get approximate file size using tail with a large value
-            size_cmd = ["sudo", "tail", "-c", "1", log_file]
-            size_result = subprocess.run(size_cmd, capture_output=True)
-            if size_result.returncode != 0:
-                self.logger.warning(f"Cannot get file size for {log_file}")
-                size = 0
-            else:
-                # Efficient way to get file size using cat and wc
-                try:
-                    # Use a more efficient approach to get file size
-                    # We pipe the entire file through wc to count bytes
-                    wc_cmd = f"sudo cat '{log_file}' | wc -c"
-                    size_result = subprocess.run(wc_cmd, shell=True, capture_output=True, text=True)
-                    if size_result.returncode == 0:
-                        size = int(size_result.stdout.strip())
-                    else:
-                        # Alternative: use tail to get an approximate size
-                        self.logger.warning(f"Using alternative size method for {log_file}")
-                        size_cmd = ["sudo", "tail", "-c", "524288000", log_file]  # Try to read up to 500MB
-                        proc = subprocess.Popen(size_cmd, stdout=subprocess.PIPE)
-                        size = 0
-                        while True:
-                            chunk = proc.stdout.read(65536)  # Read in 64KB chunks
-                            if not chunk:
-                                break
-                            size += len(chunk)
-                        proc.terminate()
-                        proc.wait()
-                except Exception as e:
-                    self.logger.warning(f"Error calculating file size: {str(e)}")
-                    # If we can't determine size, start from position 0
+            # For new files, get file size using stat (which is in NOPASSWD list)
+            try:
+                stat_cmd = ["sudo", "stat", "-c", "%s", log_file]
+                stat_result = subprocess.run(stat_cmd, capture_output=True, text=True, timeout=30)
+                
+                if stat_result.returncode == 0:
+                    size = int(stat_result.stdout.strip())
+                else:
+                    self.logger.warning(f"Cannot get file size for {log_file}, starting from 0")
                     size = 0
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"Timeout getting file size for {log_file}")
+                size = 0
+            except (ValueError, Exception) as e:
+                self.logger.warning(f"Error calculating file size: {str(e)}")
+                size = 0
             
             # Store the position
             self.log_positions[log_file] = {
@@ -660,7 +649,7 @@ class LogIntegrityMonitor:
                 "first_seen": True  # Mark this as first time seeing this file
             }
             return 0
-    
+
     def update_log_position(self, log_file, position):
         """Update saved position for log file"""
         self.log_positions[log_file] = {
@@ -1036,49 +1025,39 @@ class LogIntegrityMonitor:
             
             # Skip files with extensions indicating they are archived
             if re.search(r'\.(gz|zip|bz2|\d+)$', log_file):
-                self.logger.debug(f"Skipping fs log file: {log_file}")
+                self.logger.debug(f"Skipping archived log file: {log_file}")
                 return []
             
-            # Try to get the file size using sudo head
+            # Try to get the file size using stat (which is in NOPASSWD list)
             try:
-                # Use sudo head to peek at the file
+                # Use sudo head to peek at the file first
                 head_cmd = ["sudo", "head", "-c", "1", log_file]
-                head_result = subprocess.run(head_cmd, capture_output=True)
+                head_result = subprocess.run(head_cmd, capture_output=True, timeout=10)
                 
                 if head_result.returncode != 0:
                     self.logger.warning(f"Cannot access {log_file}: {head_result.stderr}")
                     return []
                 
-                # If we can access the file, get its size with a large head command
-                # 500MB should be enough for most logs
-                size_cmd = ["sudo", "head", "-c", "524288000", log_file]
-                size_proc = subprocess.Popen(size_cmd, stdout=subprocess.PIPE)
+                # Get file size using stat command (allowed by NOPASSWD)
+                stat_cmd = ["sudo", "stat", "-c", "%s", log_file]
+                stat_result = subprocess.run(stat_cmd, capture_output=True, text=True, timeout=30)
                 
-                # Count bytes as they come through
-                current_size = 0
-                while True:
-                    chunk = size_proc.stdout.read(1024 * 1024)  # Read 1MB chunks
-                    if not chunk:
-                        break
-                    current_size += len(chunk)
-                
-                # Clean up process
-                size_proc.terminate()
-                size_proc.wait()
-                
-            except KeyboardInterrupt:
-                self.logger.info("Operation interrupted by user")
-                self.running = False
+                if stat_result.returncode == 0:
+                    current_size = int(stat_result.stdout.strip())
+                else:
+                    self.logger.warning(f"Could not get file size for {log_file}, using fallback method")
+                    # Fallback: assume file hasn't changed if we have a position
+                    current_size = position if position > 0 else 0
+                    
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"Timeout getting file size for {log_file}")
+                return []
+            except (ValueError, KeyboardInterrupt):
                 raise
             except Exception as e:
                 self.logger.warning(f"Error getting file size for {log_file}: {str(e)}")
                 # If we can't get the file size, use a safer approach
-                # Either start from the beginning (0) or keep the last position
-                if position == 0:
-                    current_size = 0
-                else:
-                    # If we had a previous position, assume file hasn't changed
-                    current_size = position
+                current_size = position if position > 0 else 0
             
             # Handle file truncation (file smaller than last position)
             if current_size < position:
@@ -1099,7 +1078,7 @@ class LogIntegrityMonitor:
                     # Read whole file
                     cmd = ["sudo", "cat", log_file]
                     
-                result = subprocess.run(cmd, capture_output=True, text=True)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                 
                 if result.returncode != 0:
                     self.logger.warning(f"Error reading {log_file}: {result.stderr}")
@@ -1119,6 +1098,9 @@ class LogIntegrityMonitor:
                 alerts = self.analyze_log_entries(entries, log_file, log_category)
                 
                 return alerts
+            except subprocess.TimeoutExpired:
+                self.logger.warning(f"Timeout reading content from {log_file}")
+                return []
             except KeyboardInterrupt:
                 self.logger.info("Operation interrupted by user")
                 self.running = False
@@ -1446,15 +1428,25 @@ class LogIntegrityMonitor:
         logs_dir = os.path.join(self.base_dir, "logs")
         os.makedirs(logs_dir, exist_ok=True)
         output_file = os.path.join(logs_dir, "lim_monitor.json")
-
+    
         # Read existing alerts if file exists
         existing_alerts = []
         if os.path.exists(output_file):
             try:
                 with open(output_file, 'r') as f:
-                    existing_alerts = json.load(f)
+                    data = json.load(f)
+                    # Handle case where existing file contains a dict instead of list
+                    if isinstance(data, list):
+                        existing_alerts = data
+                    elif isinstance(data, dict):
+                        # Convert single dict to list
+                        existing_alerts = [data]
+                    else:
+                        self.logger.warning(f"Unexpected data type in alerts file: {type(data)}")
+                        existing_alerts = []
             except Exception as e:
                 self.logger.error(f"Error reading existing alerts: {str(e)}")
+                existing_alerts = []
         
         # Combine alerts and write back
         combined_alerts = existing_alerts + alerts
