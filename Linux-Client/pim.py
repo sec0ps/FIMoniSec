@@ -1494,7 +1494,7 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
     Map detected activities to MITRE ATT&CK techniques with enhanced impersonation detection
     by comparing process attributes to known good processes in the integrity database.
     """
-    # Comprehensive built-in MITRE ATT&CK mappings
+    # Comprehensive built-in MITRE ATT&CK mappings - CORRECTED FOR LINUX
     mitre_mapping = {
         "NEW_PROCESS": [
             {
@@ -1510,8 +1510,8 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                 "tactic": "Command and Control"
             },
             {
-                "technique_id": "T1543",
-                "technique_name": "Create or Modify System Process",
+                "technique_id": "T1543.002",
+                "technique_name": "Create or Modify System Process: Systemd Service",
                 "tactic": "Persistence"
             }
         ],
@@ -1529,9 +1529,9 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                 "tactic": "Defense Evasion"
             },
             {
-                "technique_id": "T1112",
-                "technique_name": "Modify Registry",
-                "tactic": "Defense Evasion"
+                "technique_id": "T1546.004",
+                "technique_name": "Event Triggered Execution: Unix Shell Configuration Modification",
+                "tactic": "Persistence"
             }
         ],
         "SUSPICIOUS_MEMORY_REGION": [
@@ -1546,8 +1546,8 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                 "tactic": "Defense Evasion"
             },
             {
-                "technique_id": "T1055.002",
-                "technique_name": "Process Injection: Portable Executable Injection",
+                "technique_id": "T1055.008",
+                "technique_name": "Process Injection: Ptrace System Calls",
                 "tactic": "Defense Evasion"
             }
         ],
@@ -1587,13 +1587,13 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                 "tactic": "Execution"
             },
             {
-                "technique_id": "T1053",
-                "technique_name": "Scheduled Task/Job",
+                "technique_id": "T1053.003",
+                "technique_name": "Scheduled Task/Job: Cron",
                 "tactic": "Persistence"
             },
             {
-                "technique_id": "T1078",
-                "technique_name": "Valid Accounts",
+                "technique_id": "T1078.003",
+                "technique_name": "Valid Accounts: Local Accounts",
                 "tactic": "Defense Evasion"
             }
         ],
@@ -1635,13 +1635,13 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
         ],
         "USER_MISMATCH": [
             {
-                "technique_id": "T1078",
-                "technique_name": "Valid Accounts",
+                "technique_id": "T1078.003",
+                "technique_name": "Valid Accounts: Local Accounts",
                 "tactic": "Defense Evasion"
             },
             {
-                "technique_id": "T1548",
-                "technique_name": "Abuse Elevation Control Mechanism",
+                "technique_id": "T1548.001",
+                "technique_name": "Abuse Elevation Control Mechanism: Setuid and Setgid",
                 "tactic": "Privilege Escalation"
             }
         ]
@@ -1752,8 +1752,8 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
     port = process_info.get("port", 0)
     if isinstance(port, int) and port < 1024 and user != "root":
         context_insights.append({
-            "technique_id": "T1068",
-            "technique_name": "Exploitation for Privilege Escalation",
+            "technique_id": "T1548.001",
+            "technique_name": "Abuse Elevation Control Mechanism: Setuid and Setgid",
             "tactic": "Privilege Escalation",
             "severity": "high",
             "evidence": f"Non-root user '{user}' binding to privileged port {port}"
@@ -1761,8 +1761,8 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
     
     # 5. Check for suspicious command line patterns
     suspicious_cmd_patterns = [
-        "base64", "-encode", "--decode", "powershell", "eval", "exec", 
-        "system(", "shell_exec", "wget", "curl", "nc ", "netcat", "perl -e", "python -c"
+        "base64", "-encode", "--decode", "python -c", "perl -e", "eval", "exec", 
+        "system(", "shell_exec", "wget", "curl", "nc ", "netcat", "bash -i", "sh -i"
     ]
     if any(pattern in cmdline for pattern in suspicious_cmd_patterns):
         context_insights.append({
@@ -1794,8 +1794,8 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             "evidence": f"Potential reverse shell detected: {cmdline}"
         })
     
-    # 8. Check for credential access
-    if "shadow" in cmdline or "passwd" in cmdline or "/etc/passwd" in cmdline:
+    # 8. Check for credential access - CORRECTED FOR LINUX
+    if any(cred_file in cmdline for cred_file in ["/etc/shadow", "/etc/passwd", "/etc/gshadow", "/etc/group"]):
         context_insights.append({
             "technique_id": "T1003.008",
             "technique_name": "OS Credential Dumping: /etc/passwd and /etc/shadow",
@@ -1804,7 +1804,47 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             "evidence": f"Potential credential access attempt: {cmdline}"
         })
     
-    # 9. Check for specific detection events
+    # 9. Check for sudo/su privilege escalation attempts
+    if any(priv_cmd in cmdline for priv_cmd in ["sudo -s", "sudo su", "su -", "sudo bash", "sudo sh"]):
+        context_insights.append({
+            "technique_id": "T1548.003",
+            "technique_name": "Abuse Elevation Control Mechanism: Sudo and Sudo Caching",
+            "tactic": "Privilege Escalation",
+            "severity": "medium",
+            "evidence": f"Privilege escalation attempt detected: {cmdline}"
+        })
+    
+    # 10. Check for Linux-specific persistence mechanisms
+    if any(persist_file in cmdline for persist_file in [".bashrc", ".bash_profile", ".profile", "/etc/crontab", ".ssh/authorized_keys"]):
+        context_insights.append({
+            "technique_id": "T1546.004",
+            "technique_name": "Event Triggered Execution: Unix Shell Configuration Modification",
+            "tactic": "Persistence",
+            "severity": "medium",
+            "evidence": f"Potential persistence mechanism modification: {cmdline}"
+        })
+    
+    # 11. Check for Linux service manipulation
+    if any(service_cmd in cmdline for service_cmd in ["systemctl", "service", "chkconfig", "/etc/init.d/"]):
+        context_insights.append({
+            "technique_id": "T1543.002",
+            "technique_name": "Create or Modify System Process: Systemd Service",
+            "tactic": "Persistence",
+            "severity": "medium",
+            "evidence": f"Service manipulation detected: {cmdline}"
+        })
+    
+    # 12. Check for Linux kernel module manipulation
+    if any(kernel_cmd in cmdline for kernel_cmd in ["insmod", "rmmod", "modprobe", "lsmod"]):
+        context_insights.append({
+            "technique_id": "T1547.006",
+            "technique_name": "Boot or Logon Autostart Execution: Kernel Modules and Extensions",
+            "tactic": "Persistence",
+            "severity": "high",
+            "evidence": f"Kernel module manipulation detected: {cmdline}"
+        })
+    
+    # 13. Check for specific detection events
     if event_type == "SUSPICIOUS_BEHAVIOR" and detection_details:
         if "suspicious_patterns" in detection_details:
             for pattern in detection_details.get("suspicious_patterns", []):
@@ -1891,23 +1931,23 @@ def calculate_threat_score(process_info, detection_events):
             reasons.append(f"Suspicious process in lineage: {proc}")
             break
     
-    # 3. Score based on execution path
-    suspicious_paths = ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/"]
+    # 3. Score based on execution path - Linux specific paths
+    suspicious_paths = ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/", "/proc/", "/sys/"]
     for path in suspicious_paths:
         if path in exe_path:
             base_score += 25
             reasons.append(f"Executing from suspicious location: {path}")
             break
     
-    # 4. Score based on port
+    # 4. Score based on port - Linux context
     if isinstance(port, int):
         # Known malicious ports
-        malicious_ports = [4444, 1337, 31337, 6667, 6697, 6660, 6665, 6666, 6668, 6669]
+        malicious_ports = [4444, 1337, 31337, 6667, 6697, 6660, 6665, 6666, 6668, 6669, 8080, 8888, 9999]
         if port in malicious_ports:
             base_score += 30
             reasons.append(f"Listening on known malicious port: {port}")
-        # Non-standard high ports (possibly suspicious)
-        elif port > 10000 and port not in [27017, 28017, 50070, 50075, 50030, 50060]:
+        # Non-standard high ports (possibly suspicious) - excluding common Linux service ports
+        elif port > 10000 and port not in [27017, 28017, 50070, 50075, 50030, 50060, 11211, 27015, 25565]:
             base_score += 15
             reasons.append(f"Listening on high non-standard port: {port}")
     
@@ -1951,12 +1991,18 @@ def calculate_threat_score(process_info, detection_events):
                     elif "malicious port" in pattern_lower:
                         base_score += 30
                         reasons.append("Known malicious port detected")
-                    elif "encoded command" in pattern_lower:
+                    elif "encoded command" in pattern_lower or "base64" in pattern_lower:
                         base_score += 35
                         reasons.append("Obfuscated command execution detected")
                     elif "network utility" in pattern_lower:
                         base_score += 25
                         reasons.append("Network utility in unusual context")
+                    elif "privilege escalation" in pattern_lower:
+                        base_score += 30
+                        reasons.append("Privilege escalation attempt detected")
+                    elif "persistence" in pattern_lower:
+                        base_score += 25
+                        reasons.append("Persistence mechanism detected")
                     else:
                         base_score += 15
                         reasons.append(f"Suspicious behavior: {pattern}")
@@ -1985,7 +2031,25 @@ def calculate_threat_score(process_info, detection_events):
             base_score += 20
             reasons.append("Process lineage deviation")
     
-    # 6. Cap and categorize score
+    # 6. Additional Linux-specific scoring
+    cmdline = process_info.get("cmdline", "").lower()
+    
+    # Check for Linux-specific suspicious commands
+    if any(linux_cmd in cmdline for linux_cmd in ["chmod +x", "chown root", "sudo -i", "su -", "/bin/sh -c"]):
+        base_score += 15
+        reasons.append("Linux privilege escalation commands detected")
+    
+    # Check for systemd manipulation
+    if any(systemd_cmd in cmdline for systemd_cmd in ["systemctl enable", "systemctl start", "systemctl daemon-reload"]):
+        base_score += 20
+        reasons.append("Systemd service manipulation detected")
+    
+    # Check for cron job manipulation
+    if any(cron_cmd in cmdline for cron_cmd in ["crontab -e", "crontab -l", "/etc/crontab"]):
+        base_score += 18
+        reasons.append("Cron job manipulation detected")
+    
+    # 7. Cap and categorize score
     final_score = min(base_score, 100)
     
     # Determine severity category
