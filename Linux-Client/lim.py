@@ -1429,6 +1429,10 @@ class LogIntegrityMonitor:
         os.makedirs(logs_dir, exist_ok=True)
         output_file = os.path.join(logs_dir, "lim_monitor.json")
     
+        # Add log_type to each alert before writing
+        for alert in alerts:
+            alert["log_type"] = "LIM"  # Add log type identifier
+    
         # Read existing alerts if file exists
         existing_alerts = []
         if os.path.exists(output_file):
