@@ -63,8 +63,7 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_FILES = [
     os.path.join(LOG_DIR, "file_monitor.json"),
     os.path.join(LOG_DIR, "pim_monitor.json"),
-    os.path.join(LOG_DIR, "lim_monitor.json"),
-    os.path.join(OUTPUT_DIR, "integrity_processes.json")
+    os.path.join(LOG_DIR, "lim_monitor.json")
 ]
 
 # Update AUTH_TOKEN_FILE path
@@ -359,8 +358,6 @@ def send_logs_to_server():
                 sock.settimeout(10)
                 sock.connect((server_ip, 5555))
 
-                # Use the same method that works in authenticate_with_server()
-                # Send a JSON handshake instead of an HMAC handshake
                 handshake_data = {
                     "client_name": client_name,
                     "timestamp": time.time()
@@ -372,7 +369,7 @@ def send_logs_to_server():
                 response = sock.recv(1024)
 
                 if not response or response != b"OK":
-                    if attempt < RETRIES - 1:  # Don't raise on the last attempt to allow the outer loop to handle it
+                    if attempt < RETRIES - 1:
                         continue
                     raise ConnectionError("Bad handshake response")
 
@@ -391,13 +388,11 @@ def send_logs_to_server():
         saved_positions = load_file_positions()
         file_positions = {}
         
-        # Initialize each file with saved position or current size
         for log_file in LOG_FILES:
             if str(log_file) in saved_positions and os.path.exists(log_file):
                 file_size = os.path.getsize(log_file)
                 saved_pos = int(saved_positions[str(log_file)])
                 
-                # Validate the saved position against file size
                 if saved_pos <= file_size:
                     file_positions[log_file] = saved_pos
                 else:
@@ -408,6 +403,8 @@ def send_logs_to_server():
 
         while True:
             logs_to_send = {}
+            total_entries = 0
+            
             for log_file in LOG_FILES:
                 if os.path.exists(log_file):
                     try:
@@ -425,66 +422,166 @@ def send_logs_to_server():
                             new_position = f.tell()
 
                             if new_logs:
-                                entries = extract_valid_json_objects(new_logs)
+                                # Determine log type
+                                log_type = "UNKNOWN"
+                                if "file_monitor.json" in log_file:
+                                    log_type = "FIM"
+                                elif "pim_monitor.json" in log_file:
+                                    log_type = "PIM"
+                                elif "lim_monitor.json" in log_file:
+                                    log_type = "LIM"
+                                
+                                logging.debug(f"[LOGS-{log_type}] Processing {len(new_logs)} characters from {log_file}")
+                                
+                                # Add detailed debugging for problematic files
+                                if len(new_logs) > 100:  # Only debug substantial content
+                                    debug_log_content(new_logs, log_file)
+                                
+                                # PASS THE FILENAME TO THE PARSER
+                                entries = extract_valid_json_objects(new_logs, log_file_name=log_file)
+                                
+                                # Enhanced validation with file info
+                                valid_entries = []
+                                for entry_num, entry in enumerate(entries, 1):
+                                    if entry is None:
+                                        logging.warning(f"[LOGS-{log_type}] Skipping None entry {entry_num} from {log_file}")
+                                        continue
+                                    if not isinstance(entry, dict):
+                                        logging.warning(f"[LOGS-{log_type}] Skipping non-dict entry {entry_num} from {log_file}: {type(entry)}")
+                                        continue
+                                    
+                                    # Add required fields
+                                    entry["client_name"] = client_name
+                                    entry["log_type"] = log_type
+                                    
+                                    # Ensure timestamp exists
+                                    if not entry.get("timestamp"):
+                                        entry["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                                    
+                                    valid_entries.append(entry)
+                                
+                                logging.info(f"[LOGS-{log_type}] {log_file}: Validated {len(valid_entries)} of {len(entries)} entries")
 
-                                if entries:
+                                if valid_entries:
                                     if log_file not in logs_to_send:
                                         logs_to_send[log_file] = {
                                             "entries": [],
                                             "new_position": new_position
                                         }
-
-                                    for entry in entries:
-                                        if isinstance(entry, dict):
-                                            entry["client_name"] = client_name
-                                            logs_to_send[log_file]["entries"].append(entry)
+                                    logs_to_send[log_file]["entries"].extend(valid_entries)
+                                    total_entries += len(valid_entries)
+                                else:
+                                    if new_logs.strip():
+                                        logging.warning(f"[LOGS-{log_type}] {log_file}: Could not parse any valid entries from {len(new_logs)} characters")
+                                        # Show a sample of the problematic content
+                                        sample = new_logs[:500].replace('\n', '\\n')
+                                        logging.warning(f"[LOGS-{log_type}] {log_file}: Content sample: {sample}...")
                     except Exception as e:
                         logging.error(f"[LOGS] Error reading {log_file}: {e}")
+                        import traceback
+                        logging.error(f"[LOGS] {log_file} traceback: {traceback.format_exc()}")
 
-            if any(data["entries"] for data in logs_to_send.values()):
+            if total_entries > 0:
                 try:
                     all_logs = []
-                    for data in logs_to_send.values():
+                    for log_file, data in logs_to_send.items():
                         all_logs.extend(data["entries"])
+                        logging.debug(f"[LOGS] Added {len(data['entries'])} entries from {log_file}")
+
+                    # FINAL VALIDATION BEFORE SENDING
+                    final_logs = []
+                    for i, log_entry in enumerate(all_logs):
+                        if log_entry is None:
+                            logging.error(f"[LOGS] Detected None log entry {i+1} before sending, skipping")
+                            continue
+                        if not isinstance(log_entry, dict):
+                            logging.error(f"[LOGS] Detected non-dict log entry {i+1} before sending: {type(log_entry)}, skipping")
+                            continue
+                        
+                        # Additional validation for required fields
+                        if not log_entry.get("log_type"):
+                            logging.warning(f"[LOGS] Entry {i+1} missing log_type, adding default")
+                            log_entry["log_type"] = "UNKNOWN"
+                        
+                        final_logs.append(log_entry)
+                    
+                    if not final_logs:
+                        logging.warning("[LOGS] No valid log entries to send after final validation")
+                        continue
+
+                    # Log summary of what we're sending
+                    by_type = {}
+                    by_file = {}
+                    for entry in final_logs:
+                        log_type = entry.get("log_type", "UNKNOWN")
+                        by_type[log_type] = by_type.get(log_type, 0) + 1
+                        
+                        # Try to determine source file from entry data
+                        source_file = "unknown"
+                        if "file_path" in entry:
+                            source_file = "FIM"
+                        elif "process_hash" in entry:
+                            source_file = "PIM" 
+                        elif "attack_name" in entry:
+                            source_file = "LIM"
+                        by_file[source_file] = by_file.get(source_file, 0) + 1
+                    
+                    logging.info(f"[LOGS] Sending {len(final_logs)} entries: {dict(by_type)} from sources: {dict(by_file)}")
 
                     message = json.dumps({
-                        "logs": all_logs,
-                        "client_name": client_name
+                        "logs": final_logs,
+                        "client_name": client_name,
+                        "total_entries": len(final_logs),
+                        "breakdown": by_type
                     })
 
-                    # Import client_crypt here to avoid circular imports
                     from client_crypt import encrypt_data
                     encrypted = encrypt_data(message)
                     
                     if len(encrypted) > CHUNKING_THRESHOLD:
+                        logging.debug(f"[LOGS] Using chunked transmission for {len(encrypted)} bytes")
                         success = send_chunked_data(sock, encrypted)
                         if not success:
                             raise ConnectionError("Chunked data send failed")
                     else:
                         sock.sendall(encrypted)
 
-                    sock.settimeout(5)
+                    sock.settimeout(10)  # Increased timeout for server response
                     ack = sock.recv(1024)
+                    
                     if ack == b"ACK":
                         for log_file, data in logs_to_send.items():
                             file_positions[log_file] = data["new_position"]
-                        
-                        # Save positions to disk for persistence
                         save_file_positions(file_positions)
+                        logging.info(f"[LOGS] Successfully sent and acknowledged {len(final_logs)} log entries")
+                    elif ack == b"ERROR":
+                        logging.error(f"[LOGS] Server returned ERROR when processing {len(final_logs)} log entries")
+                        logging.error(f"[LOGS] Entry breakdown that failed: {dict(by_type)}")
+                        # Log first few entries for debugging
+                        for i, entry in enumerate(final_logs[:3], 1):
+                            entry_info = {
+                                "log_type": entry.get("log_type"),
+                                "timestamp": entry.get("timestamp"),
+                                "keys": list(entry.keys())[:10]
+                            }
+                            logging.error(f"[LOGS] Sample failed entry {i}: {entry_info}")
+                        # Don't update positions on error to retry these entries
+                        break  # Break to reconnect
                     else:
                         logging.warning(f"[LOGS] Unexpected server response: {ack}")
                         if not ack:
-                            raise ConnectionError("No ACK, possible disconnect")
+                            raise ConnectionError("No response from server")
 
                 except Exception as e:
                     logging.error(f"[LOGS] Send error: {e}")
+                    import traceback
+                    logging.error(f"[LOGS] Send error traceback: {traceback.format_exc()}")
                     try:
                         sock.close()
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         sock.settimeout(10)
                         sock.connect((server_ip, 5555))
 
-                        # Use the same JSON handshake method that works for reconnection
                         handshake_data = {
                             "client_name": client_name,
                             "timestamp": time.time()
@@ -498,6 +595,8 @@ def send_logs_to_server():
                         if not response or response != b"OK":
                             logging.warning(f"[LOGS] Reconnection failed: {response}")
                             raise ConnectionError("Failed to authenticate after reconnection")
+                        
+                        logging.info("[LOGS] Successfully reconnected after error")
                     except Exception as reconnect_err:
                         logging.error(f"[LOGS] Failed to reconnect: {reconnect_err}")
                         break
@@ -506,62 +605,212 @@ def send_logs_to_server():
 
     except Exception as e:
         logging.error(f"[LOGS] Fatal client error: {e}")
+        import traceback
+        logging.error(f"[LOGS] Fatal error traceback: {traceback.format_exc()}")
     finally:
-        # Save positions before exiting
         if 'file_positions' in locals():
             save_file_positions(file_positions)
             
         if sock:
             sock.close()
 
-def extract_valid_json_objects(buffer):
-    """Extract valid JSON objects from a buffer, handling complete JSON objects at the root level."""
+def extract_valid_json_objects(buffer, log_file_name=None):
+    """Extract valid JSON objects from a buffer, only accepting complete dictionary objects."""
     logs = []
+    file_info = f" from {log_file_name}" if log_file_name else ""
+    
     if not buffer or not buffer.strip():
         return logs
     
-    # Split by line and look for complete objects
-    lines = buffer.strip().split('\n')
+    buffer = buffer.strip()
     
-    # Handle multi-line JSON objects
-    current_object = ""
-    bracket_count = 0
+    # Method 1: Try to parse using JSONDecoder for concatenated objects
+    decoder = json.JSONDecoder()
+    idx = 0
     
-    for line in lines:
-        # Count opening and closing brackets to track JSON object boundaries
-        bracket_count += line.count('{') - line.count('}')
-        
-        # Add this line to the current object we're building
-        current_object += line
-        
-        # If brackets are balanced, we might have a complete object
-        if bracket_count == 0 and current_object.strip():
-            try:
-                obj = json.loads(current_object)
-                logs.append(obj)
-                current_object = ""
-            except json.JSONDecodeError:
-                # Not a valid object yet, keep going
-                pass
-    
-    # If we couldn't parse any objects the standard way, try as a last resort
-    if not logs and buffer.strip():
-        try:
-            # Try to find all JSON objects in the buffer using regex
-            import re
-            json_pattern = r'\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\}'
-            matches = re.findall(json_pattern, buffer)
+    while idx < len(buffer):
+        # Skip whitespace
+        while idx < len(buffer) and buffer[idx].isspace():
+            idx += 1
             
-            for match in matches:
-                try:
-                    obj = json.loads(match)
-                    logs.append(obj)
-                except json.JSONDecodeError:
-                    continue
-        except Exception:
-            pass
+        if idx >= len(buffer):
+            break
+            
+        # Only try to parse if we're at the start of an object
+        if buffer[idx] != '{':
+            # Find the next '{' character
+            next_brace = buffer.find('{', idx)
+            if next_brace == -1:
+                break
+            idx = next_brace
+            continue
+            
+        try:
+            # Try to decode a JSON object starting at current position
+            obj, end_idx = decoder.raw_decode(buffer, idx)
+            
+            # ONLY accept dictionary objects
+            if isinstance(obj, dict) and obj:  # Must be non-empty dict
+                logs.append(obj)
+            else:
+                logging.warning(f"[JSON-PARSE] Skipping non-dictionary object{file_info}: {type(obj)} - {str(obj)[:100]}")
+            
+            # Move to the position after the parsed object
+            idx += end_idx
+            
+        except json.JSONDecodeError as e:
+            logging.warning(f"[JSON-PARSE] JSON decode error{file_info} at position {idx}: {e}")
+            logging.debug(f"[JSON-PARSE] Context around error{file_info}: ...{buffer[max(0, idx-50):idx+100]}...")
+            # If parsing fails, try to find the next complete JSON object
+            # Look for the next '{' that might start a valid object
+            next_brace = buffer.find('{', idx + 1)
+            if next_brace == -1:
+                break
+            idx = next_brace
+            continue
+        except Exception as e:
+            logging.error(f"[JSON-PARSE] Unexpected parsing error{file_info}: {e}")
+            break
     
-    return logs
+    # Method 2: If no objects found, try line-by-line parsing
+    if not logs:
+        logging.debug(f"[JSON-PARSE] Trying line-by-line parsing{file_info}")
+        lines = buffer.split('\n')
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line or not line.startswith('{'):
+                continue
+                
+            try:
+                obj = json.loads(line)
+                # ONLY accept dictionary objects
+                if isinstance(obj, dict) and obj:  # Must be non-empty dict
+                    logs.append(obj)
+                else:
+                    logging.warning(f"[JSON-PARSE] Skipping line {line_num} non-dictionary{file_info}: {type(obj)} - {str(obj)[:100]}")
+            except json.JSONDecodeError as e:
+                logging.warning(f"[JSON-PARSE] Failed to parse line {line_num}{file_info}: {e}")
+                logging.debug(f"[JSON-PARSE] Problem line{file_info}: {line[:200]}")
+                continue
+    
+    # Method 3: Handle multi-line JSON objects if still no results
+    if not logs:
+        logging.debug(f"[JSON-PARSE] Trying multi-line JSON parsing{file_info}")
+        lines = buffer.split('\n')
+        current_object = ""
+        bracket_count = 0
+        in_string = False
+        escape_next = False
+        start_line = 0
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Start building object only if we see an opening brace
+            if not current_object and not line.startswith('{'):
+                continue
+            
+            if not current_object:
+                start_line = line_num
+                
+            # Add this line to the current object we're building
+            if current_object:
+                current_object += "\n" + line
+            else:
+                current_object = line
+            
+            # Count brackets carefully, considering strings
+            for char in line:
+                if escape_next:
+                    escape_next = False
+                    continue
+                    
+                if char == '\\':
+                    escape_next = True
+                    continue
+                    
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    continue
+                    
+                if not in_string:
+                    if char == '{':
+                        bracket_count += 1
+                    elif char == '}':
+                        bracket_count -= 1
+            
+            # If brackets are balanced and we have content, try to parse
+            if bracket_count == 0 and current_object.strip():
+                try:
+                    obj = json.loads(current_object.strip())
+                    # ONLY accept dictionary objects
+                    if isinstance(obj, dict) and obj:  # Must be non-empty dict
+                        logs.append(obj)
+                    else:
+                        logging.warning(f"[JSON-PARSE] Skipping multi-line non-dictionary{file_info} (lines {start_line}-{line_num}): {type(obj)} - {str(obj)[:100]}")
+                    current_object = ""
+                    bracket_count = 0
+                except json.JSONDecodeError as e:
+                    logging.warning(f"[JSON-PARSE] Failed to parse multi-line JSON{file_info} (lines {start_line}-{line_num}): {e}")
+                    logging.debug(f"[JSON-PARSE] Problem multi-line object{file_info}: {current_object[:300]}...")
+                    current_object = ""
+                    bracket_count = 0
+    
+    # Filter out any remaining invalid objects
+    valid_logs = []
+    for i, log in enumerate(logs):
+        if isinstance(log, dict) and log:  # Must be non-empty dictionary
+            # Additional validation - ensure it has basic log structure
+            if log.get("timestamp") or log.get("log_type") or log.get("event_type"):
+                valid_logs.append(log)
+            else:
+                logging.warning(f"[JSON-PARSE] Skipping log {i+1} without basic structure{file_info}: keys={list(log.keys())[:5]}")
+        else:
+            logging.warning(f"[JSON-PARSE] Skipping invalid log {i+1} type{file_info}: {type(log)}")
+    
+    if logs and not valid_logs:
+        logging.error(f"[JSON-PARSE] All {len(logs)} parsed objects{file_info} were invalid!")
+    
+    return valid_logs
+
+def debug_log_content(new_logs, log_file):
+    """Debug function to show what's in the log files with detailed analysis."""
+    logging.info(f"[LOG-DEBUG] Analyzing content from {log_file} ({len(new_logs)} chars)")
+    
+    # Show first few lines with line numbers
+    lines = new_logs.split('\n')
+    logging.info(f"[LOG-DEBUG] File {log_file} has {len(lines)} lines")
+    
+    for i, line in enumerate(lines[:15], 1):  # Show first 15 lines
+        if line.strip():
+            logging.info(f"[LOG-DEBUG] {log_file} Line {i:2d}: {line[:300]}{'...' if len(line) > 300 else ''}")
+    
+    # Analyze the structure
+    if new_logs.startswith('{'):
+        logging.info(f"[LOG-DEBUG] {log_file} starts with '{{' - looks like JSON")
+    elif new_logs.startswith('"'):
+        logging.info(f"[LOG-DEBUG] {log_file} starts with '\"' - might be quoted string")
+    elif new_logs.startswith('['):
+        logging.info(f"[LOG-DEBUG] {log_file} starts with '[' - might be JSON array")
+    else:
+        first_chars = new_logs[:50].replace('\n', '\\n').replace('\r', '\\r')
+        logging.info(f"[LOG-DEBUG] {log_file} starts with: {first_chars}")
+    
+    # Count JSON-like structures
+    brace_count = new_logs.count('{')
+    bracket_count = new_logs.count('[')
+    quote_count = new_logs.count('"')
+    
+    logging.info(f"[LOG-DEBUG] {log_file} contains: {brace_count} '{{', {bracket_count} '[', {quote_count} '\"'")
+    
+    # Try to identify what might be wrong
+    if brace_count == 0:
+        logging.warning(f"[LOG-DEBUG] {log_file} has no opening braces - not JSON objects!")
+    elif brace_count != new_logs.count('}'):
+        logging.warning(f"[LOG-DEBUG] {log_file} has mismatched braces: {brace_count} '{{' vs {new_logs.count('}')} '}}'")
 
 def send_chunked_data(sock, data):
     """Send data in manageable chunks with length prefixes."""
