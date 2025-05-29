@@ -80,7 +80,7 @@ def get_next_agent_id(psks):
         return 0
     return max(int(agent["AgentID"]) for agent in psks.values()) + 1
 
-def add_client():
+def add_agent():
     """Prompts user for Agent Name and IP, assigns a unique Agent ID, and stores it in JSON."""
     psks = load_psks()
 
@@ -129,7 +129,7 @@ def remove_client(agent_id):
     print(f"[ERROR] Agent ID {agent_id} not found.")
     return False
 
-def list_clients():
+def list_agents():
     """Lists all registered clients with their Agent IDs, Names, and IPs."""
     psks = load_psks()
     if not psks:
@@ -383,27 +383,78 @@ def handle_client(client_socket, client_address):
                                     client_socket.sendall(b"ERROR")
                                     continue
 
-                                logs = log_data.get("logs", [])
-                                if isinstance(logs, dict):
-                                    logs = [logs]
+                                # FIXED LOG PROCESSING SECTION
+                                logs = []
+                                
+                                # Handle different data structures from client
+                                if isinstance(log_data, dict):
+                                    if "logs" in log_data:
+                                        # Standard format: {"logs": [...], "client_name": "...", ...}
+                                        logs = log_data["logs"]
+                                        if isinstance(logs, dict):
+                                            logs = [logs]  # Convert single dict to list
+                                    else:
+                                        # Single log entry format
+                                        logs = [log_data]
+                                elif isinstance(log_data, list):
+                                    # Direct list of logs
+                                    logs = log_data
+                                else:
+                                    logging.error(f"[RECV] Unexpected log_data type from {client_name}: {type(log_data)}")
+                                    client_socket.sendall(b"ERROR")
+                                    continue
 
-                                log_count = len(logs)
-                                logging.info(f"[RECV] Successfully decrypted {log_count} logs from {client_name}")
-
-                                for log_entry in logs:
+                                # Validate logs structure
+                                valid_logs = []
+                                for i, log_entry in enumerate(logs):
+                                    if log_entry is None:
+                                        logging.warning(f"[RECV] Skipping None log entry {i+1} from {client_name}")
+                                        continue
+                                    
+                                    if not isinstance(log_entry, dict):
+                                        logging.warning(f"[RECV] Skipping non-dict log entry {i+1} from {client_name}: {type(log_entry)}")
+                                        continue
+                                    
+                                    # Ensure required fields exist
+                                    if not log_entry.get("log_type"):
+                                        logging.warning(f"[RECV] Log entry {i+1} missing log_type, adding default")
+                                        log_entry["log_type"] = "UNKNOWN"
+                                    
+                                    if not log_entry.get("timestamp"):
+                                        log_entry["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                                    
+                                    # Add client name to log entry
                                     log_entry["client_name"] = client_name
+                                    valid_logs.append(log_entry)
+
+                                if not valid_logs:
+                                    logging.warning(f"[RECV] No valid log entries found from {client_name}")
+                                    client_socket.sendall(b"ERROR")
+                                    continue
+
+                                log_count = len(valid_logs)
+                                logging.info(f"[RECV] Successfully processed {log_count} valid logs from {client_name}")
+
+                                # Write logs to file and forward to SIEM
+                                for log_entry in valid_logs:
                                     try:
                                         with open(ENDPOINT_LOG_FILE, "a") as log_file:
                                             log_file.write(json.dumps(log_entry) + "\n")
                                     except Exception as e:
                                         logging.error(f"[ERROR] Failed to write client log: {e}")
 
-                                    server_siem.forward_log_to_siem(log_entry, client_name)
+                                    try:
+                                        server_siem.forward_log_to_siem(log_entry, client_name)
+                                    except Exception as e:
+                                        logging.error(f"[ERROR] Failed to forward log to SIEM: {e}")
 
+                                # Send ACK only after successful processing
                                 client_socket.sendall(b"ACK")
+                                logging.info(f"[RECV] Successfully processed and acknowledged {log_count} logs from {client_name}")
 
                             except Exception as e:
                                 logging.error(f"[RECV] Unexpected processing error from {client_name}: {e}")
+                                logging.error(f"[RECV] Error traceback: {traceback.format_exc()}")
                                 try:
                                     client_socket.sendall(b"ERROR")
                                 except Exception as send_err:
@@ -447,8 +498,7 @@ def handle_client(client_socket, client_address):
 
     except Exception as e:
         logging.error(f"[ERROR] Unexpected top-level error from {client_address}: {e}")
-        import traceback
-        logging.error(traceback.format_exc())
+        logging.error(f"[ERROR] Traceback: {traceback.format_exc()}")
     finally:
         logging.info(f"[DISCONNECT] Client {client_address} disconnected.")
         client_socket.close()
