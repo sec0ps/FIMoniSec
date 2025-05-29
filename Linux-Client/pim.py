@@ -701,6 +701,7 @@ def log_pim_event(event_type, process_hash, previous_metadata=None, new_metadata
     # Create the basic log entry
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "log_type": "FIM",
         "event_type": event_type,
         "process_hash": process_hash,
         "previous_metadata": previous_metadata,
