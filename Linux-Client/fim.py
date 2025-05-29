@@ -245,6 +245,7 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
     # Create simplified log entry
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "log_type": "FIM",
         "event_type": event_type,
         "file_path": file_path,
         "mitre_mapping": mitre_mapping
