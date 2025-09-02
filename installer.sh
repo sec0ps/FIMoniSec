@@ -293,7 +293,7 @@ cd /opt/FIMoniSec || error_exit "Failed to change directory to /opt/FIMoniSec"
 if ! command -v pip &> /dev/null; then
     status_message "Installing pip..."
     apt-get update -qq > /dev/null 2>&1
-    apt-get install -y python3-pip -qq > /dev/null 2>&1 || error_exit "Failed to install pip"
+    apt-get install -y python3-pip python-is-python3 -qq > /dev/null 2>&1 || error_exit "Failed to install pip"
 fi
 
 # Install Python requirements for both current user and fimonisec
