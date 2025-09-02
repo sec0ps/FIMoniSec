@@ -168,15 +168,15 @@ if [ "$ACTION" = "remove" ]; then
     fi
 fi
 
-# Step 1: Verify we're in the FIMoniSec directory (skip this check for removal)
+# Step 1: Install git if not present
 if [ "$ACTION" = "install" ]; then
-    if [ ! -f "$(pwd)/README.md" ] || [ ! -d "$(pwd)/.git" ]; then
-        status_message "This script should be run from within the FIMoniSec repository."
-        status_message "Please navigate to the FIMoniSec directory and try again."
-        exit 1
+    status_message "Checking for git installation..."
+    if ! command -v git &> /dev/null; then
+        status_message "Installing git..."
+        apt-get update -qq > /dev/null 2>&1
+        apt-get install -y git -qq > /dev/null 2>&1 || error_exit "Failed to install git"
     fi
-    
-    status_message "FIMoniSec repository detected in current directory."
+    status_message "Git is available."
 fi
 
 # Step 2: Create fimonisec user and group
@@ -198,11 +198,11 @@ status_message "Adding current user to fimonisec group..."
 usermod -a -G fimonisec $CURRENT_USER || error_exit "Failed to add current user to fimonisec group"
 status_message "User $CURRENT_USER added to fimonisec group"
 
-# Step 3: Move files to /opt based on installation type
-move_files_to_opt() {
+# Step 3: Clone or update FIMoniSec repository to /opt
+clone_fimonisec_repo() {
     local install_type=$1
     
-    status_message "Setting up FIMoniSec in /opt..."
+    status_message "Setting up FIMoniSec repository in /opt..."
     
     # Create backup of existing installation if present
     if [ -d "/opt/FIMoniSec" ]; then
@@ -210,48 +210,34 @@ move_files_to_opt() {
         mv /opt/FIMoniSec /opt/FIMoniSec.backup.$(date +%Y%m%d%H%M%S)
     fi
     
-    # Create the main directory
-    mkdir -p /opt/FIMoniSec
+    # Clone the repository directly to /opt/FIMoniSec
+    status_message "Cloning FIMoniSec repository from GitHub..."
+    git clone https://github.com/sec0ps/FIMoniSec.git /opt/FIMoniSec || error_exit "Failed to clone FIMoniSec repository"
     
-    # Copy files based on installation type
+    # Verify required directories exist based on installation type
     case "$install_type" in
         "linux_client")
-            status_message "Installing Linux Client only..."
-            if [ -d "Linux-Client" ]; then
-                cp -r Linux-Client /opt/FIMoniSec/
-            else
-                error_message "Linux-Client directory not found!"
-                exit 1
+            status_message "Verifying Linux Client installation..."
+            if [ ! -d "/opt/FIMoniSec/Linux-Client" ]; then
+                error_exit "Linux-Client directory not found in cloned repository!"
             fi
             ;;
             
         "server")
-            status_message "Installing Server components (includes Linux Client)..."
-            if [ -d "Linux-Client" ]; then
-                cp -r Linux-Client /opt/FIMoniSec/
-            else
-                error_message "Linux-Client directory not found!"
-                exit 1
+            status_message "Verifying Server installation (includes Linux Client)..."
+            if [ ! -d "/opt/FIMoniSec/Linux-Client" ]; then
+                error_exit "Linux-Client directory not found in cloned repository!"
             fi
             
-            if [ -d "Monisec-Server" ]; then
-                cp -r Monisec-Server /opt/FIMoniSec/
-            else
-                error_message "Monisec-Server directory not found!"
-                exit 1
+            if [ ! -d "/opt/FIMoniSec/Monisec-Server" ]; then
+                error_exit "Monisec-Server directory not found in cloned repository!"
             fi
             ;;
             
         *)
             error_exit "Unknown installation type: $install_type"
-            exit 1
             ;;
     esac
-    
-    # Copy common files
-    cp README.md /opt/FIMoniSec/ 2>/dev/null
-    cp requirements.txt /opt/FIMoniSec/ 2>/dev/null
-    cp control-client.sh /opt/FIMoniSec/ 2>/dev/null
     
     # Create logs directory
     mkdir -p /opt/FIMoniSec/logs
@@ -259,11 +245,15 @@ move_files_to_opt() {
     # Set permissions
     chown -R fimonisec:fimonisec /opt/FIMoniSec || error_exit "Failed to set ownership on /opt/FIMoniSec"
     
-    status_message "FIMoniSec has been installed to /opt/FIMoniSec"
+    # Ensure .git directory has proper permissions for updates
+    chmod -R g+w /opt/FIMoniSec/.git
+    
+    status_message "FIMoniSec repository has been cloned to /opt/FIMoniSec"
+    status_message "Git repository is maintained for future updates"
 }
 
-# Call the move function with the installation type
-move_files_to_opt "$INSTALL_TYPE"
+# Call the clone function with the installation type
+clone_fimonisec_repo "$INSTALL_TYPE"
 
 # Step 4: Modify sudoers file for required commands
 status_message "Updating sudoers file..."
@@ -293,18 +283,18 @@ cd /opt/FIMoniSec || error_exit "Failed to change directory to /opt/FIMoniSec"
 if ! command -v pip &> /dev/null; then
     status_message "Installing pip..."
     apt-get update -qq > /dev/null 2>&1
-    apt-get install -y python3-pip python-is-python3 -qq > /dev/null 2>&1 || error_exit "Failed to install pip"
+    apt-get install -y python3-pip -qq > /dev/null 2>&1 || error_exit "Failed to install pip"
 fi
 
 # Install Python requirements for both current user and fimonisec
 status_message "Installing Python requirements for fimonisec user. This may take a few minutes..."
-su - fimonisec -c "cd /opt/FIMoniSec && pip install -r requirements.txt -q" || error_exit "Failed to install Python requirements for fimonisec"
+su - fimonisec -c "cd /opt/FIMoniSec && pip install -r requirements.txt --user -q --no-warn-script-location" || error_exit "Failed to install Python requirements for fimonisec"
 
 status_message "Installing Python requirements for current user. This may take a few minutes..."
 if [ "$CURRENT_USER" != "root" ]; then
-    su - $CURRENT_USER -c "cd /opt/FIMoniSec && pip install -r requirements.txt -q" || error_exit "Failed to install Python requirements for $CURRENT_USER"
+    su - $CURRENT_USER -c "cd /opt/FIMoniSec && pip install -r requirements.txt --user -q --no-warn-script-location" || error_exit "Failed to install Python requirements for $CURRENT_USER"
 else
-    pip install -r requirements.txt -q || error_exit "Failed to install Python requirements for root"
+    pip install -r requirements.txt -q --no-warn-script-location || error_exit "Failed to install Python requirements for root"
 fi
 
 # Step 6: Add Python local bin to PATH for both current user and fimonisec
@@ -332,16 +322,26 @@ if [ "$CURRENT_USER" != "root" ]; then
     fi
 fi
 
-# Also add it to system-wide profile to take effect immediately
-if [ ! -f "/etc/profile.d/fimonisec_path.sh" ]; then
-    echo 'export PATH="/opt/FIMoniSec/.local/bin:$PATH"' > /etc/profile.d/fimonisec_path.sh
-    echo 'export PATH="/home/'$CURRENT_USER'/.local/bin:$PATH"' >> /etc/profile.d/fimonisec_path.sh
-    chmod +x /etc/profile.d/fimonisec_path.sh
+# Create system-wide profile script for immediate availability
+status_message "Creating system-wide PATH configuration..."
+cat > /etc/profile.d/fimonisec_path.sh << EOF
+#!/bin/bash
+# Add local bin directories to PATH for FIMoniSec users
+export PATH="/opt/FIMoniSec/.local/bin:\$PATH"
+if [ "\$USER" != "root" ] && [ -d "\$HOME/.local/bin" ]; then
+    export PATH="\$HOME/.local/bin:\$PATH"
 fi
+EOF
+chmod +x /etc/profile.d/fimonisec_path.sh
 
-# Export it for the current session
+# Export paths for current session
 export PATH="/opt/FIMoniSec/.local/bin:$PATH"
-export PATH="/home/$CURRENT_USER/.local/bin:$PATH"
+if [ "$CURRENT_USER" != "root" ]; then
+    USER_HOME=$(eval echo ~$CURRENT_USER)
+    if [ -d "$USER_HOME/.local/bin" ]; then
+        export PATH="$USER_HOME/.local/bin:$PATH"
+    fi
+fi
 
 # Step 7: Install YARA
 status_message "Installing YARA..."
@@ -383,7 +383,8 @@ Type=simple
 User=fimonisec
 Group=fimonisec
 WorkingDirectory=/opt/FIMoniSec
-ExecStart=/usr/bin/python3 /opt/FIMoniSec/Linux-Client/monisec_client.py -d
+Environment="PATH=/opt/FIMoniSec/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/python3 /opt/FIMoniSec/Linux-Client/fimonisec_client.py -d
 Restart=on-failure
 RestartSec=5s
 
@@ -410,7 +411,7 @@ elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
 
 DAEMON_PATH="/opt/FIMoniSec/Linux-Client"
 DAEMON="/usr/bin/python3"
-DAEMONOPTS="monisec_client.py -d"
+DAEMONOPTS="fimonisec_client.py -d"
 NAME="fimonisec-client"
 DESC="FIMoniSec Client Service"
 PIDFILE=/var/run/$NAME.pid
@@ -421,7 +422,7 @@ case "$1" in
 start)
     printf "%-50s" "Starting $NAME..."
     cd $DAEMON_PATH
-    PID=`su -c "$DAEMON $DAEMONOPTS > /dev/null 2>&1 & echo \$!" $USER`
+    PID=`su -c "PATH=/opt/FIMoniSec/.local/bin:\$PATH $DAEMON $DAEMONOPTS > /dev/null 2>&1 & echo \$!" $USER`
     if [ -z $PID ]; then
         printf "%s\n" "Fail"
     else
@@ -490,7 +491,9 @@ setgid fimonisec
 
 chdir /opt/FIMoniSec
 
-exec /usr/bin/python3 monisec_client.py -d
+env PATH="/opt/FIMoniSec/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+exec /usr/bin/python3 Linux-Client/fimonisec_client.py -d
 EOF
     status_message "Client Upstart service created"
 fi
@@ -511,7 +514,8 @@ Type=simple
 User=fimonisec
 Group=fimonisec
 WorkingDirectory=/opt/FIMoniSec
-ExecStart=/usr/bin/python3 /opt/FIMoniSec/Monisec-Server/monisec-server.py -d
+Environment="PATH=/opt/FIMoniSec/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/bin/python3 /opt/FIMoniSec/Monisec-Server/fimonisec-server.py -d
 Restart=on-failure
 RestartSec=5s
 
@@ -538,7 +542,7 @@ EOF
 
 DAEMON_PATH="/opt/FIMoniSec/Monisec-Server"
 DAEMON="/usr/bin/python3"
-DAEMONOPTS="monisec-server.py -d"
+DAEMONOPTS="fimonisec-server.py -d"
 NAME="fimonisec-server"
 DESC="FIMoniSec Server Service"
 PIDFILE=/var/run/$NAME.pid
@@ -549,7 +553,7 @@ case "$1" in
 start)
     printf "%-50s" "Starting $NAME..."
     cd $DAEMON_PATH
-    PID=`su -c "$DAEMON $DAEMONOPTS > /dev/null 2>&1 & echo \$!" $USER`
+    PID=`su -c "PATH=/opt/FIMoniSec/.local/bin:\$PATH $DAEMON $DAEMONOPTS > /dev/null 2>&1 & echo \$!" $USER`
     if [ -z $PID ]; then
         printf "%s\n" "Fail"
     else
@@ -618,7 +622,9 @@ setgid fimonisec
 
 chdir /opt/FIMoniSec
 
-exec /usr/bin/python3 monisec-server.py -d
+env PATH="/opt/FIMoniSec/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+exec /usr/bin/python3 Monisec-Server/fimonisec-server.py -d
 EOF
         status_message "Server Upstart service created"
     fi
@@ -627,6 +633,9 @@ EOF
     cat > /opt/FIMoniSec/control-server.sh << 'EOF'
 #!/bin/bash
 # FIMoniSec Server Control Script
+
+# Ensure PATH includes local bin directories
+export PATH="/opt/FIMoniSec/.local/bin:$PATH"
 
 case "$1" in
     start)
@@ -689,86 +698,18 @@ esac
 exit 0
 EOF
     chmod +x /opt/FIMoniSec/control-server.sh
+    chown fimonisec:fimonisec /opt/FIMoniSec/control-server.sh
     status_message "Server control script created at /opt/FIMoniSec/control-server.sh"
 fi
 
-# Final steps
-status_message "Installation completed successfully!"
+# Create client control script  
+cat > /opt/FIMoniSec/control-client.sh << 'EOF'
+#!/bin/bash
+# FIMoniSec Client Control Script
 
-# Ask if user wants to start the client service now
-read -p "Do you want to start the FIMoniSec client service now? (y/n): " REPLY
-if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-    cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d
-    status_message "FIMoniSec client service started"
-fi
+# Ensure PATH includes local bin directories
+export PATH="/opt/FIMoniSec/.local/bin:$PATH"
 
-# Ask if user wants to start the server service now if server installation was selected
-if [ "$INSTALL_TYPE" = "server" ]; then
-    read -p "Do you want to start the FIMoniSec server service now? (y/n): " REPLY
-    if [ "$REPLY" = "y" ] || [ "$REPLY" = "Y" ]; then
-        cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py -d
-        status_message "FIMoniSec server service started"
-    fi
-fi
-
-# Service management instructions
-status_message "----------------------------------------------"
-status_message "FIMoniSec Service Management Instructions:"
-status_message "----------------------------------------------"
-
-status_message "Direct command execution (recommended):"
-status_message "  Start client:   cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py -d"
-status_message "  Stop client:    cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py stop"
-status_message "  Restart client: cd /opt/FIMoniSec/Linux-Client && python3 monisec_client.py stop && python3 monisec_client.py -d"
-
-if [ "$INSTALL_TYPE" = "server" ]; then
-    status_message "  Start server:   cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py -d"
-    status_message "  Stop server:    cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py stop"
-    status_message "  Restart server: cd /opt/FIMoniSec/Monisec-Server && python3 monisec-server.py stop && python3 monisec-server.py -d"
-fi
-
-if [ "$INIT_SYSTEM" = "systemd" ]; then
-    status_message "Using systemd commands (alternative):"
-    status_message "  Start client:   sudo systemctl start fimonisec-client"
-    status_message "  Stop client:    sudo systemctl stop fimonisec-client"
-    status_message "  Restart client: sudo systemctl restart fimonisec-client"
-    status_message "  Status client:  sudo systemctl status fimonisec-client"
-    
-    if [ "$INSTALL_TYPE" = "server" ]; then
-        status_message "  Start server:   sudo systemctl start fimonisec-server"
-        status_message "  Stop server:    sudo systemctl stop fimonisec-server"
-        status_message "  Restart server: sudo systemctl restart fimonisec-server"
-        status_message "  Status server:  sudo systemctl status fimonisec-server"
-    fi
-elif [ "$INIT_SYSTEM" = "sysvinit" ]; then
-    status_message "Using service commands (alternative):"
-    status_message "  Start client:   sudo service fimonisec-client start"
-    status_message "  Stop client:    sudo service fimonisec-client stop"
-    status_message "  Restart client: sudo service fimonisec-client restart"
-    status_message "  Status client:  sudo service fimonisec-client status"
-    
-    if [ "$INSTALL_TYPE" = "server" ]; then
-        status_message "  Start server:   sudo service fimonisec-server start"
-        status_message "  Stop server:    sudo service fimonisec-server stop"
-        status_message "  Restart server: sudo service fimonisec-server restart"
-        status_message "  Status server:  sudo service fimonisec-server status"
-    fi
-elif [ "$INIT_SYSTEM" = "upstart" ]; then
-    status_message "Using upstart commands (alternative):"
-    status_message "  Start client:   sudo start fimonisec-client"
-    status_message "  Stop client:    sudo stop fimonisec-client"
-    status_message "  Restart client: sudo restart fimonisec-client"
-    status_message "  Status client:  sudo status fimonisec-client"
-    
-    if [ "$INSTALL_TYPE" = "server" ]; then
-        status_message "  Start server:   sudo start fimonisec-server"
-        status_message "  Stop server:    sudo stop fimonisec-server"
-        status_message "  Restart server: sudo restart fimonisec-server"
-        status_message "  Status server:  sudo status fimonisec-server"
-    fi
-fi
-
-status_message "----------------------------------------------"
-status_message "Thank you for installing FIMoniSec!"
-
-exit 0
+case "$1" in
+    start)
+        echo "Starting FIMoniSec client
