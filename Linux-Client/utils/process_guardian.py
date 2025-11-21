@@ -349,35 +349,51 @@ class ProcessGuardian:
                 pass
         
         return pids
-    
+
     def _restart_process(self, proc_name, proc_info):
         """
         Restart a terminated process, but check if another instance
         is already running first.
-        
+
         Args:
             proc_name (str): Process name
             proc_info (dict): Process information
         """
         # Check if another instance is already running
         existing_pids = self._find_process_pids(proc_name)
-        
+
         # Filter out the old PID that might still be in the zombie state
         existing_pids = [pid for pid in existing_pids if pid != proc_info["pid"]]
-        
+
         if existing_pids:
             logger.info(f"Found another instance of {proc_name} already running (PID: {existing_pids[0]})")
             # Update our tracking to use the existing process instead
             proc_info["pid"] = existing_pids[0]
             return
-        
+
+        # Check if LIM is disabled and this is a lim.py process
+        if "lim.py" in proc_name:
+            # Load config to check if LIM is enabled
+            config_file = os.path.join(BASE_DIR, "fim.config")
+            try:
+                with open(config_file, 'r') as f:
+                    import json
+                    config = json.load(f)
+                    if not config.get("client_settings", {}).get("lim_enabled", False):
+                        logger.info(f"LIM is disabled in config, not restarting {proc_name}")
+                        return
+            except Exception as e:
+                logger.warning(f"Could not read config to check LIM status: {e}")
+                # If we can't read config, don't restart LIM to be safe
+                return
+
         # Log the restart attempt
         logger.warning(f"Attempting to restart {proc_name}")
-        
+
         # Determine the command to run based on the process name
         cmd = None
         cwd = None
-        
+
         if "monisec_client.py" in proc_name:
             cmd = ["python3", os.path.join(BASE_DIR, "monisec_client.py"), "-d"]
             cwd = BASE_DIR
@@ -390,7 +406,7 @@ class ProcessGuardian:
         elif "pim.py" in proc_name:
             cmd = ["python3", os.path.join(BASE_DIR, "pim.py"), "-d"]  # Fixed syntax
             cwd = BASE_DIR
-        
+
         if cmd and cwd:
             try:
                 # Start the process
@@ -401,17 +417,17 @@ class ProcessGuardian:
                     stderr=subprocess.PIPE,
                     start_new_session=True
                 )
-                
+
                 # Update the process info
                 proc_info["pid"] = process.pid
                 proc_info["restart_count"] += 1
                 proc_info["last_restart"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
+
                 logger.info(f"Successfully restarted {proc_name} with PID {process.pid}")
-                
+
                 # Log the restart as a security event
                 self._log_process_restart(proc_name, process.pid)
-            
+
             except Exception as e:
                 logger.error(f"Failed to restart {proc_name}: {e}")
         else:
@@ -467,9 +483,23 @@ class ProcessGuardian:
         Terminate all monitored processes when shutting down in foreground mode.
         """
         logger.info("Terminating all monitored processes...")
-        
+
+        # Build list of processes to terminate based on config
+        processes_to_terminate = ["fim_client.py", "pim.py"]
+
+        # Check if LIM is enabled
+        config_file = os.path.join(BASE_DIR, "fim.config")
+        try:
+            with open(config_file, 'r') as f:
+                import json
+                config = json.load(f)
+                if config.get("client_settings", {}).get("lim_enabled", False):
+                    processes_to_terminate.append("lim.py")
+        except Exception as e:
+            logger.warning(f"Could not read config to check LIM status: {e}")
+
         # Find and terminate all monitored processes
-        for proc_name in ["fim_client.py", "pim.py", "lim.py"]:
+        for proc_name in processes_to_terminate:
             pids = self._find_process_pids(proc_name)
             for pid in pids:
                 try:
@@ -477,12 +507,12 @@ class ProcessGuardian:
                     os.kill(pid, signal.SIGTERM)
                 except OSError as e:
                     logger.error(f"Error sending SIGTERM to {proc_name} (PID: {pid}): {e}")
-        
+
         # Wait for processes to terminate gracefully
         time.sleep(2)
-        
+
         # Force kill any remaining processes
-        for proc_name in ["fim_client.py", "pim.py", "lim.py"]:
+        for proc_name in processes_to_terminate:
             pids = self._find_process_pids(proc_name)
             for pid in pids:
                 try:
