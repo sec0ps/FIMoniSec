@@ -126,18 +126,27 @@ if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
     console_handler.setLevel(logging.INFO)
     root_logger.addHandler(console_handler)
 
-# List of monitored processes
-PROCESSES = {
-    "fim": "python3 fim.py -d",
-    "pim": "python3 pim.py -d",
-    "lim": "python3 lim.py -d",
-}
+# List of monitored processes - will be built dynamically based on config
+PROCESSES = {}
+
+def build_processes_dict():
+    """Build the PROCESSES dictionary based on configuration."""
+    global PROCESSES
+    PROCESSES = {
+        "fim": "python3 fim.py -d",
+        "pim": "python3 pim.py -d",
+    }
+
+    # Only add LIM if it's enabled in config
+    if config.get("client_settings", {}).get("lim_enabled", False):
+        PROCESSES["lim"] = "python3 lim.py -d"
 
 def create_default_config():
     """Create a default configuration file if it does not exist and set permissions."""
     default_config = {
         "client_settings": {
-            "BASE_DIR": BASE_DIR
+            "BASE_DIR": BASE_DIR,
+            "lim_enabled": False  # LIM disabled by default
         },
         "scheduled_scan": {
             "directories": ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/var/www"],
@@ -174,17 +183,18 @@ def create_default_config():
             "enabled": False,  # Default to disabled
             "siem_server": "",
             "siem_port": 0
-   },         
+   },
         "instructions": {
             "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
             "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
             "exclusions": "Specify directories or files to be excluded from scanning and monitoring.",
             "performance": "Adjust performance settings based on system resources.",
             "siem_settings": "Set 'enabled' to true, and provide 'siem_server' and 'siem_port' for SIEM logging.",
+            "lim_enabled": "Set to true to enable Log Integrity Monitoring (LIM) process. Default is false.",
             "enhanced_fim": "Configure enhanced file integrity monitoring capabilities including performance optimization, behavioral analysis, content analysis, and detection."
         }
     }
-    
+
     with open(CONFIG_FILE, "w") as f:
         json.dump(default_config, f, indent=4)
     os.chmod(CONFIG_FILE, 0o600)
@@ -196,14 +206,17 @@ def create_default_config():
 # Initialize process guardian at the beginning of execution
 def initialize_process_protection():
     """Initialize process protection mechanisms."""
-    # Protected processes to monitor
+    # Protected processes to monitor - build list based on config
     protected_processes = [
         "fimonisec_client.py",
         "fim.py",
-        "lim.py",
         "pim.py"
     ]
-    
+
+    # Only add LIM if it's enabled
+    if config.get("client_settings", {}).get("lim_enabled", False):
+        protected_processes.append("lim.py")
+
     # Create and start the process guardian
     guardian = ProcessGuardian(
         process_names=protected_processes,
@@ -211,16 +224,16 @@ def initialize_process_protection():
         foreground_mode=True,
         install_signals=False
     )
-    
+
     # Start monitoring for process termination
     guardian.start_monitoring()
-    
+
     # Set higher process priority to make it harder to terminate
     guardian.set_process_priority(-10)
-    
+
     # Prevent core dumps to avoid leaking sensitive information
     guardian.prevent_core_dumps()
-    
+
     return guardian
 
 def load_or_create_config():
@@ -234,15 +247,18 @@ def load_or_create_config():
         try:
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
-                
+
             # Ensure BASE_DIR is set correctly in the loaded config
             if "client_settings" not in config:
-                config["client_settings"] = {"BASE_DIR": BASE_DIR}
+                config["client_settings"] = {"BASE_DIR": BASE_DIR, "lim_enabled": False}
             else:
                 config["client_settings"]["BASE_DIR"] = BASE_DIR
-                
+                # Set default for lim_enabled if not present
+                if "lim_enabled" not in config["client_settings"]:
+                    config["client_settings"]["lim_enabled"] = False
+
             return config
-            
+
         except Exception as e:
             print(f"Error loading config file: {e}")
             sys.exit(1)
@@ -251,8 +267,8 @@ def load_or_create_config():
         default_config = create_default_config()
         return default_config
 
-#create default config
 config = load_or_create_config()
+build_processes_dict()
 
 def start_process(name):
     if name in PROCESSES:
@@ -452,7 +468,7 @@ def stop_fimonisec_client_daemon():
     """Stop the MoniSec client running in daemon mode and its watchdog."""
     pidfile = os.path.join(BASE_DIR, "output", "fimonisec_client.pid")
     watchdog_pidfile = os.path.join(BASE_DIR, "output", "enhanced_watchdog.pid")
-    
+
     # Create control file to stop ProcessGuardian monitoring
     control_file = os.path.join(BASE_DIR, "output", "guardian_stop_monitoring")
     try:
@@ -460,10 +476,10 @@ def stop_fimonisec_client_daemon():
             f.write(str(os.getpid()))
     except Exception as e:
         logging.error(f"Failed to create control file: {e}")
-    
+
     # Allow a moment for ProcessGuardian to notice
     time.sleep(1)
-    
+
     # Find and stop watchdog process first
     watchdog_processes = []
     for proc in psutil.process_iter(['pid', 'cmdline']):
@@ -473,7 +489,7 @@ def stop_fimonisec_client_daemon():
                 watchdog_processes.append(proc.info['pid'])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    
+
     for pid in watchdog_processes:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -482,35 +498,39 @@ def stop_fimonisec_client_daemon():
                 if not psutil.pid_exists(pid):
                     break
                 time.sleep(0.5)
-            
+
             # Force kill if still running
             if psutil.pid_exists(pid):
                 os.kill(pid, signal.SIGKILL)
         except OSError as e:
             logging.error(f"Error stopping watchdog: {e}")
-    
-    # Find and stop all child processes
-    for name in ["fim", "pim", "lim"]:
+
+    # Find and stop all child processes - build list based on config
+    processes_to_stop = ["fim", "pim"]
+    if config.get("client_settings", {}).get("lim_enabled", False):
+        processes_to_stop.append("lim")
+
+    for name in processes_to_stop:
         pid = is_process_running(name)
         if pid:
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError as e:
                 logging.error(f"Error stopping {name}: {e}")
-                
-    # Wait briefly for children to exit         
+
+    # Wait briefly for children to exit
     time.sleep(1)
-    
+
     try:
         if os.path.exists(pidfile):
             with open(pidfile, 'r') as f:
                 pid = int(f.read().strip())
-            
+
             # Check if process is actually running
             try:
                 os.kill(pid, 0)  # Signal 0 doesn't kill but checks if process exists
                 os.kill(pid, signal.SIGTERM)
-                
+
                 # Wait for process to terminate
                 for _ in range(10):  # 10-second timeout
                     try:
@@ -525,7 +545,7 @@ def stop_fimonisec_client_daemon():
                         if os.path.exists(watchdog_pidfile):
                             os.remove(watchdog_pidfile)
                         return True
-                
+
                 # Force kill if not terminated
                 os.kill(pid, signal.SIGKILL)
                 if os.path.exists(pidfile):
@@ -535,7 +555,7 @@ def stop_fimonisec_client_daemon():
                 if os.path.exists(control_file):
                     os.remove(control_file)
                 return True
-            
+
             except OSError:
                 if os.path.exists(pidfile):
                     os.remove(pidfile)
@@ -548,7 +568,7 @@ def stop_fimonisec_client_daemon():
             if os.path.exists(control_file):
                 os.remove(control_file)
             return False
-    
+
     except Exception as e:
         logging.error(f"Error stopping MoniSec client daemon: {e}")
         return False
