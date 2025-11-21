@@ -68,6 +68,17 @@ class EnhancedWatchdog:
     
     def __init__(self, daemon_mode=False):
         """Initialize the enhanced watchdog."""
+        # Load config to check if LIM is enabled
+        lim_enabled = False
+        config_file = os.path.join(BASE_DIR, "fim.config")
+        try:
+            with open(config_file, 'r') as f:
+                import json
+                config = json.load(f)
+                lim_enabled = config.get("client_settings", {}).get("lim_enabled", False)
+        except Exception as e:
+            logger.warning(f"Could not read config to check LIM status: {e}")
+
         # Define the processes to monitor and protect
         self.processes = {
             "monisec_client": {
@@ -79,13 +90,6 @@ class EnhancedWatchdog:
             },
             "fim": {
                 "script": os.path.join(BASE_DIR, "fim.py"),
-                "args": ["-d"],
-                "cwd": BASE_DIR,
-                "expected_count": 1,
-                "protected": True
-            },
-            "lim": {
-                "script": os.path.join(BASE_DIR, "lim.py"),
                 "args": ["-d"],
                 "cwd": BASE_DIR,
                 "expected_count": 1,
@@ -106,7 +110,17 @@ class EnhancedWatchdog:
                 "protected": True
             }
         }
-        
+
+        # Only add LIM if it's enabled in config
+        if lim_enabled:
+            self.processes["lim"] = {
+                "script": os.path.join(BASE_DIR, "lim.py"),
+                "args": ["-d"],
+                "cwd": BASE_DIR,
+                "expected_count": 1,
+                "protected": True
+            }
+
         # Internal state tracking
         self.termination_attempts = {}
         self.running = True
@@ -116,17 +130,17 @@ class EnhancedWatchdog:
         self.daemon_mode = daemon_mode
         self.pid_file = os.path.join(output_dir, "enhanced_watchdog.pid")
         self.process_hashes = {}
-        
+
         # Set up signal handlers to intercept termination attempts
         self._setup_signal_handlers()
-        
+
         # Create a PID file
         self._create_pid_file()
         atexit.register(self._cleanup_pid_file)
-        
+
         # Initialize process binary hashes (for integrity monitoring)
         self._initialize_process_hashes()
-        
+
         logger.info(f"Enhanced Watchdog initialized. Main PID: {self.main_pid}")
     
     def _setup_signal_handlers(self):
