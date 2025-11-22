@@ -27,19 +27,6 @@
 #             in the software.
 #
 # =============================================================================
-# === TODO: Integrate GitHub Updater ===
-# Step 1: Import the updater module
-#import updater
-
-# Step 2: At the top of your `__main__` block, before any mode-specific logic,
-#         add the following code to check for updates before running MoniSec Client:
-#
-#         try:
-#             updater.check_for_updates()
-#         except Exception as e:
-#             logging.warning(f"Updater failed: {e}")
-#
-#         This will ensure the latest code is pulled from GitHub before continuing.
 
 import argparse
 import requests
