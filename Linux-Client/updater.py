@@ -29,6 +29,7 @@
 # =============================================================================
 
 import os
+import requests
 
 # ✅ Correct repo path
 GITHUB_RAW_BASE = "https://raw.githubusercontent.com/sec0ps/FIMoniSec/main/Linux-Client/"
