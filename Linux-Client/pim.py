@@ -167,272 +167,70 @@ def save_process_metadata(processes):
 
 def get_all_processes():
     """
-    Retrieve all running processes and their metadata using dynamic behavioral analysis
-    to identify system services without relying on static lists or keywords.
+    Enumerate all running processes using /proc for efficiency.
+    Preserves original metadata fields: pid, exe_path, process_name, port, user,
+    start_time, cmdline, hash, ppid, lineage, is_listening, state, runtime_seconds.
     """
     all_processes = {}
-
     try:
-        # Step 1: Get initial process data with runtime information
-        ps_command = ["sudo", "-n", "/bin/ps", "-eo", "pid,user,etime,ppid,comm,state,etimes,args", "--no-headers"]
-        try:
-            output = subprocess.check_output(ps_command, stderr=subprocess.PIPE, text=True)
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] ps command failed: {e}")
-            if e.stderr:
-                print(f"[ERROR] ps stderr: {e.stderr}")
-            return all_processes
-
-        if not output:
-            print("[ERROR] ps command returned no output. Check sudo permissions.")
-            return all_processes
-
-        # Step 2: Get network listening processes (likely services)
-        listening_pids = set()
-        try:
-            netstat_output = subprocess.check_output(
-                ["sudo", "-n", "/bin/netstat", "-tulpn"], 
-                stderr=subprocess.PIPE, 
-                text=True
-            )
-            for line in netstat_output.splitlines():
-                if "LISTEN" in line and "/" in line:
-                    pid_part = line.split()[-1].split("/")[0]
-                    if pid_part.isdigit():
-                        listening_pids.add(int(pid_part))
-        except subprocess.CalledProcessError:
-            print("[WARNING] Failed to get network listening processes.")
-
-        # Step 3: Get terminal-attached processes (likely interactive)
-        terminal_pids = set()
-        try:
-            # Find processes with a terminal
-            tty_output = subprocess.check_output(
-                ["sudo", "-n", "/bin/ps", "-eo", "pid,tty", "--no-headers"], 
-                stderr=subprocess.PIPE, 
-                text=True
-            )
-            for line in tty_output.splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[0].isdigit():
-                    # Skip processes with '?' as TTY (no terminal)
-                    if parts[1] != '?':
-                        terminal_pids.add(int(parts[0]))
-        except subprocess.CalledProcessError:
-            print("[WARNING] Failed to identify terminal processes.")
-
-        # Step 4: Build parent-child relationships and collect process groups
-        pid_to_ppid = {}
-        pid_to_name = {}
-        pid_to_user = {}
-        pid_to_runtime = {}  # Process runtime in seconds
-        pid_to_cmdline = {}  # Full command line
-        
-        # Track process groups (processes with the same parent)
-        ppid_to_children = {}
-        
-        for line in output.splitlines():
-            try:
-                # Split only the first few fields to avoid cmdline issues
-                parts = line.strip().split(None, 7)
-                if len(parts) < 7:
-                    continue
-                    
-                # Parse only the safe numeric fields
-                pid = int(parts[0]) if parts[0].isdigit() else 0
-                if pid == 0:
-                    continue
-                    
-                user = parts[1]
-                # Skip etime (elapsed time) - parts[2]
-                
-                # Parse ppid carefully
-                ppid = int(parts[3]) if parts[3].isdigit() else 0
-                name = parts[4]
-                
-                # Parse runtime carefully
-                etimes = int(parts[6]) if parts[6].isdigit() else 0
-                
-                # Get full command line
-                cmdline = parts[7] if len(parts) > 7 else name
-                
-                # Store the data
-                pid_to_ppid[pid] = ppid
-                pid_to_name[pid] = name
-                pid_to_user[pid] = user
-                pid_to_runtime[pid] = etimes
-                pid_to_cmdline[pid] = cmdline
-                
-                # Build parent-child relationships
-                if ppid not in ppid_to_children:
-                    ppid_to_children[ppid] = []
-                ppid_to_children[ppid].append(pid)
-            except (ValueError, IndexError) as e:
-                # Just skip lines that cause parsing issues
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
                 continue
-        
-        # Step 5: Find init process (PID 1) and direct descendants (system services)
-        system_service_pids = set()
-        
-        # Add PID 1 (init/systemd) 
-        if 1 in pid_to_ppid:
-            system_service_pids.add(1)
-            
-        # Add direct children of PID 1
-        for pid, ppid in pid_to_ppid.items():
-            if ppid == 1:
-                system_service_pids.add(pid)
-        
-        # Step 6: Find process groups (siblings with same PPID)
-        process_groups = {}
-        
-        for ppid, children in ppid_to_children.items():
-            if len(children) >= 3:  # At least 3 siblings with same parent
-                # Check if siblings have similar names (likely part of same service)
-                names = [pid_to_name.get(pid, "") for pid in children]
-                
-                # Look for name patterns that indicate they're part of the same service
-                prefixes = set()
-                for name in names:
-                    # Extract common prefixes (e.g., "ossec-" from "ossec-analysisd")
-                    parts = name.split('-')
-                    if len(parts) > 1:
-                        prefixes.add(parts[0])
-                
-                # If we found common prefixes and they're not empty
-                if prefixes and any(prefix and len(prefix) > 2 for prefix in prefixes):
-                    # This is likely a process group belonging to the same service
-                    for prefix in prefixes:
-                        if prefix and len(prefix) > 2:  # Avoid short/generic prefixes
-                            process_groups[prefix] = [pid for pid in children 
-                                                    if pid_to_name.get(pid, "").startswith(prefix)]
-        
-        # Step 7: Process the output with enhanced behavioral analysis
-        for line in output.splitlines():
+            proc_path = f"/proc/{pid}"
             try:
-                # Parse the line carefully, splitting out the main fields
-                parts = line.strip().split(None, 7)
-                if len(parts) < 7:
-                    continue
+                # Executable path
+                exe_real_path = os.readlink(os.path.join(proc_path, "exe"))
+                process_name = os.path.basename(exe_real_path)
 
-                # Parse essential fields safely
-                if not parts[0].isdigit():
-                    continue
-                    
-                pid = int(parts[0])
-                user = parts[1]
-                # etime is at parts[2], but we won't use it directly
-                
-                # Safely parse ppid
-                ppid = int(parts[3]) if parts[3].isdigit() else 0
-                process_name = parts[4]
-                process_state = parts[5][0] if parts[5] else '?'
-                
-                # Safely parse runtime
-                runtime = int(parts[6]) if parts[6].isdigit() else 0
-                
-                # Get command line as the rest of the line
-                cmdline = parts[7] if len(parts) > 7 else process_name
-                
-                # Skip stopped processes
-                if process_state == 'T':
-                    continue
-                
-                # PURELY BEHAVIORAL CLASSIFICATION
-                # ================================
-                is_system_process = False
-                reasons = []
-                
-                # 1. System critical process (PID 1 or direct child)
-                if pid in system_service_pids:
-                    is_system_process = True
-                    reasons.append("system_critical")
-                    
-                # 2. Network service (listening on ports)
-                if pid in listening_pids:
-                    is_system_process = True
-                    reasons.append("network_listener")
-                    
-                # 3. Long-running process without a terminal
-                if runtime > 3600 and pid not in terminal_pids:  # More than 1 hour
-                    is_system_process = True
-                    reasons.append("long_running")
-                
-                # 4. Parent of other system processes
-                child_is_system = False
-                if pid in ppid_to_children:
-                    for child_pid in ppid_to_children[pid]:
-                        if (child_pid in system_service_pids or 
-                            child_pid in listening_pids):
-                            child_is_system = True
-                            break
-                            
-                if child_is_system:
-                    is_system_process = True
-                    reasons.append("system_parent")
-                
-                # 5. Part of a process group (siblings with similar names)
-                in_process_group = False
-                for prefix, group_pids in process_groups.items():
-                    if pid in group_pids:
-                        in_process_group = True
-                        reasons.append(f"process_group:{prefix}")
-                        break
-                        
-                if in_process_group:
-                    is_system_process = True
-                
-                # 6. Non-interactive (not attached to terminal)
-                is_interactive = pid in terminal_pids
-                
-                # FINAL DECISION: Only include if system process AND not interactive
-                if not is_system_process or is_interactive:
-                    continue
-                
-                # Get executable path with error handling
-                exe_real_path = None
-                try:
-                    exe_path = f"/proc/{pid}/exe"
-                    if os.path.exists(exe_path):
-                        try:
-                            exe_real_path = subprocess.check_output(
-                                ["sudo", "-n", "/usr/bin/readlink", "-f", exe_path],
-                                stderr=subprocess.PIPE, 
-                                text=True
-                            ).strip()
-                        except subprocess.CalledProcessError:
-                            pass
-                except Exception:
-                    pass
-                
-                # If we couldn't get the exe path, try command line
-                if not exe_real_path:
-                    # First word in command line might be the path
-                    if cmdline and ' ' in cmdline:
-                        potential_path = cmdline.split()[0]
-                        if os.path.exists(potential_path):
-                            exe_real_path = potential_path
-                    
-                # If still not found, use a fallback
-                if not exe_real_path:
-                    exe_real_path = f"/usr/bin/{process_name}"
-                
-                # Generate hash based on path and command
-                process_hash = get_process_hash(exe_real_path, cmdline)
-                
-                # Resolve lineage
-                lineage = resolve_lineage(pid)
-                
-                # Set port information 
+                # Command line
+                cmdline = ""
+                cmdline_path = os.path.join(proc_path, "cmdline")
+                if os.path.exists(cmdline_path):
+                    with open(cmdline_path, "r") as f:
+                        cmdline = f.read().replace("\x00", " ").strip()
+
+                # Status info (UID, PPID, State)
+                user = None
+                ppid = None
+                process_state = None
+                with open(os.path.join(proc_path, "status"), "r") as f:
+                    for line in f:
+                        if line.startswith("Uid:"):
+                            user = int(line.split()[1])
+                        elif line.startswith("PPid:"):
+                            ppid = int(line.split()[1])
+                        elif line.startswith("State:"):
+                            process_state = line.split()[1]
+
+                # Start time and runtime from /proc/[pid]/stat
+                start_time = None
+                runtime_seconds = None
+                stat_path = os.path.join(proc_path, "stat")
+                if os.path.exists(stat_path):
+                    with open(stat_path, "r") as f:
+                        stat_fields = f.read().split()
+                        # Field 22 = starttime (in clock ticks), Field 14 = utime, Field 15 = stime
+                        start_ticks = int(stat_fields[21])
+                        utime = int(stat_fields[13])
+                        stime = int(stat_fields[14])
+                        clk_tck = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+                        runtime_seconds = (utime + stime) / clk_tck
+                        # Convert start_ticks to seconds since boot
+                        start_time = start_ticks / clk_tck
+
+                # Detect listening state later
+                is_listening = False
                 port = "NOT_LISTENING"
-                is_listening = pid in listening_pids
-                
-                # Simplify start time display using etime field
-                start_time = parts[2]  # This is the elapsed time (etime)
-                
-                # Store the process
+
+                # Generate hash
+                process_hash = get_process_hash(exe_real_path, cmdline)
+
+                # Resolve lineage
+                lineage = resolve_lineage(int(pid))
+
+                # Populate full metadata
                 all_processes[process_hash] = {
-                    "pid": pid,
+                    "pid": int(pid),
                     "exe_path": exe_real_path,
                     "process_name": process_name,
                     "port": port,
@@ -444,24 +242,14 @@ def get_all_processes():
                     "lineage": lineage,
                     "is_listening": is_listening,
                     "state": process_state,
-                    "runtime_seconds": runtime,
-                    "system_process_reasons": reasons  # For debugging only
+                    "runtime_seconds": runtime_seconds
                 }
-                
-            except Exception as e:
-                print(f"[ERROR] Failed to process PID {parts[0] if len(parts) > 0 else 'unknown'}: {e}")
+            except Exception:
                 continue
-
-        # Debug output
-        system_process_count = len(all_processes)
-        listening_process_count = sum(1 for proc in all_processes.values() if proc.get("is_listening"))
-        #print(f"[INFO] Identified {system_process_count} system processes, {listening_process_count} listening processes")
-
+        return all_processes
     except Exception as e:
-        print(f"[ERROR] subprocess error in get_all_processes: {e}")
-        traceback.print_exc()
-
-    return all_processes
+        print(f"[ERROR] Failed to enumerate processes: {e}")
+        return {}
 
 def get_process_hash(exe_path, cmdline=None):
     """
@@ -490,189 +278,226 @@ def get_process_hash(exe_path, cmdline=None):
         print(f"[ERROR] Failed to hash process {exe_path}: {e}")
         return f"ERROR_HASHING_{exe_path}"
 
+def monitor_proc_events(interval=2, use_initial_baseline=False):
+    """
+    Enhanced monitoring loop with real-time detection, integrity tracking,
+    ML anomaly detection, and MITRE ATT&CK mapping.
+    Combines event-driven detection with periodic full scans for accuracy.
+    """
+    import pyinotify
+    import threading
+
+    # Load initial baseline if requested
+    all_known_processes = INITIAL_BASELINE.copy() if use_initial_baseline and 'INITIAL_BASELINE' in globals() else {}
+    detection_history = {}
+    alerted_processes = set()
+
+    # ML baseline phase
+    ml_model_info = None
+    ml_baseline_counter = 0
+    ml_baseline_cycles = 300  # ~10 minutes at 2s intervals
+    establishing_ml_baseline = True
+
+    # Event handler for real-time process creation/termination
+    class ProcessEventHandler(pyinotify.ProcessEvent):
+        def process_IN_CREATE(self, event):
+            if event.name.isdigit():
+                pid = event.name
+                process_info = get_process_info(pid)
+                if process_info:
+                    process_hash = get_process_hash(process_info["exe_path"], process_info["cmdline"])
+                    update_process_tracking(process_hash, process_info)
+                    log_pim_event("NEW_PROCESS", process_hash, None, process_info)
+
+        def process_IN_DELETE(self, event):
+            if event.name.isdigit():
+                pid = event.name
+                # Remove from integrity tracking
+                for h, info in all_known_processes.items():
+                    if info.get("pid") == int(pid):
+                        log_pim_event("PROCESS_TERMINATED", h, info, None)
+                        remove_process_tracking(h)
+                        break
+
+    # Start inotify watcher in a separate thread
+    def start_inotify():
+        wm = pyinotify.WatchManager()
+        handler = ProcessEventHandler()
+        notifier = pyinotify.Notifier(wm, handler)
+        wm.add_watch("/proc", pyinotify.IN_CREATE | pyinotify.IN_DELETE)
+        notifier.loop()
+
+    threading.Thread(target=start_inotify, daemon=True).start()
+    print("[INFO] Real-time process monitoring started...")
+
+    # Main loop for periodic scans and ML analysis
+    while True:
+        try:
+            # Enumerate all processes and listening services
+            current_processes = get_all_processes()
+            listening_processes = get_listening_processes()
+
+            # Merge listening info into current processes
+            for h, info in listening_processes.items():
+                if h in current_processes:
+                    current_processes[h]["is_listening"] = True
+                    current_processes[h]["port"] = info["port"]
+                    current_processes[h]["protocol"] = info["protocol"]
+
+            # Detect new and terminated processes
+            new_processes = {h: info for h, info in current_processes.items() if h not in all_known_processes}
+            terminated_processes = {h: info for h, info in all_known_processes.items() if h not in current_processes}
+
+            # Handle new processes
+            for h, info in new_processes.items():
+                update_process_tracking(h, info)
+                log_pim_event("NEW_PROCESS", h, None, info)
+                if info.get("is_listening"):
+                    log_pim_event("NEW_LISTENING_PROCESS", h, None, info)
+
+            # Handle terminated processes
+            for h, info in terminated_processes.items():
+                log_pim_event("PROCESS_TERMINATED", h, info, None)
+                remove_process_tracking(h)
+
+            # ML baseline and anomaly detection
+            if establishing_ml_baseline:
+                ml_baseline_counter += 1
+                if ml_baseline_counter >= ml_baseline_cycles:
+                    establishing_ml_baseline = False
+                    ml_model_info = implement_behavioral_baselining()
+                    if ml_model_info and ml_model_info.get("model"):
+                        print("[INFO] ML model trained successfully.")
+                    else:
+                        print("[WARNING] ML model training failed.")
+            else:
+                if ml_model_info and ml_model_info.get("model"):
+                    for h, info in current_processes.items():
+                        if h in alerted_processes:
+                            continue
+                        detection_events = []
+                        # Memory scan for code injection
+                        suspicious_memory = scan_process_memory(info["pid"])
+                        if suspicious_memory:
+                            detection_events.append({"event_type": "SUSPICIOUS_MEMORY_REGION", "details": suspicious_memory})
+                        # Behavioral anomaly detection
+                        behavioral_patterns = analyze_process_for_anomalies(info["pid"], info)
+                        if behavioral_patterns:
+                            detection_events.append({"event_type": "SUSPICIOUS_BEHAVIOR", "details": behavioral_patterns})
+                        # ML anomaly detection
+                        prediction, anomaly_score = predict_ml_anomaly(info, ml_model_info)
+                        if prediction == -1 and anomaly_score < -0.1:
+                            detection_events.append({"event_type": "ML_DETECTED_ANOMALY", "details": {"anomaly_score": anomaly_score}})
+                        # Log detections
+                        if detection_events:
+                            threat_assessment = calculate_threat_score(info, detection_events)
+                            for event in detection_events:
+                                mitre_info = classify_by_mitre_attck(event["event_type"], info, event.get("details"))
+                                log_pim_event(event["event_type"], h, None, {
+                                    "process_info": info,
+                                    "detection_details": event.get("details", {}),
+                                    "mitre_mapping": mitre_info,
+                                    "threat_assessment": threat_assessment
+                                })
+                            alerted_processes.add(h)
+
+            # Update baseline
+            all_known_processes = current_processes.copy()
+            time.sleep(interval)
+
+        except Exception as e:
+            print(f"[ERROR] Exception in monitoring loop: {e}")
+            time.sleep(interval)
+
 def get_listening_processes():
     """
-    Retrieve all listening processes and their metadata.
-    Properly uses lsof to get complete information about listening processes.
+    Enumerate all listening processes using /proc instead of lsof/netstat.
+    Preserves original metadata fields: pid, exe_path, process_name, port, user,
+    cmdline, hash, ppid, lineage, is_listening, protocol.
     """
     listening_processes = {}
-    
     try:
-        # Get all listening processes using lsof (primary method)
-        try:
-            lsof_output = subprocess.check_output(
-                ["sudo", "-n", "/usr/bin/lsof", "-i", "-P", "-n"],
-                stderr=subprocess.PIPE,
-                text=True
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"[WARNING] lsof command failed: {e}")
-            lsof_output = ""
-            
-        # Fallback to netstat if lsof fails
-        if not lsof_output:
-            try:
-                lsof_output = subprocess.check_output(
-                    ["sudo", "-n", "/bin/netstat", "-tulpn"],
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-            except subprocess.CalledProcessError as e:
-                print(f"[WARNING] netstat command failed: {e}")
-                return listening_processes
-        
-        # Process lsof output to map ports to PIDs and process names
-        port_to_process = {}
-        port_to_proto = {}  # Track protocol (TCP/UDP)
-        
-        for line in lsof_output.splitlines():
-            if "LISTEN" in line or "UDP" in line or ("TCP" in line and "ESTABLISHED" not in line):
-                parts = line.split()
-                if len(parts) < 8:
-                    continue
-                
-                # Extract process name and PID from lsof output
-                process_name = None
-                pid = None
-                port = None
-                
-                # lsof format: COMMAND  PID USER  FD  TYPE  DEVICE SIZE/OFF NODE NAME
-                if "lsof" in " ".join(["sudo", "-n", "/usr/bin/lsof", "-i", "-P", "-n"]):
-                    # This is proper lsof output
-                    if len(parts) >= 2:
-                        process_name = parts[0]
-                        if parts[1].isdigit():
-                            pid = int(parts[1])
-                    
-                    # Find the port in the line
-                    for part in parts:
-                        if ":" in part:
-                            addr_port = part.split(":")
-                            if len(addr_port) > 1 and addr_port[-1].isdigit():
-                                port = int(addr_port[-1])
-                                break
-                    
-                    # Determine protocol (TCP/UDP)
-                    proto = "TCP" if "TCP" in line else "UDP" if "UDP" in line else "UNKNOWN"
-                    
-                elif "netstat" in " ".join(["sudo", "-n", "/bin/netstat", "-tulpn"]):
-                    # This is netstat output - different format
-                    # Proto Recv-Q Send-Q Local Address  Foreign Address  State  PID/Program name
-                    if len(parts) >= 7:
-                        proto = parts[0]
-                        local_addr = parts[3]
-                        if ":" in local_addr:
-                            port = int(local_addr.split(":")[-1])
-                        
-                        # PID/Program format
-                        pid_prog = parts[6]
-                        if "/" in pid_prog:
-                            pid_parts = pid_prog.split("/")
-                            if pid_parts[0].isdigit():
-                                pid = int(pid_parts[0])
-                                process_name = pid_parts[1] if len(pid_parts) > 1 else "UNKNOWN"
-                
-                # Store the process info by port
-                if port is not None and pid is not None:
-                    port_to_process[port] = {
-                        "pid": pid,
-                        "process_name": process_name
-                    }
-                    port_to_proto[port] = proto
-        
-        # Now use ps to get full details for each identified process
-        processed_pids = set()
-        
-        for port, proc_info in port_to_process.items():
-            pid = proc_info["pid"]
-            
-            # Skip if we've already processed this PID
-            if pid in processed_pids:
+        # Collect socket inodes for listening TCP and UDP sockets
+        socket_map = {}  # inode -> (protocol, port)
+        for proto in ["tcp", "udp"]:
+            path = f"/proc/net/{proto}"
+            if not os.path.exists(path):
                 continue
-            
-            processed_pids.add(pid)
-            
-            # Get detailed process info using ps
+            with open(path, "r") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    local_address = parts[1]
+                    state = parts[3]
+                    inode = parts[9]
+
+                    # For TCP, state '0A' means LISTEN
+                    if proto == "tcp" and state != "0A":
+                        continue
+
+                    # Extract port from local_address (hex)
+                    ip_hex, port_hex = local_address.split(":")
+                    port = int(port_hex, 16)
+
+                    socket_map[inode] = (proto.upper(), port)
+
+        # Map sockets to processes by scanning /proc/[pid]/fd
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            if not os.path.exists(fd_dir):
+                continue
             try:
-                ps_output = subprocess.check_output(
-                    ["sudo", "-n", "/bin/ps", "-p", str(pid), "-o", "user,start,ppid,comm", "--no-headers"],
-                    stderr=subprocess.PIPE,
-                    text=True
-                ).strip()
-                
-                if not ps_output:
-                    continue
-                
-                ps_parts = ps_output.split(None, 3)
-                if len(ps_parts) < 4:
-                    continue
-                
-                user = ps_parts[0]
-                start_time = ps_parts[1]
-                ppid = int(ps_parts[2]) if ps_parts[2].isdigit() else 0
-                process_name = ps_parts[3]
-                
-                # Get the executable path using readlink
-                exe_real_path = None
-                try:
-                    exe_real_path = subprocess.check_output(
-                        ["sudo", "-n", "/usr/bin/readlink", "-f", f"/proc/{pid}/exe"],
-                        stderr=subprocess.PIPE,
-                        text=True
-                    ).strip()
-                except subprocess.CalledProcessError:
-                    # If readlink fails, try to find the binary in standard locations
-                    for prefix in ['/usr/bin/', '/usr/sbin/', '/bin/', '/sbin/', '/usr/lib/']:
-                        if os.path.exists(f"{prefix}{process_name}"):
-                            exe_real_path = f"{prefix}{process_name}"
-                            break
-                    
-                    if not exe_real_path:
-                        # Last resort: use the process name
-                        exe_real_path = f"/usr/bin/{process_name}"
-                
-                # Get command line
-                cmdline = ""
-                try:
-                    cmdline_raw = subprocess.check_output(
-                        ["sudo", "-n", "/bin/cat", f"/proc/{pid}/cmdline"],
-                        stderr=subprocess.PIPE
-                    )
-                    cmdline = cmdline_raw.decode('utf-8', errors='replace').replace('\x00', ' ').strip()
-                except subprocess.CalledProcessError:
-                    # If we can't get cmdline, use process name
-                    cmdline = process_name
-                
-                # Generate hash based on executable path
-                process_hash = get_process_hash(exe_real_path, cmdline)
-                
-                # Resolve process lineage
-                lineage = resolve_lineage(pid)
-                
-                # Store complete process info
-                listening_processes[process_hash] = {
-                    "pid": pid,
-                    "exe_path": exe_real_path,
-                    "process_name": process_name,
-                    "port": port,
-                    "protocol": port_to_proto.get(port, "TCP"),
-                    "user": user,
-                    "start_time": start_time,
-                    "cmdline": cmdline,
-                    "hash": process_hash,
-                    "ppid": ppid,
-                    "lineage": lineage,
-                    "is_listening": True
-                }
-                
-            except Exception as e:
-                print(f"[ERROR] Failed to get details for PID {pid} on port {port}: {e}")
-                
+                for fd in os.listdir(fd_dir):
+                    link = os.readlink(os.path.join(fd_dir, fd))
+                    if link.startswith("socket:["):
+                        inode = link.split("[")[1].strip("]")
+                        if inode in socket_map:
+                            protocol, port = socket_map[inode]
+
+                            # Gather process details
+                            exe_path = os.readlink(f"/proc/{pid}/exe")
+                            process_name = os.path.basename(exe_path)
+                            cmdline = ""
+                            cmdline_path = f"/proc/{pid}/cmdline"
+                            if os.path.exists(cmdline_path):
+                                with open(cmdline_path, "r") as f:
+                                    cmdline = f.read().replace("\x00", " ").strip()
+
+                            # Get user and PPID from /proc/[pid]/status
+                            user = None
+                            ppid = None
+                            with open(f"/proc/{pid}/status", "r") as f:
+                                for line in f:
+                                    if line.startswith("Uid:"):
+                                        user = int(line.split()[1])
+                                    elif line.startswith("PPid:"):
+                                        ppid = int(line.split()[1])
+
+                            # Generate hash and lineage
+                            process_hash = get_process_hash(exe_path, cmdline)
+                            lineage = resolve_lineage(int(pid))
+
+                            # Populate full metadata
+                            listening_processes[process_hash] = {
+                                "pid": int(pid),
+                                "exe_path": exe_path,
+                                "process_name": process_name,
+                                "port": port,
+                                "protocol": protocol,
+                                "user": user,
+                                "cmdline": cmdline,
+                                "hash": process_hash,
+                                "ppid": ppid,
+                                "lineage": lineage,
+                                "is_listening": True
+                            }
+            except Exception:
+                continue
+        return listening_processes
     except Exception as e:
-        print(f"[ERROR] Exception in get_listening_processes: {e}")
-        traceback.print_exc()
-    
-    return listening_processes
+        print(f"[ERROR] Failed to enumerate listening processes: {e}")
+        return {}
 
 def log_pim_event(event_type, process_hash, previous_metadata=None, new_metadata=None):
     """
