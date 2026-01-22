@@ -265,28 +265,35 @@ def uninstall():
     status("Uninstallation complete.")
 
 # ---------------- Main Logic ----------------
+
 def main():
     check_root()
     current_user = get_current_user()
     status(f"Running as {current_user}")
+
     print("Choose an action:")
     print("1) Install FIMoniSec")
     print("2) Remove FIMoniSec")
     choice = input("Enter choice (1-2): ").strip()
+
     if choice == "1":
         print("Select installation type:")
         print("1) Linux Client")
         print("2) Server")
         type_choice = input("Enter choice (1-2): ").strip()
         install_type = "linux_client" if type_choice == "1" else "server"
+
+        # Installation steps
         create_user_group(current_user)
         clone_or_update_repo()
+        configure_git_settings()  # NEW
         set_permissions()
-        install_python_dependencies()
+        install_python_dependencies()  # NEW apt-based installer
         update_path(current_user)
         update_sudoers(current_user)
         init_system = detect_init_system()
         create_services(install_type, init_system)
+
         status("Installation complete!")
         start_now = input("Do you want to start the client service now? (y/n): ").strip().lower()
         if start_now == "y":
@@ -295,8 +302,7 @@ def main():
             start_server = input("Do you want to start the server service now? (y/n): ").strip().lower()
             if start_server == "y":
                 run_cmd("systemctl start fimonisec-server")
-        status("Service management instructions:")
-        print("Use systemctl or service commands based on your init system.")
+
     elif choice == "2":
         confirm = input("Are you sure you want to remove FIMoniSec? (y/n): ").strip().lower()
         if confirm == "y":
