@@ -148,6 +148,7 @@ def update_path(current_user):
     run_cmd(f"chmod +x {PROFILE_SCRIPT}")
     os.environ["PATH"] = f"/opt/FIMoniSec/.local/bin:/home/{current_user}/.local/bin:" + os.environ["PATH"]
 
+
 def update_sudoers(current_user):
     status("Updating sudoers using /etc/sudoers.d/fimonisec...")
     SUDOERS_D_FILE = "/etc/sudoers.d/fimonisec"
@@ -155,10 +156,9 @@ def update_sudoers(current_user):
         with open(SUDOERS_D_FILE, "w") as f:
             f.write(f"{current_user} ALL=(ALL) NOPASSWD: {SUDO_CMDS}\n")
             f.write(f"{FIM_USER} ALL=(ALL) NOPASSWD: {SUDO_CMDS}\n")
-        # Set correct permissions for sudoers.d file
         run_cmd(f"chmod 440 {SUDOERS_D_FILE}")
-        # Validate sudoers configuration
-        run_cmd("visudo -c")
+        # Validate only the new file (optional)
+        run_cmd(f"visudo -cf {SUDOERS_D_FILE}")
     except Exception as e:
         error_exit(f"Failed to update sudoers: {e}")
 
