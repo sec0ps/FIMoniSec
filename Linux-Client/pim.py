@@ -168,6 +168,7 @@ def save_process_metadata(processes):
     except Exception as e:
         print(f"[ERROR] Failed to write to {INTEGRITY_PROCESS_FILE}: {e}", file=sys.stderr)
 
+
 def get_all_processes():
     """
     Enumerate all running processes using /proc for efficiency.
@@ -230,7 +231,7 @@ def get_all_processes():
                 # Resolve lineage
                 lineage = resolve_lineage(int(pid))
 
-                # Populate full metadata aligned with integrity_services
+                # Populate full metadata aligned with integrity_services schema
                 all_processes[process_hash] = {
                     "hostname": hostname,
                     "timestamp": timestamp,
@@ -248,7 +249,8 @@ def get_all_processes():
                     "is_listening": False,
                     "state": process_state,
                     "runtime_seconds": runtime_seconds,
-                    "status": "running"
+                    "status": "running",
+                    "type": "process"
                 }
             except Exception:
                 continue
@@ -493,7 +495,8 @@ def get_listening_processes():
                                 "ppid": ppid,
                                 "lineage": lineage,
                                 "is_listening": True,
-                                "status": "listening"
+                                "status": "listening",
+                                "type": "process"
                             }
             except Exception:
                 continue
