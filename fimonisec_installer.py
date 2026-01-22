@@ -78,6 +78,7 @@ def create_user_group(current_user):
     run_cmd(f"usermod -a -G {FIM_GROUP} {current_user}")
     status(f"User {current_user} added to fimonisec group.")
 
+
 def clone_or_update_repo():
     if shutil.which("git") is None:
         status("Installing Git...")
@@ -93,6 +94,10 @@ def clone_or_update_repo():
             backup = f"{INSTALL_DIR}.backup.{datetime.now().strftime('%Y%m%d%H%M%S')}"
             status(f"Backing up existing directory to {backup}")
             shutil.move(INSTALL_DIR, backup)
+
+        # Recreate directory and set permissions
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        run_cmd(f"chown {FIM_USER}:{FIM_GROUP} {INSTALL_DIR}")
 
         # Fresh clone
         status("Cloning repository...")
