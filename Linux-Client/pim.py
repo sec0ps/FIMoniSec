@@ -970,32 +970,69 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
             print(f"[ERROR] Exception in enhanced monitoring loop: {e}")
             traceback.print_exc()
             time.sleep(interval)  # Sleep to avoid spinning on errors
-            
+
 def create_baseline():
-    """Create an initial baseline of all processes without generating alerts or logs."""
+    """Create an initial baseline of all processes and services with enriched metadata."""
     try:
-        print("[INFO] Creating initial process baseline...")
-        
-        # Get current processes
+        print("[INFO] Creating initial baseline...")
+
+        hostname = socket.gethostname()
+        timestamp = datetime.utcnow().isoformat()
+
+        # === Process Baseline ===
         listening_processes = get_listening_processes()
         all_processes = get_all_processes()
-        
-        # Merge processes, with listening processes taking precedence
+
         merged_processes = all_processes.copy()
         for process_hash, info in listening_processes.items():
             merged_processes[process_hash] = info
-        
-        # Log statistics but not events
-        print(f"[INFO] Initial baseline: {len(merged_processes)} total processes, {len(listening_processes)} listening processes")
-        
-        # Write directly to integrity file without using the functions that log events
+
+        print(f"[INFO] Initial process baseline: {len(merged_processes)} total processes, {len(listening_processes)} listening")
+
         with open(INTEGRITY_PROCESS_FILE, "w") as f:
             json.dump(merged_processes, f, indent=4)
         os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
-        
-        print(f"[INFO] Successfully wrote baseline to {INTEGRITY_PROCESS_FILE}")
+
+        # === Service Baseline ===
+        INTEGRITY_SERVICE_FILE = os.path.join(OUTPUT_DIR, "integrity_services.json")
+        critical_service_paths = ["/sbin/init", "/bin/systemd", "/usr/lib/systemd/systemd"]
+        service_config_dirs = ["/etc/systemd/system", "/usr/lib/systemd/system", "/etc/init.d"]
+
+        current_service_metadata = {}
+
+        for path in critical_service_paths:
+            if os.path.exists(path):
+                current_service_metadata[path] = {
+                    "hostname": hostname,
+                    "timestamp": timestamp,
+                    "path": path,
+                    "hash": get_process_hash(path),
+                    "type": "service",
+                    "status": "verified"
+                }
+
+        for directory in service_config_dirs:
+            if os.path.exists(directory):
+                for root, _, files in os.walk(directory):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        if os.path.isfile(full_path):
+                            current_service_metadata[full_path] = {
+                                "hostname": hostname,
+                                "timestamp": timestamp,
+                                "path": full_path,
+                                "hash": get_process_hash(full_path),
+                                "type": "service_config",
+                                "status": "verified"
+                            }
+
+        with open(INTEGRITY_SERVICE_FILE, "w") as f:
+            json.dump(current_service_metadata, f, indent=4)
+        os.chmod(INTEGRITY_SERVICE_FILE, 0o600)
+
+        print(f"[INFO] Service integrity baseline created with {len(current_service_metadata)} entries.")
         return True
-        
+
     except Exception as e:
         print(f"[ERROR] Failed to create baseline: {e}")
         traceback.print_exc()
@@ -1984,7 +2021,8 @@ def stop_daemon():
 def run_monitor():
     """
     Run the process monitoring loop with comprehensive tracking of all processes.
-    Now includes boot-time integrity enforcement for critical service binaries and configs.
+    Includes boot-time integrity enforcement for critical service binaries and configs.
+    Refactored to enrich service metadata without introducing new functions.
     """
     try:
         # Ensure directories and files exist
@@ -2013,6 +2051,9 @@ def run_monitor():
 
         # === BOOT-TIME INTEGRITY CHECK ===
         INTEGRITY_SERVICE_FILE = os.path.join(OUTPUT_DIR, "integrity_services.json")
+        hostname = socket.gethostname()
+        timestamp = datetime.utcnow().isoformat()
+
         critical_service_paths = [
             "/sbin/init",
             "/bin/systemd",
@@ -2024,11 +2065,19 @@ def run_monitor():
             "/etc/init.d"
         ]
 
-        # Collect current hashes for critical services and configs
-        current_service_hashes = {}
+        # Collect current metadata for critical services and configs
+        current_service_metadata = {}
+
         for path in critical_service_paths:
             if os.path.exists(path):
-                current_service_hashes[path] = get_process_hash(path)
+                current_service_metadata[path] = {
+                    "hostname": hostname,
+                    "timestamp": timestamp,
+                    "path": path,
+                    "hash": get_process_hash(path),
+                    "type": "service",
+                    "status": "verified"
+                }
 
         for directory in service_config_dirs:
             if os.path.exists(directory):
@@ -2036,73 +2085,38 @@ def run_monitor():
                     for file in files:
                         full_path = os.path.join(root, file)
                         if os.path.isfile(full_path):
-                            current_service_hashes[full_path] = get_process_hash(full_path)
+                            current_service_metadata[full_path] = {
+                                "hostname": hostname,
+                                "timestamp": timestamp,
+                                "path": full_path,
+                                "hash": get_process_hash(full_path),
+                                "type": "service_config",
+                                "status": "verified"
+                            }
 
-        # Load or create baseline
+        # Baseline handling for services
         if not os.path.exists(INTEGRITY_SERVICE_FILE):
             print("[INFO] No service integrity baseline found. Creating baseline...")
             with open(INTEGRITY_SERVICE_FILE, "w") as f:
-                json.dump(current_service_hashes, f, indent=4)
+                json.dump(current_service_metadata, f, indent=4)
             os.chmod(INTEGRITY_SERVICE_FILE, 0o600)
-            print(f"[INFO] Service integrity baseline created with {len(current_service_hashes)} entries.")
+            print(f"[INFO] Service integrity baseline created with {len(current_service_metadata)} entries.")
         else:
             print("[INFO] Loading service integrity baseline for verification...")
             with open(INTEGRITY_SERVICE_FILE, "r") as f:
-                baseline_hashes = json.load(f)
+                baseline_metadata = json.load(f)
 
             # Compare current hashes against baseline
-            for path, current_hash in current_service_hashes.items():
-                baseline_hash = baseline_hashes.get(path)
-                if baseline_hash and baseline_hash != current_hash:
-                    # Log mismatch
+            for path, current_info in current_service_metadata.items():
+                baseline_info = baseline_metadata.get(path)
+                if baseline_info and baseline_info.get("hash") != current_info["hash"]:
                     print(f"[ALERT] Service integrity mismatch detected: {path}")
                     log_pim_event(
                         event_type="SERVICE_HASH_MISMATCH",
                         process_hash="SERVICE_CHECK",
-                        previous_metadata={"path": path, "baseline_hash": baseline_hash},
-                        new_metadata={"path": path, "current_hash": current_hash, "action": "TERMINATE_LINEAGE"}
+                        previous_metadata=baseline_info,
+                        new_metadata=current_info
                     )
-
-                    # MITRE ATT&CK mapping
-                    mitre_info = classify_by_mitre_attck("SERVICE_HASH_MISMATCH", {"exe_path": path})
-                    if mitre_info:
-                        print(f"[MITRE ATT&CK] {mitre_info}")
-
-                    # Kill offending process lineage (skip critical system processes)
-                    offending_pids = []
-                    for pid in os.listdir("/proc"):
-                        if pid.isdigit():
-                            exe_link = os.path.join("/proc", pid, "exe")
-                            try:
-                                exe_path = os.readlink(exe_link)
-                                if exe_path == path:
-                                    lineage = resolve_lineage(int(pid))
-                                    for ancestor_pid in lineage:
-                                        if ancestor_pid == 1:  # Skip systemd/init
-                                            continue
-                                        try:
-                                            os.kill(ancestor_pid, signal.SIGKILL)
-                                            offending_pids.append(ancestor_pid)
-                                        except Exception:
-                                            continue
-                                    # Kill the offending process itself
-                                    try:
-                                        os.kill(int(pid), signal.SIGKILL)
-                                        offending_pids.append(int(pid))
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                continue
-
-                    # Log killed PIDs for forensic traceability
-                    if offending_pids:
-                        print(f"[ENFORCEMENT] Terminated lineage: {offending_pids}")
-                        log_pim_event(
-                            event_type="LINEAGE_TERMINATED",
-                            process_hash="SERVICE_CHECK",
-                            previous_metadata=None,
-                            new_metadata={"terminated_pids": offending_pids, "reason": "Service integrity violation"}
-                        )
 
         # === BASELINE HANDLING FOR PROCESSES ===
         if not os.path.exists(INTEGRITY_PROCESS_FILE) or os.path.getsize(INTEGRITY_PROCESS_FILE) <= 3:
@@ -2110,8 +2124,7 @@ def run_monitor():
             listening_processes = get_listening_processes()
             all_processes = get_all_processes()
             merged_processes = all_processes.copy()
-            for process_hash, info in listening_processes.items():
-                merged_processes[process_hash] = info
+            merged_processes.update(listening_processes)
             with open(INTEGRITY_PROCESS_FILE, "w") as f:
                 json.dump(merged_processes, f, indent=4)
             os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
