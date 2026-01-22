@@ -82,13 +82,19 @@ def clone_or_update_repo():
     if shutil.which("git") is None:
         status("Installing Git...")
         run_cmd("apt-get update -qq && apt-get install -y git -qq")
-    if not os.path.exists(INSTALL_DIR):
-        os.makedirs(INSTALL_DIR, exist_ok=True)
-        run_cmd(f"chown {FIM_USER}:{FIM_GROUP} {INSTALL_DIR}")
+
     if os.path.isdir(os.path.join(INSTALL_DIR, ".git")):
+        # Existing Git repo → update
         status("Existing Git repo detected. Pulling latest changes...")
-        run_cmd(f"su - {FIM_USER} -c 'cd {INSTALL_DIR} && git pull'")
+        run_cmd(f"su - {FIM_USER} -c 'cd {INSTALL_DIR} && git reset --hard && git pull'")
     else:
+        if os.path.exists(INSTALL_DIR) and os.listdir(INSTALL_DIR):
+            # Directory exists but not a Git repo → backup
+            backup = f"{INSTALL_DIR}.backup.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            status(f"Backing up existing directory to {backup}")
+            shutil.move(INSTALL_DIR, backup)
+
+        # Fresh clone
         status("Cloning repository...")
         run_cmd(f"su - {FIM_USER} -c 'git clone {REPO_URL} {INSTALL_DIR}'")
 
