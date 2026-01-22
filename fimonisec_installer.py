@@ -44,7 +44,7 @@ SUDOERS_FILE = "/etc/sudoers"
 PROFILE_SCRIPT = "/etc/profile.d/fimonisec_path.sh"
 
 # Commands allowed via sudo without password
-SUDO_CMDS = "/usr/bin/lsof, /bin/cat, /bin/ps, /bin/netstat, /bin/ss, /usr/bin/readlink, /usr/bin/head, /usr/bin/tail, /usr/bin/find, /usr/bin/grep, /usr/bin/nice, /usr/bin/renice, /usr/bin/kill, /usr/bin/pkill, /usr/bin/pgrep, /bin/mkdir, /usr/bin/touch, /usr/bin/ulimit, /bin/systemctl, /usr/bin/python3"
+SUDO_CMDS = "/usr/bin/lsof, /bin/cat, /bin/ps, /bin/netstat, /bin/ss, /usr/bin/readlink, /usr/bin/head, /usr/bin/tail, /usr/bin/find, /usr/bin/grep, /usr/bin/nice, /usr/bin/renice, /usr/bin/kill, /usr/bin/pkill, /usr/bin/pgrep, /bin/mkdir, /usr/bin/touch, /usr/bin/ulimit, /bin/systemctl, /usr/bin/python3, /usr/bin/apt"
 
 # ---------------- Utility Functions ----------------
 def error_exit(msg):
@@ -108,16 +108,28 @@ def set_permissions():
     run_cmd(f"chown -R {FIM_USER}:{FIM_GROUP} {INSTALL_DIR}")
     run_cmd(f"chmod -R 750 {INSTALL_DIR}")
 
-def install_python_dependencies(current_user):
-    status("Installing Python dependencies...")
-    if shutil.which("pip") is None:
-        status("Installing pip...")
-        run_cmd("apt-get update -qq && apt-get install -y python3-pip -qq")
-    run_cmd(f"su - {FIM_USER} -c 'cd {INSTALL_DIR} && pip install -r requirements.txt -q'")
-    if current_user != "root":
-        run_cmd(f"su - {current_user} -c 'cd {INSTALL_DIR} && pip install -r requirements.txt -q'")
-    else:
-        run_cmd(f"pip install -r {INSTALL_DIR}/requirements.txt -q")
+
+def install_python_dependencies():
+    status("Installing Python dependencies via apt-get...")
+    # Update package list
+    run_cmd("apt-get update -qq")
+
+    # Install each dependency using system packages
+    packages = [
+        "python3-daemon",
+        "python3-pyinotify",
+        "python3-numpy",
+        "python3-pandas",
+        "python3-sklearn",  # scikit-learn
+        "python3-psutil",
+        "python3-websockets",
+        "python3-joblib"
+    ]
+
+    # Install all packages in one command for efficiency
+    run_cmd(f"apt install -y {' '.join(packages)} -qq")
+
+    status("All Python dependencies installed successfully.")
 
 def update_path(current_user):
     status("Updating PATH for users...")
@@ -246,7 +258,7 @@ def main():
         create_user_group(current_user)
         clone_or_update_repo()
         set_permissions()
-        install_python_dependencies(current_user)
+        install_python_dependencies()
         update_path(current_user)
         update_sudoers(current_user)
         init_system = detect_init_system()
