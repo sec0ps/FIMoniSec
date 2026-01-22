@@ -157,7 +157,6 @@ def update_path(current_user):
     run_cmd(f"chmod +x {PROFILE_SCRIPT}")
     os.environ["PATH"] = f"/opt/FIMoniSec/.local/bin:/home/{current_user}/.local/bin:" + os.environ["PATH"]
 
-
 def update_sudoers(current_user):
     status("Updating sudoers using /etc/sudoers.d/fimonisec...")
     SUDOERS_D_FILE = "/etc/sudoers.d/fimonisec"
@@ -166,7 +165,9 @@ def update_sudoers(current_user):
             f.write(f"{current_user} ALL=(ALL) NOPASSWD: {SUDO_CMDS}\n")
             f.write(f"{FIM_USER} ALL=(ALL) NOPASSWD: {SUDO_CMDS}\n")
         run_cmd(f"chmod 440 {SUDOERS_D_FILE}")
-        # Validate only the new file (optional)
+        # Fix main sudoers permissions before validation
+        run_cmd("chmod 440 /etc/sudoers")
+        # Validate only the new file
         run_cmd(f"visudo -cf {SUDOERS_D_FILE}")
     except Exception as e:
         error_exit(f"Failed to update sudoers: {e}")
@@ -222,31 +223,45 @@ WantedBy=multi-user.target
 
 def uninstall():
     status("Stopping and removing services...")
+    # Stop and disable client service
     run_cmd("systemctl stop fimonisec-client || true")
     run_cmd("systemctl disable fimonisec-client || true")
     run_cmd("rm -f /etc/systemd/system/fimonisec-client.service")
+
+    # Stop and disable server service if exists
     run_cmd("systemctl stop fimonisec-server || true")
     run_cmd("systemctl disable fimonisec-server || true")
     run_cmd("rm -f /etc/systemd/system/fimonisec-server.service")
+
+    # Reload systemd daemon
     run_cmd("systemctl daemon-reload")
+
     status("Removing files...")
     shutil.rmtree(INSTALL_DIR, ignore_errors=True)
+
     status("Removing profile script...")
     if os.path.exists(PROFILE_SCRIPT):
         os.remove(PROFILE_SCRIPT)
+
     status("Cleaning sudoers...")
-    temp_file = "/tmp/sudoers.tmp"
-    with open(temp_file, "w") as temp:
-        with open(SUDOERS_FILE) as orig:
-            for line in orig:
-                if "fimonisec" not in line:
-                    temp.write(line)
-    shutil.copy(temp_file, SUDOERS_FILE)
-    run_cmd("visudo -c")
-    os.remove(temp_file)
+    try:
+        # Restore correct permissions on main sudoers before validation
+        run_cmd("chmod 440 /etc/sudoers")
+
+        # Remove fimonisec sudoers file if exists
+        SUDOERS_D_FILE = "/etc/sudoers.d/fimonisec"
+        if os.path.exists(SUDOERS_D_FILE):
+            os.remove(SUDOERS_D_FILE)
+
+        # Validate sudoers configuration
+        run_cmd("visudo -c")
+    except Exception as e:
+        print(f"[WARNING] Sudoers cleanup encountered an issue: {e}")
+
     status("Removing user and group...")
     run_cmd(f"userdel -r {FIM_USER} || true")
     run_cmd(f"groupdel {FIM_GROUP} || true")
+
     status("Uninstallation complete.")
 
 # ---------------- Main Logic ----------------
