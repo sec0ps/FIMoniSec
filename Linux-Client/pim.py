@@ -41,6 +41,9 @@ import threading
 import traceback
 import atexit
 import re
+import pwd
+import socket
+from datetime import datetime
 
 # New imports for ML and analysis
 import numpy as np  # For numerical operations
@@ -168,17 +171,18 @@ def save_process_metadata(processes):
 def get_all_processes():
     """
     Enumerate all running processes using /proc for efficiency.
-    Preserves original metadata fields: pid, exe_path, process_name, port, user,
-    start_time, cmdline, hash, ppid, lineage, is_listening, state, runtime_seconds.
+    Includes full metadata aligned with integrity_services schema.
     """
     all_processes = {}
+    hostname = socket.gethostname()
+    timestamp = datetime.utcnow().isoformat()
+
     try:
         for pid in os.listdir("/proc"):
             if not pid.isdigit():
                 continue
             proc_path = f"/proc/{pid}"
             try:
-                # Executable path
                 exe_real_path = os.readlink(os.path.join(proc_path, "exe"))
                 process_name = os.path.basename(exe_real_path)
 
@@ -196,7 +200,11 @@ def get_all_processes():
                 with open(os.path.join(proc_path, "status"), "r") as f:
                     for line in f:
                         if line.startswith("Uid:"):
-                            user = int(line.split()[1])
+                            uid = int(line.split()[1])
+                            try:
+                                user = pwd.getpwuid(uid).pw_name
+                            except KeyError:
+                                user = str(uid)
                         elif line.startswith("PPid:"):
                             ppid = int(line.split()[1])
                         elif line.startswith("State:"):
@@ -209,18 +217,12 @@ def get_all_processes():
                 if os.path.exists(stat_path):
                     with open(stat_path, "r") as f:
                         stat_fields = f.read().split()
-                        # Field 22 = starttime (in clock ticks), Field 14 = utime, Field 15 = stime
                         start_ticks = int(stat_fields[21])
                         utime = int(stat_fields[13])
                         stime = int(stat_fields[14])
                         clk_tck = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
                         runtime_seconds = (utime + stime) / clk_tck
-                        # Convert start_ticks to seconds since boot
                         start_time = start_ticks / clk_tck
-
-                # Detect listening state later
-                is_listening = False
-                port = "NOT_LISTENING"
 
                 # Generate hash
                 process_hash = get_process_hash(exe_real_path, cmdline)
@@ -228,21 +230,25 @@ def get_all_processes():
                 # Resolve lineage
                 lineage = resolve_lineage(int(pid))
 
-                # Populate full metadata
+                # Populate full metadata aligned with integrity_services
                 all_processes[process_hash] = {
+                    "hostname": hostname,
+                    "timestamp": timestamp,
                     "pid": int(pid),
                     "exe_path": exe_real_path,
                     "process_name": process_name,
-                    "port": port,
+                    "port": "NOT_LISTENING",
+                    "protocol": "N/A",
                     "user": user,
                     "start_time": start_time,
                     "cmdline": cmdline,
                     "hash": process_hash,
                     "ppid": ppid,
                     "lineage": lineage,
-                    "is_listening": is_listening,
+                    "is_listening": False,
                     "state": process_state,
-                    "runtime_seconds": runtime_seconds
+                    "runtime_seconds": runtime_seconds,
+                    "status": "running"
                 }
             except Exception:
                 continue
@@ -411,14 +417,15 @@ def monitor_proc_events(interval=2, use_initial_baseline=False):
 
 def get_listening_processes():
     """
-    Enumerate all listening processes using /proc instead of lsof/netstat.
-    Preserves original metadata fields: pid, exe_path, process_name, port, user,
-    cmdline, hash, ppid, lineage, is_listening, protocol.
+    Enumerate all listening processes using /proc.
+    Metadata aligned with integrity_services schema.
     """
     listening_processes = {}
+    hostname = socket.gethostname()
+    timestamp = datetime.utcnow().isoformat()
+
     try:
-        # Collect socket inodes for listening TCP and UDP sockets
-        socket_map = {}  # inode -> (protocol, port)
+        socket_map = {}
         for proto in ["tcp", "udp"]:
             path = f"/proc/net/{proto}"
             if not os.path.exists(path):
@@ -429,18 +436,12 @@ def get_listening_processes():
                     local_address = parts[1]
                     state = parts[3]
                     inode = parts[9]
-
-                    # For TCP, state '0A' means LISTEN
                     if proto == "tcp" and state != "0A":
                         continue
-
-                    # Extract port from local_address (hex)
                     ip_hex, port_hex = local_address.split(":")
                     port = int(port_hex, 16)
-
                     socket_map[inode] = (proto.upper(), port)
 
-        # Map sockets to processes by scanning /proc/[pid]/fd
         for pid in os.listdir("/proc"):
             if not pid.isdigit():
                 continue
@@ -454,8 +455,6 @@ def get_listening_processes():
                         inode = link.split("[")[1].strip("]")
                         if inode in socket_map:
                             protocol, port = socket_map[inode]
-
-                            # Gather process details
                             exe_path = os.readlink(f"/proc/{pid}/exe")
                             process_name = os.path.basename(exe_path)
                             cmdline = ""
@@ -464,22 +463,25 @@ def get_listening_processes():
                                 with open(cmdline_path, "r") as f:
                                     cmdline = f.read().replace("\x00", " ").strip()
 
-                            # Get user and PPID from /proc/[pid]/status
                             user = None
                             ppid = None
                             with open(f"/proc/{pid}/status", "r") as f:
                                 for line in f:
                                     if line.startswith("Uid:"):
-                                        user = int(line.split()[1])
+                                        uid = int(line.split()[1])
+                                        try:
+                                            user = pwd.getpwuid(uid).pw_name
+                                        except KeyError:
+                                            user = str(uid)
                                     elif line.startswith("PPid:"):
                                         ppid = int(line.split()[1])
 
-                            # Generate hash and lineage
                             process_hash = get_process_hash(exe_path, cmdline)
                             lineage = resolve_lineage(int(pid))
 
-                            # Populate full metadata
                             listening_processes[process_hash] = {
+                                "hostname": hostname,
+                                "timestamp": timestamp,
                                 "pid": int(pid),
                                 "exe_path": exe_path,
                                 "process_name": process_name,
@@ -490,7 +492,8 @@ def get_listening_processes():
                                 "hash": process_hash,
                                 "ppid": ppid,
                                 "lineage": lineage,
-                                "is_listening": True
+                                "is_listening": True,
+                                "status": "listening"
                             }
             except Exception:
                 continue
@@ -1921,28 +1924,22 @@ def remove_process_tracking(process_hash, process_info=None):
 def update_process_tracking(process_hash, metadata):
     """
     Update process tracking with new or modified processes.
-    This now uses hash as the primary key instead of PID.
+    Preserves 'is_new' flag for alerting logic and aligns metadata schema.
     """
     integrity_state = load_process_metadata()
 
-    # Update the process metadata in our tracking structure using hash as key
-    integrity_state[process_hash] = metadata
-    
-    # Log the event as new or modified based on whether it existed before
+    # Determine if this is a new process
     is_new = process_hash not in integrity_state
-    event_type = "NEW_PROCESS" if is_new else "PROCESS_UPDATED"
-    
-    # If this process has a new PID but we've seen this hash before, that's interesting
-    old_metadata = integrity_state.get(process_hash)
-    if not is_new and old_metadata and old_metadata.get("pid") != metadata.get("pid"):
-        print(f"[INFO] Process hash {process_hash} now has PID {metadata.get('pid')}, was previously {old_metadata.get('pid')}")
-        
+
+    # Update the process metadata in our tracking structure
+    integrity_state[process_hash] = metadata
+
     # Save the updated process metadata
     save_process_metadata(integrity_state)
-    
-    # Return information about the update for potential logging or alerting
+
+    # Return structured info for logging or alerting
     return {
-        "event_type": event_type,
+        "event_type": "NEW_PROCESS" if is_new else "PROCESS_UPDATED",
         "process_hash": process_hash,
         "is_new": is_new,
         "metadata": metadata
