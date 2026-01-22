@@ -108,6 +108,15 @@ def set_permissions():
     run_cmd(f"chown -R {FIM_USER}:{FIM_GROUP} {INSTALL_DIR}")
     run_cmd(f"chmod -R 750 {INSTALL_DIR}")
 
+def configure_git_settings():
+    """
+    Configure Git to ignore file permission changes (core.fileMode=false).
+    Prevents installer-induced chmod from causing pull conflicts.
+    """
+    status("Configuring Git settings to ignore file mode changes...")
+    run_cmd(f"su - {FIM_USER} -c 'cd {INSTALL_DIR} && git config core.fileMode false'")
+
+configure_git_settings()
 
 def install_python_dependencies():
     status("Installing Python dependencies via apt-get...")
