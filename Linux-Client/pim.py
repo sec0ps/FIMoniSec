@@ -1985,78 +1985,156 @@ def stop_daemon():
         print("[ERROR] No PID file found. Is the daemon running?")
 
 def run_monitor():
-    """Run the process monitoring loop with comprehensive tracking of all processes."""
+    """
+    Run the process monitoring loop with comprehensive tracking of all processes.
+    Now includes boot-time integrity enforcement for critical service binaries and configs.
+    """
     try:
-        # First, ensure all directories and files exist
+        # Ensure directories and files exist
         ensure_output_dir()
-        
-        # Initialize global tracking for logged events
+
         global LOGGED_EVENTS
         LOGGED_EVENTS = {
             "new_process": set(),
             "listening_process": set(),
             "terminated": set()
         }
-        
+
         # Write PID file
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
-        
+
         # Register cleanup on normal and signal-based exits
         atexit.register(cleanup_and_exit)
         signal.signal(signal.SIGINT, cleanup_and_exit)
         signal.signal(signal.SIGTERM, cleanup_and_exit)
-        
+
         # Set up logging if in daemon mode
         if "--daemon" in sys.argv:
             sys.stdout = open(LOG_FILE, "a", buffering=1)
             sys.stderr = sys.stdout
-        
-        # Check if this is the first run (integrity file doesn't exist or is empty)
+
+        # === BOOT-TIME INTEGRITY CHECK ===
+        INTEGRITY_SERVICE_FILE = os.path.join(OUTPUT_DIR, "integrity_services.json")
+        critical_service_paths = [
+            "/sbin/init",
+            "/bin/systemd",
+            "/usr/lib/systemd/systemd"
+        ]
+        service_config_dirs = [
+            "/etc/systemd/system",
+            "/usr/lib/systemd/system",
+            "/etc/init.d"
+        ]
+
+        # Collect current hashes for critical services and configs
+        current_service_hashes = {}
+        for path in critical_service_paths:
+            if os.path.exists(path):
+                current_service_hashes[path] = get_process_hash(path)
+
+        for directory in service_config_dirs:
+            if os.path.exists(directory):
+                for root, _, files in os.walk(directory):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        if os.path.isfile(full_path):
+                            current_service_hashes[full_path] = get_process_hash(full_path)
+
+        # Load or create baseline
+        if not os.path.exists(INTEGRITY_SERVICE_FILE):
+            print("[INFO] No service integrity baseline found. Creating baseline...")
+            with open(INTEGRITY_SERVICE_FILE, "w") as f:
+                json.dump(current_service_hashes, f, indent=4)
+            os.chmod(INTEGRITY_SERVICE_FILE, 0o600)
+            print(f"[INFO] Service integrity baseline created with {len(current_service_hashes)} entries.")
+        else:
+            print("[INFO] Loading service integrity baseline for verification...")
+            with open(INTEGRITY_SERVICE_FILE, "r") as f:
+                baseline_hashes = json.load(f)
+
+            # Compare current hashes against baseline
+            for path, current_hash in current_service_hashes.items():
+                baseline_hash = baseline_hashes.get(path)
+                if baseline_hash and baseline_hash != current_hash:
+                    # Log mismatch
+                    print(f"[ALERT] Service integrity mismatch detected: {path}")
+                    log_pim_event(
+                        event_type="SERVICE_HASH_MISMATCH",
+                        process_hash="SERVICE_CHECK",
+                        previous_metadata={"path": path, "baseline_hash": baseline_hash},
+                        new_metadata={"path": path, "current_hash": current_hash, "action": "TERMINATE_LINEAGE"}
+                    )
+
+                    # MITRE ATT&CK mapping
+                    mitre_info = classify_by_mitre_attck("SERVICE_HASH_MISMATCH", {"exe_path": path})
+                    if mitre_info:
+                        print(f"[MITRE ATT&CK] {mitre_info}")
+
+                    # Kill offending process lineage (skip critical system processes)
+                    offending_pids = []
+                    for pid in os.listdir("/proc"):
+                        if pid.isdigit():
+                            exe_link = os.path.join("/proc", pid, "exe")
+                            try:
+                                exe_path = os.readlink(exe_link)
+                                if exe_path == path:
+                                    lineage = resolve_lineage(int(pid))
+                                    for ancestor_pid in lineage:
+                                        if ancestor_pid == 1:  # Skip systemd/init
+                                            continue
+                                        try:
+                                            os.kill(ancestor_pid, signal.SIGKILL)
+                                            offending_pids.append(ancestor_pid)
+                                        except Exception:
+                                            continue
+                                    # Kill the offending process itself
+                                    try:
+                                        os.kill(int(pid), signal.SIGKILL)
+                                        offending_pids.append(int(pid))
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                continue
+
+                    # Log killed PIDs for forensic traceability
+                    if offending_pids:
+                        print(f"[ENFORCEMENT] Terminated lineage: {offending_pids}")
+                        log_pim_event(
+                            event_type="LINEAGE_TERMINATED",
+                            process_hash="SERVICE_CHECK",
+                            previous_metadata=None,
+                            new_metadata={"terminated_pids": offending_pids, "reason": "Service integrity violation"}
+                        )
+
+        # === BASELINE HANDLING FOR PROCESSES ===
         if not os.path.exists(INTEGRITY_PROCESS_FILE) or os.path.getsize(INTEGRITY_PROCESS_FILE) <= 3:
             print("[INFO] First run detected - establishing baseline without generating alerts")
-            
-            # Create baseline directly here
-            print("[INFO] Creating initial process baseline...")
-            
-            # Get current processes
             listening_processes = get_listening_processes()
             all_processes = get_all_processes()
-            
-            # Merge processes, with listening processes taking precedence
             merged_processes = all_processes.copy()
             for process_hash, info in listening_processes.items():
                 merged_processes[process_hash] = info
-            
-            # Log statistics but not events
-            print(f"[INFO] Initial baseline: {len(merged_processes)} total processes, {len(listening_processes)} listening processes")
-            
-            # Write directly to integrity file without using the functions that log events
             with open(INTEGRITY_PROCESS_FILE, "w") as f:
                 json.dump(merged_processes, f, indent=4)
             os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
-            
             print("[INFO] Baseline established. Starting monitoring mode...")
-            # Wait briefly to ensure file is fully written
             time.sleep(1)
         else:
             print("[INFO] Baseline already exists. Starting in monitoring mode.")
-        
-        # Store initial baseline for reference
+
         global INITIAL_BASELINE
         INITIAL_BASELINE = load_process_metadata()
-        
-        # Set flag to use initial baseline
         use_initial_baseline = True
-        
-        # Start periodic integrity scan in a separate thread with a delay
+
+        # Start periodic integrity scan in a separate thread
         print("[INFO] Starting periodic integrity scan...")
         integrity_thread = threading.Thread(target=rescan_all_processes, args=(120, use_initial_baseline), daemon=True)
         integrity_thread.start()
-        
-        # Run the main monitoring loop with ML baseline establishment phase
+
+        # Run main monitoring loop
         monitor_processes(first_run=False, use_initial_baseline=use_initial_baseline)
-        
+
     except Exception as e:
         print(f"[ERROR] PIM encountered an error: {e}")
         traceback.print_exc()
