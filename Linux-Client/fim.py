@@ -238,56 +238,54 @@ def create_default_config():
     """Create a default configuration file."""
     default_config = {
         "scheduled_scan": {
-            "directories": [
-                "/etc",
-                "/usr/bin",
-                "/usr/sbin",
-                "/bin",
-                "/sbin"
-                "/var/www"
-            ],
+            "directories": ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/var/www"],
             "scan_interval": 300
         },
         "real_time_monitoring": {
-            "directories": [
-                "/etc",
-                "/var/www"
-            ]
+            "directories": ["/var/www"]
         },
         "exclusions": {
-            "directories": [
-                "/proc",
-                "/sys",
-                "/dev",
-                "/run",
-                "/var/log",
-                "/var/cache"
+            "directories": ["/var/log"],
+            "files": [
+                "/etc/mnttab",
+                "/etc/mtab",
+                "/etc/hosts.deny",
+                "/etc/mail/statistics",
+                "/etc/random-seed",
+                "/etc/adjtime",
+                "/etc/httpd/logs",
+                "/etc/utmpx",
+                "/etc/wtmpx",
+                "/etc/cups/certs",
+                "/etc/dumpdates",
+                "/etc/svc/volatile"
             ],
-            "files": [],
             "patterns": [
-                "*.log",
                 "*.tmp",
+                "*.log",
                 "*.swp",
-                "*.bak"
+                "*~"
             ],
             "extensions": [
-                ".log",
+                ".bak",
                 ".tmp",
                 ".swp",
-                ".pid",
-                ".lock"
+                ".cache"
             ],
-            "max_size": 104857600
+            "max_size": 1073741824
         },
         "siem_settings": {
             "enabled": False,
-            "siem_type": "none",
-            "host": "",
-            "port": 514,
-            "protocol": "udp"
+            "siem_server": "",
+            "siem_port": 0
         },
         "performance": {
-            "worker_threads": 4
+            "worker_threads": 4,
+            "chunk_size": 65536
+        },
+        "client_settings": {
+            "BASE_DIR": "/opt/FIMoniSec/Linux-Client",
+            "lim_enabled": False
         }
     }
 
@@ -296,6 +294,7 @@ def create_default_config():
 
     with open(CONFIG_FILE, "w") as f:
         json.dump(default_config, f, indent=4)
+    os.chmod(CONFIG_FILE, 0o600)
 
     print(f"[INFO] Created default configuration file: {CONFIG_FILE}")
 
