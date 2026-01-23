@@ -128,11 +128,13 @@ python fimonisec_client.py exclusion remove directory /path/to/exclude
 # List exclusions
 python fimonisec_client.py exclusion list
 python fimonisec_client.py exclusion list directory
+```
 
 ## Contact
+```bash
 For professional services, integrations, or support contact: operations@redcellsecurity.org
-
-## License
+```
+### License
 
 **Author**: Keith Pachulski  
 **Company**: Red Cell Security, LLC  
@@ -143,7 +145,7 @@ For professional services, integrations, or support contact: operations@redcells
 
 **License**: This software is licensed under the MIT License. You are free to use, modify, and distribute this software in accordance with the terms of the license.
 
-## Support My Work
+### Support My Work
 
 If you find my work useful and want to support continued development, you can donate here:
 
