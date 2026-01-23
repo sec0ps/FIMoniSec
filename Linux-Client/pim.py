@@ -45,20 +45,6 @@ import pwd
 import socket
 from datetime import datetime
 
-# New imports for ML and analysis
-import numpy as np  # For numerical operations
-import pandas as pd  # For data manipulation
-from sklearn.ensemble import IsolationForest  # For anomaly detection
-
-try:
-    import numpy as np
-    import pandas as pd
-    from sklearn.ensemble import IsolationForest
-    ML_LIBRARIES_AVAILABLE = True
-except ImportError:
-    print("[WARNING] Machine learning libraries (numpy, pandas, scikit-learn) not found. ML-based detection will be disabled.")
-    ML_LIBRARIES_AVAILABLE = False
-
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -289,8 +275,7 @@ def get_process_hash(exe_path, cmdline=None):
 
 def monitor_proc_events(interval=2, use_initial_baseline=False):
     """
-    Enhanced monitoring loop with real-time detection, integrity tracking,
-    ML anomaly detection, and MITRE ATT&CK mapping.
+    Enhanced monitoring loop with real-time detection and integrity tracking.
     Combines event-driven detection with periodic full scans for accuracy.
     """
     import pyinotify
@@ -300,12 +285,6 @@ def monitor_proc_events(interval=2, use_initial_baseline=False):
     all_known_processes = INITIAL_BASELINE.copy() if use_initial_baseline and 'INITIAL_BASELINE' in globals() else {}
     detection_history = {}
     alerted_processes = set()
-
-    # ML baseline phase
-    ml_model_info = None
-    ml_baseline_counter = 0
-    ml_baseline_cycles = 300  # ~10 minutes at 2s intervals
-    establishing_ml_baseline = True
 
     # Event handler for real-time process creation/termination
     class ProcessEventHandler(pyinotify.ProcessEvent):
@@ -339,7 +318,9 @@ def monitor_proc_events(interval=2, use_initial_baseline=False):
     threading.Thread(target=start_inotify, daemon=True).start()
     print("[INFO] Real-time process monitoring started...")
 
-    # Main loop for periodic scans and ML analysis
+    iteration_counter = 0
+
+    # Main loop for periodic scans
     while True:
         try:
             # Enumerate all processes and listening services
@@ -369,46 +350,36 @@ def monitor_proc_events(interval=2, use_initial_baseline=False):
                 log_pim_event("PROCESS_TERMINATED", h, info, None)
                 remove_process_tracking(h)
 
-            # ML baseline and anomaly detection
-            if establishing_ml_baseline:
-                ml_baseline_counter += 1
-                if ml_baseline_counter >= ml_baseline_cycles:
-                    establishing_ml_baseline = False
-                    ml_model_info = implement_behavioral_baselining()
-                    if ml_model_info and ml_model_info.get("model"):
-                        print("[INFO] ML model trained successfully.")
-                    else:
-                        print("[WARNING] ML model training failed.")
-            else:
-                if ml_model_info and ml_model_info.get("model"):
-                    for h, info in current_processes.items():
-                        if h in alerted_processes:
-                            continue
-                        detection_events = []
-                        # Memory scan for code injection
-                        suspicious_memory = scan_process_memory(info["pid"])
-                        if suspicious_memory:
-                            detection_events.append({"event_type": "SUSPICIOUS_MEMORY_REGION", "details": suspicious_memory})
-                        # Behavioral anomaly detection
-                        behavioral_patterns = analyze_process_for_anomalies(info["pid"], info)
-                        if behavioral_patterns:
-                            detection_events.append({"event_type": "SUSPICIOUS_BEHAVIOR", "details": behavioral_patterns})
-                        # ML anomaly detection
-                        prediction, anomaly_score = predict_ml_anomaly(info, ml_model_info)
-                        if prediction == -1 and anomaly_score < -0.1:
-                            detection_events.append({"event_type": "ML_DETECTED_ANOMALY", "details": {"anomaly_score": anomaly_score}})
-                        # Log detections
-                        if detection_events:
-                            threat_assessment = calculate_threat_score(info, detection_events)
-                            for event in detection_events:
-                                mitre_info = classify_by_mitre_attck(event["event_type"], info, event.get("details"))
-                                log_pim_event(event["event_type"], h, None, {
-                                    "process_info": info,
-                                    "detection_details": event.get("details", {}),
-                                    "mitre_mapping": mitre_info,
-                                    "threat_assessment": threat_assessment
-                                })
-                            alerted_processes.add(h)
+            # Security checks for active processes
+            for h, info in current_processes.items():
+                if h in alerted_processes:
+                    continue
+
+                detection_events = []
+
+                # Memory scan for code injection (prioritize listening processes)
+                if info.get("is_listening", False):
+                    suspicious_memory = scan_process_memory(info["pid"])
+                    if suspicious_memory:
+                        detection_events.append({"event_type": "SUSPICIOUS_MEMORY_REGION", "details": suspicious_memory})
+
+                # Log detections
+                if detection_events:
+                    threat_assessment = calculate_threat_score(info, detection_events)
+                    for event in detection_events:
+                        mitre_info = classify_by_mitre_attck(event["event_type"], info, event.get("details"))
+                        log_pim_event(event["event_type"], h, None, {
+                            "process_info": info,
+                            "detection_details": event.get("details", {}),
+                            "mitre_mapping": mitre_info,
+                            "threat_assessment": threat_assessment
+                        })
+                    alerted_processes.add(h)
+
+            # Periodic cleanup
+            iteration_counter += 1
+            if iteration_counter % 10000 == 0:
+                alerted_processes.clear()
 
             # Update baseline
             all_known_processes = current_processes.copy()
@@ -589,7 +560,7 @@ def log_pim_event(event_type, process_hash, previous_metadata=None, new_metadata
     
     # Only print alerts for significant events
     significant_event = (
-        event_type in ["NEW_PROCESS", "PROCESS_TERMINATED", "SUSPICIOUS_MEMORY_REGION", "ML_DETECTED_ANOMALY"] or
+        event_type in ["NEW_PROCESS", "PROCESS_TERMINATED", "SUSPICIOUS_MEMORY_REGION"] or
         (event_type == "PROCESS_MODIFIED" and changes_description)
     )
     
@@ -624,150 +595,6 @@ def cleanup_tracking_sets():
     LOGGED_EVENTS["new_process"].clear()
     LOGGED_EVENTS["listening_process"].clear()
     LOGGED_EVENTS["terminated"].clear()
-
-def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
-
-    global LOGGED_EVENTS
-
-    # Load initial baseline
-    all_known_processes = INITIAL_BASELINE.copy() if use_initial_baseline and 'INITIAL_BASELINE' in globals() else load_process_metadata()
-    print(f"[INFO] Loaded process metadata with {len(all_known_processes)} processes")
-
-    # Initialize tracking sets
-    for process_hash in all_known_processes:
-        LOGGED_EVENTS["new_process"].add(process_hash)
-        if all_known_processes[process_hash].get("is_listening", False):
-            LOGGED_EVENTS["listening_process"].add(process_hash)
-
-    detection_history = {}
-    alerted_processes = set()
-
-    # ML baseline setup
-    ml_model_info = None
-    ml_baseline_counter = 0
-    ml_baseline_cycles = 300  # 10 minutes at 2-second intervals
-    establishing_ml_baseline = True
-
-    if all_known_processes:
-        first_run = False
-        print("[INFO] Using existing baseline - immediate alerting enabled")
-
-    first_iteration = first_run
-
-    while True:
-        try:
-            # Collect current processes
-            listening_processes = get_listening_processes()
-            non_listening_processes = get_all_processes()
-            current_all_processes = non_listening_processes.copy()
-            current_all_processes.update(listening_processes)
-
-            # Identify new and terminated processes
-            new_processes = {h: info for h, info in current_all_processes.items() if h not in all_known_processes}
-            terminated_processes = {h: info for h, info in all_known_processes.items() if h not in current_all_processes}
-
-            # Handle new processes
-            for process_hash, info in new_processes.items():
-                update_process_tracking(process_hash, info)
-                if not first_iteration:
-                    log_pim_event("NEW_PROCESS", process_hash, None, info)
-                    if info.get("is_listening"):
-                        log_pim_event("NEW_LISTENING_PROCESS", process_hash, None, info)
-
-            # Handle terminated processes
-            for process_hash, info in terminated_processes.items():
-                if not first_iteration:
-                    log_pim_event("PROCESS_TERMINATED", process_hash, info, None)
-                remove_process_tracking(process_hash)
-
-            # Handle modified processes or suspicious changes
-            for process_hash, current_info in current_all_processes.items():
-                previous_info = all_known_processes.get(process_hash)
-                if previous_info:
-                    significant_fields = ["exe_path", "process_name", "port", "cmdline"]
-                    changes = {}
-                    for field in significant_fields:
-                        if previous_info.get(field) != current_info.get(field):
-                            changes[field] = {
-                                "previous": previous_info.get(field),
-                                "current": current_info.get(field)
-                            }
-
-                    if changes:
-                        log_pim_event("PROCESS_MODIFIED", process_hash, previous_info, current_info)
-                        update_process_tracking(process_hash, current_info)
-
-                        # Flag questionable processes: same hash but different exe_path or name
-                        if previous_info.get("hash") == current_info.get("hash") and (
-                            previous_info.get("exe_path") != current_info.get("exe_path") or
-                            previous_info.get("process_name") != current_info.get("process_name")
-                        ):
-                            print(f"[ALERT] QUESTIONABLE PROCESS: Same hash but renamed binary detected!")
-                            log_pim_event("QUESTIONABLE_PROCESS", process_hash, previous_info, current_info)
-
-            # ML baseline logic
-            if establishing_ml_baseline:
-                ml_baseline_counter += 1
-                if ml_baseline_counter >= ml_baseline_cycles:
-                    establishing_ml_baseline = False
-                    ml_model_info = implement_behavioral_baselining()
-                    if ml_model_info and ml_model_info.get("model"):
-                        print("[INFO] ML model trained successfully.")
-                    else:
-                        print("[WARNING] ML model training failed.")
-            else:
-                # ML anomaly detection logic
-                for process_hash, info in current_all_processes.items():
-                    if process_hash in alerted_processes:
-                        continue
-                    detection_events = []
-
-                    # Memory scan for code injection
-                    if info.get("is_listening", False):
-                        suspicious_memory = scan_process_memory(info["pid"])
-                        if suspicious_memory:
-                            detection_events.append({"event_type": "SUSPICIOUS_MEMORY_REGION", "details": suspicious_memory})
-
-                    # Behavioral anomaly detection
-                    behavioral_patterns = analyze_process_for_anomalies(info["pid"], info)
-                    if behavioral_patterns:
-                        detection_events.append({"event_type": "SUSPICIOUS_BEHAVIOR", "details": behavioral_patterns})
-
-                    # ML anomaly detection
-                    if ml_model_info and ml_model_info.get("model"):
-                        prediction, anomaly_score = predict_ml_anomaly(info, ml_model_info)
-                        if prediction == -1 and anomaly_score < -0.1:
-                            detection_events.append({"event_type": "ML_DETECTED_ANOMALY", "details": {"anomaly_score": anomaly_score}})
-
-                    # Log detections
-                    if detection_events:
-                        threat_assessment = calculate_threat_score(info, detection_events)
-                        for event in detection_events:
-                            mitre_info = classify_by_mitre_attck(event["event_type"], info, event.get("details"))
-                            log_pim_event(event["event_type"], process_hash, None, {
-                                "process_info": info,
-                                "detection_details": event.get("details", {}),
-                                "mitre_mapping": mitre_info,
-                                "threat_assessment": threat_assessment
-                            })
-                        alerted_processes.add(process_hash)
-
-            # Periodic cleanup of tracking sets
-            if ml_baseline_counter % 10000 == 0 and ml_baseline_counter > 0:
-                LOGGED_EVENTS["terminated"].clear()
-                LOGGED_EVENTS["new_process"] = {p for p in LOGGED_EVENTS["new_process"] if p not in LOGGED_EVENTS["terminated"]}
-                LOGGED_EVENTS["listening_process"] = {p for p in LOGGED_EVENTS["listening_process"] if p not in LOGGED_EVENTS["terminated"]}
-
-            # Update baseline for next iteration
-            all_known_processes = current_all_processes.copy()
-            first_iteration = False
-            ml_baseline_counter += 1
-            time.sleep(interval)
-
-        except Exception as e:
-            print(f"[ERROR] Exception in monitoring loop: {e}")
-            traceback.print_exc()
-            time.sleep(interval)
 
 def create_baseline():
     """Create an initial baseline of all processes and services with enriched metadata."""
@@ -903,132 +730,6 @@ def resolve_lineage(pid):
             lineage[0] = f"{lineage[0]}:system"
     
     return lineage
-
-def implement_behavioral_baselining():
-    """Implement ML-based behavioral baselining for process activity."""
-    from sklearn.ensemble import IsolationForest
-    import numpy as np
-    import pandas as pd
-    
-    # Define system processes that should have special treatment
-    system_processes = ["systemd", "init", "sshd", "cron", "rsyslogd"]
-    
-    # Collect historical process behavior data
-    processes_data = []
-    integrity_state = load_process_metadata()
-    
-    for process_hash, process in integrity_state.items():
-        process_name = process.get("process_name", "")
-        pid = process.get("pid", 0)
-        
-        # Skip system processes in the training data (to prevent them from affecting the model)
-        if process_name in system_processes and process_name == "systemd" and pid == 1:
-            continue
-            
-        # Extract features
-        try:
-            features = {
-                'pid': pid,
-                'port': int(process.get('port', 0)) if isinstance(process.get('port', 0), (int, str)) and str(process.get('port', 0)).isdigit() else 0,
-                'lineage_length': len(process.get('lineage', [])),
-                'cmdline_length': len(process.get('cmdline', '')),
-                'user_is_root': 1 if process.get('user') == 'root' else 0,
-                'child_processes': get_child_process_count(pid) if pid > 0 else 0
-            }
-            
-            # Add memory usage as a feature
-            mem_usage = get_process_memory_usage(pid) if pid > 0 else None
-            if mem_usage:
-                features['memory_usage'] = mem_usage
-                
-            # Add open file descriptor count
-            fd_count = get_open_fd_count(pid) if pid > 0 else None
-            if fd_count:
-                features['fd_count'] = fd_count
-                
-            processes_data.append(features)
-        except Exception as e:
-            print(f"[ERROR] Error extracting features for process {process_name} (Hash: {process_hash}): {e}")
-    
-    # Return empty model info if not enough data
-    if len(processes_data) < 5:
-        return {
-            'model': None,
-            'features': [],
-            'system_processes': system_processes
-        }
-    
-    # Create dataframe and train model
-    df = pd.DataFrame(processes_data)
-    numerical_features = [col for col in df.columns if col != 'pid' and df[col].dtype in [np.int64, np.float64]]
-    
-    # Train isolation forest
-    model = IsolationForest(contamination=0.1, random_state=42)
-    model.fit(df[numerical_features])
-    
-    # Store model info
-    model_info = {
-        'model': model,
-        'features': numerical_features,
-        'system_processes': system_processes
-    }
-    
-    return model_info
-
-def analyze_process_for_anomalies(pid, info):
-    """Analyze a process for anomalies using ML techniques."""
-    # Skip certain system processes
-    if info.get('process_name') == 'systemd' and pid == 1:
-        return None
-        
-    try:
-        # Extract features for anomaly detection
-        features = {
-            'port': int(info.get('port', 0)) if isinstance(info.get('port', 0), (int, str)) and str(info.get('port', 0)).isdigit() else 0,
-            'lineage_length': len(info.get('lineage', [])),
-            'cmdline_length': len(info.get('cmdline', '')),
-            'user_is_root': 1 if info.get('user') == 'root' else 0,
-            'child_processes': get_child_process_count(pid),
-            'fd_count': get_open_fd_count(pid) 
-        }
-        
-        mem_usage = get_process_memory_usage(pid)
-        if mem_usage:
-            features['memory_usage'] = mem_usage
-            
-        # Check for suspicious patterns through lineage
-        lineage = info.get('lineage', [])
-        shell_in_lineage = any(shell in lineage for shell in ['bash', 'sh', 'dash', 'zsh'])
-        unexpected_execution = shell_in_lineage and any(x in info.get('process_name', '').lower() for x in ['apache', 'nginx', 'httpd'])
-        
-        suspicious_patterns = []
-        
-        # Check if running from unusual directory
-        exe_path = info.get('exe_path', '')
-        non_standard_dirs = ["/tmp", "/dev/shm", "/var/tmp", "/run/", "/dev/", "/mnt/"]
-        for unusual_dir in non_standard_dirs:
-            if unusual_dir in exe_path:
-                suspicious_patterns.append(f"Running from unusual directory: {unusual_dir}")
-                break
-        
-        # REMOVED: Static port check
-        # We no longer check for unusual ports based on static values
-        
-        # Check for unexpected shell in lineage for server process
-        if unexpected_execution:
-            suspicious_patterns.append(f"Unusual process ancestry for {info.get('process_name')}: includes shell")
-        
-        # Return results if any suspicious patterns found
-        if suspicious_patterns:
-            return {
-                "suspicious_patterns": suspicious_patterns,
-                "features": features
-            }
-        
-        return None
-    except Exception as e:
-        print(f"[ERROR] Error analyzing process {pid} for anomalies: {e}")
-        return None
         
 def get_process_memory_usage(pid):
     """Get memory usage of a process in KB."""
@@ -1223,23 +924,6 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             {
                 "technique_id": "T1036.005",
                 "technique_name": "Masquerading: Match Legitimate Name or Location",
-                "tactic": "Defense Evasion"
-            }
-        ],
-        "ML_DETECTED_ANOMALY": [
-            {
-                "technique_id": "T1036",
-                "technique_name": "Masquerading",
-                "tactic": "Defense Evasion"
-            },
-            {
-                "technique_id": "T1059",
-                "technique_name": "Command and Scripting Interpreter",
-                "tactic": "Execution"
-            },
-            {
-                "technique_id": "T1562",
-                "technique_name": "Impair Defenses",
                 "tactic": "Defense Evasion"
             }
         ],
@@ -1625,22 +1309,6 @@ def calculate_threat_score(process_info, detection_events):
                 if isinstance(region, dict) and region.get("severity") == "high":
                     base_score += 15  # Extra points for high severity memory issues
             reasons.append("Suspicious memory regions detected")
-            
-        elif event_type == "ML_DETECTED_ANOMALY":
-            # Score based on anomaly score
-            details = event.get("details", {})
-            anomaly_score = details.get("anomaly_score", 0)
-            
-            # More severe anomalies get higher scores
-            if anomaly_score < -0.5:
-                base_score += 35
-                reasons.append(f"Severe behavioral anomaly detected (score: {anomaly_score:.2f})")
-            elif anomaly_score < -0.2:
-                base_score += 20
-                reasons.append(f"Moderate behavioral anomaly detected (score: {anomaly_score:.2f})")
-            else:
-                base_score += 10
-                reasons.append(f"Mild behavioral anomaly detected (score: {anomaly_score:.2f})")
                 
         elif event_type == "SUSPICIOUS_BEHAVIOR":
             patterns = event.get("details", {}).get("patterns", [])
@@ -2084,12 +1752,6 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
         "terminated": set()            # Track terminated processes already logged
     }
     
-    # ML baseline establishment phase - separate from core PIM functionality
-    ml_model_info = None
-    ml_baseline_counter = 0
-    ml_baseline_cycles = 300  # 10 minutes (at 2 second intervals)
-    establishing_ml_baseline = True
-    
     # CRITICAL FIX: If baseline exists, we should NOT be in first_run mode
     # This ensures alerts start immediately when a baseline already exists
     if use_initial_baseline and all_known_processes:
@@ -2098,12 +1760,6 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
     
     # Initialize first_iteration based on first_run parameter
     first_iteration = first_run
-    
-    if establishing_ml_baseline:
-        print("[INFO] Starting immediate process monitoring")
-        print("[INFO] ML behavioral analysis will begin after 10 minutes of data collection")
-    else:
-        print("[INFO] Starting process monitoring with ML-based detection...")
     
     # Track the PIDs we've seen as listening
     seen_listening_pids = set()
@@ -2432,7 +2088,6 @@ Description:
     - New or terminated processes
     - Process modifications (user, command line, etc.)
     - Suspicious memory regions (e.g., shellcode injection)
-    - Anomalous behavior using machine learning
     - Classification of suspicious activity using MITRE ATT&CK framework
 
 Note:
