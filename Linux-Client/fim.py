@@ -225,7 +225,68 @@ def load_config():
             print("[ERROR] Invalid JSON format in fim.config. Creating a new default config...")
             create_default_config()  # Create default config if JSON is invalid
             return load_config()  # Reload the default config
-            
+
+def create_default_config():
+    """Create a default configuration file."""
+    default_config = {
+        "scheduled_scan": {
+            "directories": [
+                "/etc",
+                "/var/www"
+            ],
+            "scan_interval": 300
+        },
+        "real_time_monitoring": {
+            "directories": [
+                "/etc",
+                "/var/www"
+            ]
+        },
+        "exclusions": {
+            "directories": [
+                "/proc",
+                "/sys",
+                "/dev",
+                "/run",
+                "/var/log",
+                "/var/cache"
+            ],
+            "files": [],
+            "patterns": [
+                "*.log",
+                "*.tmp",
+                "*.swp",
+                "*.bak"
+            ],
+            "extensions": [
+                ".log",
+                ".tmp",
+                ".swp",
+                ".pid",
+                ".lock"
+            ],
+            "max_size": 104857600
+        },
+        "siem_settings": {
+            "enabled": False,
+            "siem_type": "none",
+            "host": "",
+            "port": 514,
+            "protocol": "udp"
+        },
+        "performance": {
+            "worker_threads": 4
+        }
+    }
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(default_config, f, indent=4)
+
+    print(f"[INFO] Created default configuration file: {CONFIG_FILE}")
+
 def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None, changes=None, old_path=None):
     """Log file change events with exact details of what changed."""
     global integrity_state, is_baseline_mode
