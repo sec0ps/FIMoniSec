@@ -35,23 +35,18 @@ import sys
 import argparse
 import daemon
 import signal
-import math
 import re
 import difflib
 import subprocess
-import stat
 import shutil
 import pyinotify
-import psutil
-from collections import defaultdict, Counter
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
-from daemon import DaemonContext
 from pathlib import Path
 
 is_baseline_mode = False
-adv_content_analysis = None
 exclusions = {}
+integrity_state = {}
 
 BASE_DIR = "/opt/FIMoniSec/Linux-Client"
 CONFIG_FILE = os.path.join(BASE_DIR, "fim.config")
@@ -234,15 +229,15 @@ def load_config():
 def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, previous_hash=None, new_hash=None, changes=None, old_path=None):
     """Log file change events with exact details of what changed."""
     global integrity_state, is_baseline_mode
-    
+
     # Skip alerts during baseline mode
     if is_baseline_mode:
         return None
-    
+
     # Get MITRE ATT&CK mapping
     mitre_mapping = get_mitre_mapping(event_type, file_path, changes)
-    
-    # Create simplified log entry
+
+    # Create log entry
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "log_type": "FIM",
@@ -250,81 +245,67 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
         "file_path": file_path,
         "mitre_mapping": mitre_mapping
     }
-    
+
     # Add original path for moved files
     if event_type == "MOVED" and old_path:
         log_entry["old_path"] = old_path
-    
+
     # Add hash information if available
     if previous_hash:
         log_entry["previous_hash"] = previous_hash
     if new_hash:
         log_entry["new_hash"] = new_hash
-    
+
     # Add metadata changes if available
     if changes:
         log_entry["changes"] = changes
-    
+
     # Enhanced logging for config file changes
-    # Process both MODIFIED and METADATA_CHANGED events for config files
-    if (event_type == "MODIFIED" or event_type == "METADATA_CHANGED") and is_config_file(file_path):
-        # Get config diff
+    if event_type in ["MODIFIED", "METADATA_CHANGED"] and is_config_file(file_path):
         config_diff = get_config_diff(file_path)
-        
-        # Add diff to log entry if available
         if config_diff:
             log_entry["config_changes"] = {
                 "diff": config_diff[:20]  # Limit to 20 lines
             }
-    
+
     # Write to log file
     with open(LOG_FILE, "a") as log:
         log.write(json.dumps(log_entry, indent=4) + "\n")
-    
-    # Print simplified alert
+
+    # Print alert
     mitre_id = mitre_mapping.get("technique_id", "Unknown")
     mitre_name = mitre_mapping.get("technique_name", "Unknown")
     mitre_tactic = mitre_mapping.get("tactic", "Unknown")
-    
+
     # Format changes text
     changes_text = ""
     if event_type == "METADATA_CHANGED" and changes:
-        change_items = []
-        for change_type, details in changes.items():
-            change_items.append(change_type)
+        change_items = list(changes.keys())
         if change_items:
             changes_text = f" ({', '.join(change_items)})"
-    
-    # Print a single line alert based on event type
+
+    # Print alert based on event type
     if event_type == "NEW FILE":
         print(f"[NEW FILE] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
         if is_config_file(file_path):
-            backup_config_file(file_path)  # Backup new config files immediately
+            backup_config_file(file_path)
     elif event_type == "DELETED":
         print(f"[DELETED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
     elif event_type == "MODIFIED":
         print(f"[MODIFIED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
-        # Print config changes if available
         if "config_changes" in log_entry and "diff" in log_entry["config_changes"]:
             print(f"[CONFIG CHANGES for {file_path}]:")
-            for diff_line in log_entry["config_changes"]["diff"][:5]:  # Show first 5 lines only
+            for diff_line in log_entry["config_changes"]["diff"][:5]:
                 print(f"  {diff_line}")
             if len(log_entry["config_changes"]["diff"]) > 5:
                 print(f"  ... and {len(log_entry['config_changes']['diff']) - 5} more changes")
     elif event_type == "METADATA_CHANGED":
         print(f"[METADATA] {file_path}{changes_text} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
-        # Print config changes if available for metadata changes too
-        if "config_changes" in log_entry and "diff" in log_entry["config_changes"]:
-            print(f"[CONFIG CHANGES for {file_path}]:")
-            for diff_line in log_entry["config_changes"]["diff"][:5]:  # Show first 5 lines only
-                print(f"  {diff_line}")
-            if len(log_entry["config_changes"]["diff"]) > 5:
-                print(f"  ... and {len(log_entry['config_changes']['diff']) - 5} more changes")
     elif event_type == "MOVED":
         print(f"[MOVED] {old_path} -> {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
         if is_config_file(file_path):
-            backup_config_file(file_path)  # Backup moved config files
-    
+            backup_config_file(file_path)
+
     return log_entry
 
 def process_file(filepath, integrity_state):
@@ -925,57 +906,6 @@ def detect_moved_file(file_hash, metadata, new_path):
     # No match found
     return None
 
-def correlate_with_processes(file_path, event_type):
-    """Correlate file changes with process activity."""
-    pim_data_file = os.path.join(OUTPUT_DIR, "integrity_processes.json")
-    correlation = {}
-    
-    if not os.path.exists(pim_data_file):
-        return None
-    
-    try:
-        with open(pim_data_file, "r") as f:
-            processes = json.load(f)
-            
-        # Find processes that might be responsible for the file change
-        for pid, process_info in processes.items():
-            # Check if the process has accessed this file or its directory
-            cmdline = process_info.get("cmdline", "").lower()
-            exe_path = process_info.get("exe_path", "").lower()
-            file_path_lower = file_path.lower()
-            file_dir_lower = os.path.dirname(file_path).lower()
-            
-            is_related = False
-            
-            # Check if file path appears in command line
-            if file_path_lower in cmdline or file_dir_lower in cmdline:
-                is_related = True
-                
-            # Check common write patterns
-            if any(pattern in cmdline for pattern in ["> " + file_path_lower, ">> " + file_path_lower, 
-                                                    "tee " + file_path_lower, "echo", "cat"]):
-                is_related = True
-            
-            # Special handling for common tools that modify files
-            common_tools = ["vi", "vim", "nano", "emacs", "gedit", "sed", "awk", "perl", "python", "bash"]
-            if process_info.get("process_name", "").lower() in common_tools and file_path_lower in cmdline:
-                is_related = True
-                
-            if is_related:
-                correlation["related_process"] = {
-                    "pid": pid,
-                    "process_name": process_info.get("process_name", "unknown"),
-                    "cmdline": process_info.get("cmdline", ""),
-                    "user": process_info.get("user", "unknown"),
-                    "start_time": process_info.get("start_time", "unknown")
-                }
-                break
-                
-        return correlation if correlation else None
-    except Exception as e:
-        print(f"[ERROR] Failed to correlate with processes: {e}")
-        return None
-
 def stop_daemon():
     """Stop the daemon process cleanly."""
     if os.path.exists(PID_FILE):
@@ -997,14 +927,14 @@ def parse_arguments():
 
 def run_monitor():
     """Run the file monitoring process with real-time monitoring and scheduled scans."""
-    global is_baseline_mode, integrity_state, exclusions, adv_content_analysis
-    
+    global is_baseline_mode, integrity_state, exclusions
+
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
     # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
-    signal.signal(signal.SIGTERM, handle_shutdown)  # kill <pid>
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
     config = load_config()
     scheduled_scan = config.get("scheduled_scan", {})
@@ -1012,29 +942,22 @@ def run_monitor():
     exclusions = config.get("exclusions", {})
 
     scheduled_directories = scheduled_scan.get("directories", [])
-    scan_interval = scheduled_scan.get("scan_interval", 300)  # Default scan interval
+    scan_interval = scheduled_scan.get("scan_interval", 300)
     real_time_directories = real_time_monitoring.get("directories", [])
 
     if not scheduled_directories and not real_time_directories:
         print("[ERROR] No directories specified for monitoring. Exiting.")
         handle_shutdown()
 
-    # Ensure enhanced_fim configuration exists
-    config = ensure_enhanced_config()
-    
     # Check if this is an initial baseline run
     is_baseline_mode = not os.path.exists(INTEGRITY_STATE_FILE) or os.path.getsize(INTEGRITY_STATE_FILE) <= 2
-    
+
     if is_baseline_mode:
         print("\n[INFO] INITIAL BASELINE MODE - Creating baseline integrity state...")
         print("[INFO] No alerts will be generated until baseline is complete\n")
-    
+
     # Load initial integrity state
     integrity_state = load_integrity_state()
-    
-    # Initialize advanced content analysis
-    adv_content_analysis = AdvancedFileContentAnalysis(config.get('enhanced_fim', {}).get('content_analysis', {}))
-    print("[INFO] Advanced content analysis initialized")
 
     # Start real-time monitoring in a background thread
     if real_time_directories:
@@ -1048,11 +971,11 @@ def run_monitor():
             print("[INFO] Starting scheduled file scanning")
             # Run an initial scan
             generate_file_hashes(scheduled_directories, real_time_directories, exclusions, config)
-            
+
             # Then perform periodic scans
             scan_thread = Thread(target=scan_files, args=(scheduled_directories, scan_interval, exclusions), daemon=True)
             scan_thread.start()
-            
+
             # Keep main thread alive
             while True:
                 time.sleep(60)
@@ -1069,199 +992,50 @@ def run_monitor():
 ############################################################################################################
 
 def is_binary_file(file_path):
-    """Check if a file is likely binary based on extension or content sampling."""
+    """Check if a file is likely binary based on extension."""
     if not file_path or file_path == "N/A":
         return False
-        
-    binary_extensions = ['.exe', '.bin', '.o', '.so', '.dll', '.pyc', '.pyd', 
-                         '.jpg', '.jpeg', '.png', '.gif', '.mp3', '.mp4', '.zip', 
-                         '.tar', '.gz', '.bz2', '.xz', '.pdf']
-    
-    # Check extension first (faster)
-    if any(file_path.lower().endswith(ext) for ext in binary_extensions):
-        return True
-    
-    # If file exists, try reading first few bytes
-    try:
-        if os.path.exists(file_path) and os.path.isfile(file_path):
-            with open(file_path, 'rb') as f:
-                sample = f.read(1024)
-                # Heuristic: If more than 30% non-printable/control chars, likely binary
-                non_printable = sum(1 for b in sample if b < 32 and b != 9 and b != 10 and b != 13)
-                if non_printable > len(sample) * 0.3:
-                    return True
-    except:
-        pass
-            
-    return False
+
+    binary_extensions = [
+        '.exe', '.bin', '.o', '.so', '.dll', '.pyc', '.pyd',
+        '.jpg', '.jpeg', '.png', '.gif', '.webp', '.ico',
+        '.mp3', '.mp4', '.avi', '.mkv', '.wav', '.flac',
+        '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx',
+        '.deb', '.rpm', '.iso', '.img'
+    ]
+
+    return any(file_path.lower().endswith(ext) for ext in binary_extensions)
 
 def is_config_file(file_path):
-    """
-    Check if a file is likely a configuration file based on monitored directories
-    and file characteristics. 
-    Returns True if it's a config file, False otherwise.
-    """
+    """Check if a file is a configuration file."""
     if not file_path or file_path == "N/A":
         return False
-    
-    # Load the configuration to get monitored directories
-    config = load_config()
-    scheduled_dirs = config.get("scheduled_scan", {}).get("directories", [])
-    real_time_dirs = config.get("real_time_monitoring", {}).get("directories", [])
-    excluded_dirs = config.get("exclusions", {}).get("directories", [])
-    
-    # Combine all monitored directories
-    monitored_dirs = scheduled_dirs + real_time_dirs
-    
-    # Check if the file is in a monitored directory
-    in_monitored_dir = False
-    for directory in monitored_dirs:
-        if file_path.startswith(directory):
-            # Make sure it's not in an excluded directory
-            if not any(file_path.startswith(excluded) for excluded in excluded_dirs):
-                in_monitored_dir = True
-                break
-    
-    if not in_monitored_dir:
+
+    # Skip binary files
+    if is_binary_file(file_path):
         return False
-    
-    # Explicitly exclude archive and compressed files
-    archive_extensions = [
-        '.gz', '.zip', '.tar', '.tgz', '.bz2', '.xz', '.7z', '.rar', 
-        '.deb', '.rpm', '.iso', '.img', '.bin', '.jar', '.war'
-    ]
-    
-    if any(file_path.lower().endswith(ext) for ext in archive_extensions):
-        return False
-    
-    # Define config file extensions and patterns
+
+    # Config file extensions
     config_extensions = ['.conf', '.cfg', '.ini', '.json', '.yaml', '.yml', '.xml', '.properties']
-    config_patterns = ['config', 'conf', 'settings', '.rc', '_config']
-    
     file_path_lower = file_path.lower()
-    file_name = os.path.basename(file_path_lower)
-    
-    # Check extensions first (most reliable)
-    has_config_ext = any(file_path_lower.endswith(ext) for ext in config_extensions)
-    # Check for *_config pattern in filename
-    ends_with_config = file_name.endswith('_config')
-    
-    if has_config_ext or ends_with_config:
-        # Even if it has a config extension, make sure it's not a binary
-        try:
-            with open(file_path, 'rb') as f:
-                header = f.read(512)
-                
-            # Skip empty files
-            if not header:
-                return False
-                
-            # Check for binary signatures and common compressed file signatures
-            if (header.startswith(b'\x7fELF') or 
-                header.startswith(b'MZ') or 
-                header.startswith(b'\x1f\x8b') or  # gzip
-                header.startswith(b'PK\x03\x04') or  # zip
-                header.startswith(b'BZh') or  # bz2
-                header.startswith(b'\xFD\x37\x7A\x58\x5A\x00')):  # xz
-                return False
-                
-        except (IOError, OSError, PermissionError):
-            # If we can't read the file, be cautious
-            pass
-            
+
+    # Check by extension
+    if any(file_path_lower.endswith(ext) for ext in config_extensions):
         return True
-    
-    # Special case for /etc directory - most files here are configs
+
+    # Files in /etc are typically configs
     if file_path.startswith('/etc/'):
-        # Exclude known non-config files in /etc
+        # Exclude non-config patterns
         non_config_patterns = ['.cache', '.lock', '.socket', '.pid', '.placeholder']
         if not any(pattern in file_path_lower for pattern in non_config_patterns):
-            # Check if it's a binary
-            is_binary = False
-            try:
-                with open(file_path, 'rb') as f:
-                    header = f.read(512)
-                    
-                # Skip empty files
-                if not header:
-                    return False
-                    
-                # Check for binary signatures and compressed file signatures
-                if (header.startswith(b'\x7fELF') or 
-                    header.startswith(b'MZ') or 
-                    header.startswith(b'\x1f\x8b') or  # gzip
-                    header.startswith(b'PK\x03\x04') or  # zip
-                    header.startswith(b'BZh') or  # bz2
-                    header.startswith(b'\xFD\x37\x7A\x58\x5A\x00')):  # xz
-                    is_binary = True
-                else:
-                    # Count non-text characters
-                    text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7f})
-                    binary_chars = bytearray(set(range(256)) - set(text_chars))
-                    
-                    binary_count = len([b for b in header if b in binary_chars])
-                    if binary_count > 0 and len(header) > 0:  # Ensure we don't divide by zero
-                        if float(binary_count) / len(header) > 0.3:
-                            is_binary = True
-            except (IOError, OSError, PermissionError):
-                # If we can't read the file, skip it
-                return False
-                
-            # If it's not binary and is in /etc, it's likely a config
-            if not is_binary:
-                return True
-    
-    # For other directories, need both a config pattern and not be a binary
-    if any(pattern in file_path_lower for pattern in config_patterns):
-        # Check if it's a binary
-        try:
-            # Skip if not readable
-            if not os.path.exists(file_path) or not os.access(file_path, os.R_OK):
-                return False
-                
-            with open(file_path, 'rb') as f:
-                header = f.read(512)
-                
-            # Skip empty files
-            if not header:
-                return False
-                
-            # Binary file and compressed file checks
-            if (header.startswith(b'\x7fELF') or 
-                header.startswith(b'MZ') or 
-                header.startswith(b'\x1f\x8b') or  # gzip
-                header.startswith(b'PK\x03\x04') or  # zip
-                header.startswith(b'BZh') or  # bz2
-                header.startswith(b'\xFD\x37\x7A\x58\x5A\x00')):  # xz
-                return False
-                
-            # Count non-text characters
-            text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7f})
-            binary_chars = bytearray(set(range(256)) - set(text_chars))
-            
-            # Ensure we don't divide by zero
-            binary_count = len([b for b in header if b in binary_chars])
-            if binary_count > 0 and len(header) > 0:
-                # If >30% non-text chars, likely binary
-                if float(binary_count) / len(header) > 0.3:
-                    return False
-                
-            # If it's in /var/www and has "config" in the name, it's likely a config file
-            if file_path.startswith('/var/www/'):
-                return True
-                
-            # Apply more restrictive pattern matching for system directories
-            if file_path.startswith(('/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/')):
-                # For these directories, require the filename to be exactly "config" or end with ".conf" or "_config"
-                basename = os.path.basename(file_path)
-                return basename == "config" or basename.endswith(".conf") or basename.endswith("_config")
-                
-            # For all other monitored directories, accept any config pattern
             return True
-            
-        except (IOError, OSError, PermissionError):
-            return False
-    
+
+    # Check for common config naming patterns
+    file_name = os.path.basename(file_path_lower)
+    if file_name.endswith('_config') or file_name == 'config':
+        return True
+
     return False
 
 def get_config_diff(file_path):
@@ -1561,760 +1335,11 @@ def get_mitre_mapping(event_type, file_path, changes=None):
         "description": "Generic file manipulation"
     })
 
-def ensure_enhanced_config():
-    """Ensure the enhanced_fim section exists in the configuration file."""
-    config = load_config()
-    
-    # Check if enhanced_fim section exists
-    if 'enhanced_fim' not in config:
-        print("[INFO] Adding enhanced_fim configuration section...")
-        
-        # Add default enhanced_fim section
-        config['enhanced_fim'] = {
-            "enabled": True,
-            "environment": "production",
-            "performance": {
-                "system_load_threshold": 75,
-                "io_threshold": 80,
-                "worker_threads": 4
-            },
-            "content_analysis": {
-                "diff_threshold": 0.3,
-                "max_file_size": 10485760
-            }
-        }
-        
-        # Also update instructions if they exist
-        if 'instructions' in config:
-            config['instructions']['enhanced_fim'] = "Configure enhanced file integrity monitoring capabilities."
-        
-        # Save updated config
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=4)
-        
-        print("[INFO] Enhanced FIM configuration added to config file.")
-        
-    return config
-
-################## ADV ANALYSIS CODE #######################
-
-class AdvancedFileContentAnalysis:
-    def __init__(self, config=None):
-        self.config = config or {}
-        self.file_cache = {}  # Cache for file content
-        self.diff_threshold = self.config.get('diff_threshold', 0.3)  # Threshold for significant diffs
-        self.max_file_size = self.config.get('max_file_size', 10 * 1024 * 1024)  # 10MB max for content analysis
-        self.content_signatures = {}  # Store file content signatures
-        
-    def analyze_file_changes(self, file_path, previous_hash, new_hash):
-        """Analyze changes between file versions using diff and semantic analysis"""
-        if not os.path.exists(file_path):
-            return {'error': 'File not found'}
-            
-        # Check file size before processing
-        try:
-            file_size = os.path.getsize(file_path)
-            if file_size > self.max_file_size:
-                return {
-                    'analysis_type': 'size_only',
-                    'file_size': file_size,
-                    'too_large': True,
-                    'message': f"File too large for content analysis ({file_size} bytes)"
-                }
-        except OSError:
-            return {'error': 'Cannot access file'}
-        
-        # Determine file type
-        file_type = self.determine_file_type(file_path)
-        
-        # Select appropriate analysis method based on file type
-        if file_type == 'binary':
-            return self.analyze_binary_changes(file_path, previous_hash, new_hash)
-        elif file_type in ['config', 'script', 'text']:
-            return self.analyze_text_changes(file_path, previous_hash, new_hash, file_type)
-        else:
-            return {'analysis_type': 'hash_only', 'file_type': 'unknown'}
-    
-    def determine_file_type(self, file_path):
-        """Determine file type based on extension and content sampling"""
-        # Check by extension first
-        _, ext = os.path.splitext(file_path.lower())
-        
-        # Binary file extensions
-        binary_extensions = ['.exe', '.bin', '.o', '.so', '.dll', '.pyc', '.pyd', 
-                             '.jpg', '.jpeg', '.png', '.gif', '.mp3', '.mp4', '.zip', 
-                             '.tar', '.gz', '.bz2', '.xz', '.pdf']
-        
-        # Config file extensions
-        config_extensions = ['.conf', '.cfg', '.ini', '.json', '.yaml', '.yml', '.xml', '.properties']
-        
-        # Script file extensions
-        script_extensions = ['.sh', '.py', '.rb', '.pl', '.js', '.php', '.ps1', '.bat', '.cmd']
-        
-        # Text file extensions
-        text_extensions = ['.txt', '.md', '.log', '.csv', '.html', '.htm', '.css']
-        
-        if ext in binary_extensions:
-            return 'binary'
-        elif ext in config_extensions:
-            return 'config'
-        elif ext in script_extensions:
-            return 'script'
-        elif ext in text_extensions:
-            return 'text'
-        
-        # If extension doesn't give a clear answer, check content
-        try:
-            # Read first few KB to determine content type
-            with open(file_path, 'rb') as f:
-                content = f.read(4096)
-                
-            # Check for binary content
-            text_chars = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7f})
-            binary_chars = bytearray(set(range(256)) - set(text_chars))
-            
-            # If >30% non-text chars, likely binary
-            if float(len([b for b in content if b in binary_chars])) / len(content) > 0.3:
-                return 'binary'
-                
-            # Try to decode as text
-            try:
-                text_content = content.decode('utf-8')
-                
-                # Check for config patterns
-                if any(pattern in text_content for pattern in ['<config', '<?xml', '{', '[', 'config', 'setting']):
-                    return 'config'
-                
-                # Check for script patterns
-                if any(pattern in text_content for pattern in ['#!/', 'import ', 'function ', 'def ', 'class ']):
-                    return 'script'
-                    
-                # Default to text
-                return 'text'
-            except UnicodeDecodeError:
-                return 'binary'
-                
-        except (IOError, OSError):
-            # If we can't read the file, default to binary
-            return 'binary'
-    
-    def analyze_binary_changes(self, file_path, previous_hash, new_hash):
-        """Analyze changes in binary files using entropy and partial hashing"""
-        # For binary files, we focus on entropy analysis and segment hashing
-        try:
-            with open(file_path, 'rb') as f:
-                content = f.read()
-                
-            # Calculate entropy
-            entropy = self.calculate_entropy(content)
-            
-            # Calculate segment hashes (divide file into segments and hash each)
-            segment_size = min(4096, len(content) // 10) if len(content) > 0 else 0
-            segments = []
-            
-            if segment_size > 0:
-                for i in range(0, len(content), segment_size):
-                    segment = content[i:i + segment_size]
-                    segment_hash = hashlib.md5(segment).hexdigest()
-                    segments.append({
-                        'offset': i,
-                        'size': len(segment),
-                        'hash': segment_hash
-                    })
-            
-            # Check if we have a previous signature to compare against
-            diff_analysis = None
-            if previous_hash in self.content_signatures:
-                prev_sig = self.content_signatures[previous_hash]
-                diff_analysis = self.compare_binary_signatures(prev_sig, {
-                    'entropy': entropy,
-                    'segments': segments,
-                    'file_size': len(content)
-                })
-            
-            # Store current signature
-            self.content_signatures[new_hash] = {
-                'entropy': entropy,
-                'segments': segments,
-                'file_size': len(content)
-            }
-            
-            return {
-                'analysis_type': 'binary',
-                'file_size': len(content),
-                'entropy': entropy,
-                'segment_count': len(segments),
-                'diff_analysis': diff_analysis
-            }
-            
-        except (IOError, OSError):
-            return {'error': 'Cannot access file for binary analysis'}
-    
-    def calculate_entropy(self, data):
-        """Calculate Shannon entropy of binary data"""
-        if not data:
-            return 0
-            
-        entropy = 0
-        data_len = len(data)
-        if data_len == 0:  # Additional check to prevent division by zero
-            return 0
-            
-        # Count byte frequencies
-        counter = Counter(data)
-        
-        # Calculate entropy
-        for count in counter.values():
-            probability = count / data_len
-            if probability > 0:  # Prevent log(0) which is undefined
-                entropy -= probability * math.log2(probability)
-            
-        return entropy
-    
-    def compare_binary_signatures(self, old_sig, new_sig):
-        """Compare binary file signatures to identify changes"""
-        # Compare file sizes
-        old_size = old_sig.get('file_size', 0)
-        new_size = new_sig.get('file_size', 0)
-        size_delta = new_size - old_size
-        size_change_pct = (size_delta / old_size * 100) if old_size > 0 else float('inf')
-        
-        # Compare entropy
-        old_entropy = old_sig.get('entropy', 0)
-        new_entropy = new_sig.get('entropy', 0)
-        entropy_delta = new_entropy - old_entropy
-        
-        # Compare segments
-        old_segments = old_sig.get('segments', [])
-        new_segments = new_sig.get('segments', [])
-        
-        # Find matching segments
-        matching_segments = 0
-        modified_segments = 0
-        
-        # Map of segment offset to hash
-        old_segment_map = {seg['offset']: seg['hash'] for seg in old_segments}
-        new_segment_map = {seg['offset']: seg['hash'] for seg in new_segments}
-        
-        # Find common offsets
-        common_offsets = set(old_segment_map.keys()) & set(new_segment_map.keys())
-        
-        for offset in common_offsets:
-            if old_segment_map[offset] == new_segment_map[offset]:
-                matching_segments += 1
-            else:
-                modified_segments += 1
-        
-        # Calculate similarity
-        total_segments = len(old_segments)
-        similarity = matching_segments / total_segments if total_segments > 0 else 0
-        
-        # Analyze entropy change
-        is_encrypted = entropy_delta > 1.0 and new_entropy > 7.0
-        is_compressed = entropy_delta > 0.5 and size_delta < 0
-        is_decompressed = entropy_delta < -0.5 and size_delta > 0
-        
-        return {
-            'size_delta': size_delta,
-            'size_change_pct': size_change_pct,
-            'entropy_delta': entropy_delta,
-            'matching_segments': matching_segments,
-            'modified_segments': modified_segments,
-            'similarity': similarity,
-            'is_encrypted': is_encrypted,
-            'is_compressed': is_compressed,
-            'is_decompressed': is_decompressed,
-            'significant_change': similarity < 0.7
-        }
-    
-    def analyze_text_changes(self, file_path, previous_hash, new_hash, file_type):
-        """Analyze changes in text files using diff and semantic analysis"""
-        try:
-            # Read current file content
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                new_content = f.read()
-                
-            # Get old content if available
-            old_content = None
-            if previous_hash in self.file_cache:
-                old_content = self.file_cache[previous_hash]
-            
-            # Store new content in cache
-            self.file_cache[new_hash] = new_content
-            
-            # If we don't have the old content, we can only analyze current state
-            if old_content is None:
-                return self.analyze_text_content(new_content, file_type)
-            
-            # Get diff between versions
-            diff_result = self.compute_text_diff(old_content, new_content)
-            
-            # Combine with content analysis
-            content_analysis = self.analyze_text_content(new_content, file_type)
-            
-            # Special handling for different file types
-            type_specific = {}
-            
-            if file_type == 'config':
-                type_specific = self.analyze_config_changes(old_content, new_content)
-            elif file_type == 'script':
-                type_specific = self.analyze_script_changes(old_content, new_content)
-            
-            # Combine all analyses
-            result = {
-                'analysis_type': 'text',
-                'file_type': file_type,
-                'diff': diff_result,
-                'content': content_analysis
-            }
-            
-            if type_specific:
-                result['type_specific'] = type_specific
-                
-            return result
-            
-        except (IOError, OSError, UnicodeDecodeError) as e:
-            return {'error': f'Text analysis failed: {str(e)}'}
-    
-    def compute_text_diff(self, old_content, new_content):
-        """Compute diff between old and new content"""
-        # Split into lines
-        old_lines = old_content.splitlines()
-        new_lines = new_content.splitlines()
-        
-        # Get unified diff
-        diff = list(difflib.unified_diff(old_lines, new_lines, n=2))
-        
-        # Count additions and deletions
-        additions = len([line for line in diff if line.startswith('+')])
-        deletions = len([line for line in diff if line.startswith('-')])
-        
-        # Calculate similarity using difflib's SequenceMatcher
-        similarity = difflib.SequenceMatcher(None, old_content, new_content).ratio()
-        
-        # Get changed sections for more detailed analysis
-        changed_sections = []
-        diff_iter = iter(diff)
-        
-        # Skip the header lines
-        for _ in range(3):
-            next(diff_iter, None)
-        
-        current_section = {'context': [], 'additions': [], 'deletions': []}
-        
-        for line in diff_iter:
-            if line.startswith(' '):  # Context line
-                if current_section['additions'] or current_section['deletions']:
-                    changed_sections.append(current_section)
-                    current_section = {'context': [], 'additions': [], 'deletions': []}
-                current_section['context'].append(line[1:])
-            elif line.startswith('+'):  # Addition
-                current_section['additions'].append(line[1:])
-            elif line.startswith('-'):  # Deletion
-                current_section['deletions'].append(line[1:])
-        
-        # Add the last section if non-empty
-        if current_section['additions'] or current_section['deletions']:
-            changed_sections.append(current_section)
-        
-        return {
-            'additions': additions,
-            'deletions': deletions,
-            'similarity': similarity,
-            'changed_sections': changed_sections[:5],  # Limit to first 5 sections
-            'significant_change': similarity < self.diff_threshold
-        }
-    
-    def analyze_text_content(self, content, file_type):
-        """Analyze text content for patterns of interest"""
-        # Basic text statistics
-        line_count = content.count('\n') + 1
-        word_count = len(content.split())
-        char_count = len(content)
-        
-        # Look for patterns based on file type
-        patterns = {}
-        
-        if file_type == 'config':
-            patterns['ip_addresses'] = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', content)
-            patterns['urls'] = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', content)
-            patterns['uncommon_ports'] = re.findall(r'port\s*[=:]\s*(\d+)', content)
-        elif file_type == 'script':
-            patterns['functions'] = re.findall(r'function\s+(\w+)|def\s+(\w+)', content)
-            patterns['imports'] = re.findall(r'import\s+(\w+)|from\s+(\w+)', content)
-            patterns['suspicious_commands'] = re.findall(r'system\(|exec\(|eval\(|shell_exec|subprocess', content)
-        
-        return {
-            'line_count': line_count,
-            'word_count': word_count,
-            'char_count': char_count,
-            'patterns': patterns
-        }
-    
-    def analyze_config_changes(self, old_content, new_content):
-        """Special analysis for configuration files"""
-        # Try to detect config format
-        config_format = self.detect_config_format(new_content)
-        
-        if config_format == 'json':
-            return self.analyze_json_config(old_content, new_content)
-        elif config_format == 'ini':
-            return self.analyze_ini_config(old_content, new_content)
-        elif config_format == 'xml':
-            return self.analyze_xml_config(old_content, new_content)
-        else:
-            # Generic key-value extraction for unknown formats
-            old_settings = self.extract_generic_settings(old_content)
-            new_settings = self.extract_generic_settings(new_content)
-            return self.compare_settings(old_settings, new_settings)
-    
-    def detect_config_format(self, content):
-        """Detect configuration file format"""
-        # Check for JSON format
-        if content.strip().startswith('{') and content.strip().endswith('}'):
-            try:
-                json.loads(content)
-                return 'json'
-            except json.JSONDecodeError:
-                pass
-        
-        # Check for XML format
-        if content.strip().startswith('<') and content.strip().endswith('>'):
-            if '<?xml' in content or '<config' in content:
-                return 'xml'
-        
-        # Check for INI format
-        if '[' in content and ']' in content and '=' in content:
-            if re.search(r'^\s*\[[^\]]+\]', content, re.MULTILINE):
-                return 'ini'
-        
-        # Default to generic
-        return 'generic'
-    
-    def analyze_json_config(self, old_content, new_content):
-        """Analyze changes in JSON configuration files"""
-        try:
-            old_json = json.loads(old_content)
-            new_json = json.loads(new_content)
-            
-            # Flatten nested JSON for comparison
-            old_flat = self.flatten_json(old_json)
-            new_flat = self.flatten_json(new_json)
-            
-            return self.compare_settings(old_flat, new_flat)
-        except json.JSONDecodeError:
-            return {'error': 'Invalid JSON format'}
-    
-    def flatten_json(self, json_obj, prefix=''):
-        """Flatten nested JSON object into key-value pairs"""
-        flattened = {}
-        
-        if isinstance(json_obj, dict):
-            for k, v in json_obj.items():
-                key = f"{prefix}.{k}" if prefix else k
-                if isinstance(v, (dict, list)):
-                    flattened.update(self.flatten_json(v, key))
-                else:
-                    flattened[key] = str(v)
-        elif isinstance(json_obj, list):
-            for i, item in enumerate(json_obj):
-                key = f"{prefix}[{i}]"
-                if isinstance(item, (dict, list)):
-                    flattened.update(self.flatten_json(item, key))
-                else:
-                    flattened[key] = str(item)
-        else:
-            flattened[prefix] = str(json_obj)
-            
-        return flattened
-    
-    def analyze_ini_config(self, old_content, new_content):
-        """Analyze changes in INI configuration files"""
-        # Parse INI-style settings
-        old_settings = self.parse_ini_content(old_content)
-        new_settings = self.parse_ini_content(new_content)
-        
-        return self.compare_settings(old_settings, new_settings)
-    
-    def parse_ini_content(self, content):
-        """Parse INI-style configuration"""
-        settings = {}
-        current_section = 'DEFAULT'
-        
-        for line in content.splitlines():
-            line = line.strip()
-            
-            # Skip comments and empty lines
-            if not line or line.startswith(('#', ';')):
-                continue
-            
-            # Parse section headers
-            if line.startswith('[') and line.endswith(']'):
-                current_section = line[1:-1]
-                continue
-            
-            # Parse key-value pairs
-            if '=' in line:
-                key, value = line.split('=', 1)
-                settings[f"{current_section}.{key.strip()}"] = value.strip()
-        
-        return settings
-    
-    def analyze_xml_config(self, old_content, new_content):
-        """Analyze changes in XML configuration files"""
-        # Simple XML parsing
-        old_settings = self.extract_xml_settings(old_content)
-        new_settings = self.extract_xml_settings(new_content)
-        
-        return self.compare_settings(old_settings, new_settings)
-    
-    def extract_xml_settings(self, content):
-        """Extract settings from XML content using regex"""
-        settings = {}
-        
-        # Find all XML tags with values
-        tag_pattern = re.compile(r'<([^>/\s]+)[^>]*>(.*?)</\1>', re.DOTALL)
-        attribute_pattern = re.compile(r'(\w+)=["\'](.*?)["\']')
-        
-        for match in tag_pattern.finditer(content):
-            tag_name = match.group(1)
-            tag_value = match.group(2).strip()
-            
-            if tag_value:
-                settings[tag_name] = tag_value
-            
-            # Also extract attributes
-            tag_start = match.group(0)[:match.group(0).find('>')] # This line had an extra bracket
-            for attr_match in attribute_pattern.finditer(tag_start):
-                attr_name = attr_match.group(1)
-                attr_value = attr_match.group(2)
-                settings[f"{tag_name}.{attr_name}"] = attr_value
-        
-        return settings
-    
-    def extract_generic_settings(self, content):
-        """Extract key-value pairs from generic config content"""
-        settings = {}
-        
-        # Look for key-value patterns
-        patterns = [
-            r'(\w+)\s*[=:]\s*([^;#\n]+)',  # key=value or key: value
-            r'(-{1,2}\w+)\s+([^-][^;#\n]*)'  # --key value
-        ]
-        
-        for pattern in patterns:
-            for match in re.finditer(pattern, content):
-                key = match.group(1).strip()
-                value = match.group(2).strip()
-                settings[key] = value
-        
-        return settings
-    
-    def compare_settings(self, old_settings, new_settings):
-        """Compare settings between versions"""
-        # Find added, removed, and modified settings
-        old_keys = set(old_settings.keys())
-        new_keys = set(new_settings.keys())
-        
-        added_keys = new_keys - old_keys
-        removed_keys = old_keys - new_keys
-        common_keys = old_keys & new_keys
-        
-        modified_keys = {key for key in common_keys if old_settings[key] != new_settings[key]}
-        
-        # Collect changes
-        changes = {
-            'added': {key: new_settings[key] for key in added_keys},
-            'removed': {key: old_settings[key] for key in removed_keys},
-            'modified': {key: {'old': old_settings[key], 'new': new_settings[key]} for key in modified_keys}
-        }
-        
-        # Count changes
-        total_changes = len(added_keys) + len(removed_keys) + len(modified_keys)
-        
-        # Calculate criticality based on changes
-        criticality = 'low'
-        if total_changes > 10:
-            criticality = 'high'
-        elif total_changes > 5:
-            criticality = 'medium'
-        
-        return {
-            'format': 'config',
-            'changes': changes,
-            'total_changes': total_changes,
-            'criticality': criticality
-        }
-    
-    def analyze_script_changes(self, old_content, new_content):
-        """Analyze changes in script files for security implications"""
-        # Extract functions and imports from both versions
-        old_functions = set(re.findall(r'function\s+(\w+)|def\s+(\w+)', old_content))
-        new_functions = set(re.findall(r'function\s+(\w+)|def\s+(\w+)', new_content))
-        
-        old_imports = set(re.findall(r'import\s+(\w+)|from\s+(\w+)', old_content))
-        new_imports = set(re.findall(r'import\s+(\w+)|from\s+(\w+)', new_content))
-        
-        # Look for suspicious patterns
-        suspicious_patterns = {
-            'system_commands': r'system\s*\(|exec\s*\(|shell_exec|subprocess\..*call|os\.system',
-            'network_access': r'socket\.|urllib|requests\.|http\.|connect\s*\(',
-            'file_operations': r'open\s*\(|file\s*\(|read\s*\(|write\s*\(|unlink\s*\(',
-            'eval_code': r'eval\s*\(|exec\s*\(|execfile|compile\s*\(|__import__',
-            'privilege_escalation': r'sudo|su\s+|setuid|setgid|chmod\s+777|chown\s+root',
-            'data_exfiltration': r'base64\.|encode\s*\(|encrypt\s*\(|\.send\s*\('
-        }
-        
-        # Check for these patterns in new content
-        suspicious_matches = {}
-        for category, pattern in suspicious_patterns.items():
-            matches = re.findall(pattern, new_content)
-            if matches:
-                suspicious_matches[category] = matches
-        
-        # Compare functions and imports
-        added_functions = [f[0] or f[1] for f in new_functions - old_functions if any(f)]
-        removed_functions = [f[0] or f[1] for f in old_functions - new_functions if any(f)]
-        
-        added_imports = [i[0] or i[1] for i in new_imports - old_imports if any(i)]
-        removed_imports = [i[0] or i[1] for i in old_imports - new_imports if any(i)]
-        
-        # Analyze criticality based on findings
-        criticality = 'low'
-        
-        # Elevate criticality based on suspicious patterns
-        if any(category in suspicious_matches for category in ['eval_code', 'privilege_escalation']):
-            criticality = 'high'
-        elif any(category in suspicious_matches for category in ['system_commands', 'network_access']):
-            criticality = 'medium'
-        elif suspicious_matches:
-            criticality = 'low'
-            
-        return {
-            'format': 'script',
-            'added_functions': added_functions,
-            'removed_functions': removed_functions,
-            'added_imports': added_imports,
-            'removed_imports': removed_imports,
-            'suspicious_patterns': suspicious_matches,
-            'criticality': criticality
-        }
-    
-    def check_malware_indicators(self, file_path, file_hash):
-        """Check file against known malware indicators"""
-        entropy = None
-        strings_analysis = None
-        
-        try:
-            # Calculate entropy for all files
-            with open(file_path, 'rb') as f:
-                content = f.read()
-                entropy = self.calculate_entropy(content)
-                
-            # For non-binary files, extract suspicious strings
-            if not self.determine_file_type(file_path) == 'binary':
-                strings_analysis = self.extract_suspicious_strings(file_path)
-                
-            return {
-                'file_hash': file_hash,
-                'entropy': entropy,
-                'high_entropy': entropy > 7.0 if entropy is not None else False,
-                'strings_analysis': strings_analysis
-            }
-        except (IOError, OSError):
-            return {'error': 'Cannot access file for malware analysis'}
-    
-    def extract_suspicious_strings(self, file_path):
-        """Extract suspicious strings from a file using external 'strings' tool"""
-        suspicious_categories = {
-            'ip_addresses': r'\b(?:\d{1,3}\.){3}\d{1,3}\b',
-            'urls': r'https?://[^\s<>"]+|www\.[^\s<>"]+',
-            'encoded_commands': r'base64 -d|base64 --decode|base64\.decode',
-            'shell_commands': r'sh -c|bash -c|cmd\.exe|powershell',
-            'common_exfil': r'curl|wget|nc \-|netcat|ssh|sftp'
-        }
-        
-        try:
-            # Use strings command if available (more efficient for binary files)
-            if os.path.exists('/usr/bin/strings'):
-                output = subprocess.check_output(['strings', file_path], stderr=subprocess.DEVNULL)
-                strings_content = output.decode('utf-8', errors='replace')
-            else:
-                # Fallback to reading the file directly
-                with open(file_path, 'rb') as f:
-                    content = f.read()
-                    strings_content = ''.join(chr(c) if c >= 32 and c < 127 else ' ' for c in content)
-            
-            # Look for suspicious patterns
-            findings = {}
-            for category, pattern in suspicious_categories.items():
-                matches = set(re.findall(pattern, strings_content))
-                if matches:
-                    findings[category] = list(matches)[:10]  # Limit to first 10 matches
-            
-            return findings if findings else None
-            
-        except (IOError, OSError, subprocess.SubprocessError):
-            return None
-    
-    def analyze_partial_file_changes(self, file_path, old_content, new_content):
-        """Analyze changes in specific parts of files"""
-        # Get diff
-        diff_result = self.compute_text_diff(old_content, new_content)
-        
-        # Detect if changes are localized to specific sections
-        changed_sections = diff_result.get('changed_sections', [])
-        
-        # Identify specific types of changes
-        change_types = []
-        for section in changed_sections:
-            context = '\n'.join(section.get('context', []))
-            additions = '\n'.join(section.get('additions', []))
-            deletions = '\n'.join(section.get('deletions', []))
-            
-            # Look for specific patterns in changes
-            if re.search(r'password|passwd|secret|key|token|auth', context, re.IGNORECASE):
-                change_types.append('credential_change')
-            
-            if re.search(r'127\.0\.0\.1|localhost', deletions, re.IGNORECASE) and not re.search(r'127\.0\.0\.1|localhost', additions, re.IGNORECASE):
-                change_types.append('localhost_removal')
-            
-            if re.search(r'deny|block|restrict', deletions, re.IGNORECASE) and not re.search(r'deny|block|restrict', additions, re.IGNORECASE):
-                change_types.append('security_restriction_removal')
-            
-            # Check for added URLs or IPs
-            new_urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', additions)
-            new_ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', additions)
-            
-            if new_urls:
-                change_types.append('new_url_added')
-            
-            if new_ips:
-                change_types.append('new_ip_added')
-        
-        # Determine criticality based on change types
-        criticality = 'low'
-        if 'security_restriction_removal' in change_types or 'credential_change' in change_types:
-            criticality = 'high'
-        elif 'localhost_removal' in change_types or 'new_url_added' in change_types or 'new_ip_added' in change_types:
-            criticality = 'medium'
-        
-        return {
-            'localized_changes': len(changed_sections) <= 3,
-            'change_types': change_types,
-            'criticality': criticality
-        }
-
 ############################################################
 
 def handle_shutdown(signum=None, frame=None):
     """Cleanly handle shutdown signals."""
     print("[INFO] Caught termination signal. Cleaning up...")
-    
-    # Clean up resources
-    global adv_content_analysis
-    if adv_content_analysis:
-        print("[INFO] Advanced content analysis shut down.")
 
     if os.path.exists(PID_FILE):
         os.remove(PID_FILE)
