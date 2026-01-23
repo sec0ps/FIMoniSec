@@ -907,10 +907,11 @@ def send_to_siem(log_entry):
         print(f"[ERROR] Failed to send log to SIEM: {e}")
 
 if __name__ == "__main__":
-    # Define flag to skip guardian initialization for stop/restart commands
-    no_guardian = len(sys.argv) <= 1 or sys.argv[1] not in ["start"]
+    # Define flag to skip guardian initialization for stop/restart/start commands
+    # For "start", guardian will be initialized after fork in the daemon child
+    no_guardian = len(sys.argv) <= 1 or sys.argv[1] in ["stop", "restart", "start", "import-psk", "auth", "config-siem", "exclusion", "pim", "fim", "lim"]
 
-    # Only initialize guardian if not stopping or restarting
+    # Only initialize guardian if running in foreground mode (no arguments)
     if not no_guardian:
         guardian = initialize_process_protection()
 
@@ -936,8 +937,7 @@ if __name__ == "__main__":
                 print("[ERROR] Invalid command. Usage: fimonisec_client auth test")
                 sys.exit(1)
 
-        # Command processing continues here
-        if action == "restart":
+        elif action == "restart":
             stop_fimonisec_client_daemon()
             time.sleep(2)
             # Restart in daemon mode
@@ -948,7 +948,7 @@ if __name__ == "__main__":
 
         elif action == "stop":
             stop_fimonisec_client_daemon()
-            sys.exit(0)  # Exit immediately after stopping
+            sys.exit(0)
 
         elif action in ["pim", "fim", "lim"]:
             if len(sys.argv) > 2 and sys.argv[2] in ["start", "stop", "restart"]:
@@ -994,7 +994,6 @@ if __name__ == "__main__":
             configure_siem()
             sys.exit(0)
 
-        # Daemon mode - now triggered by "start" instead of "-d"
         elif action == "start":
             # Run updater in daemon mode
             try:
@@ -1042,11 +1041,18 @@ if __name__ == "__main__":
             # Start the daemon process
             pid = os.fork()
             if pid > 0:
+                # Parent process - exit cleanly WITHOUT triggering guardian cleanup
                 print(f"[INFO] MoniSec client started in daemon mode.")
-                sys.exit(0)
+                os._exit(0)
+
+            # Child process continues here
             os.setsid()
             os.umask(0)
             sys.stdin = open(os.devnull, 'r')
+
+            # Redirect stdout and stderr to log file for daemon
+            sys.stdout = open(os.path.join(LOG_DIR, "daemon_stdout.log"), 'a')
+            sys.stderr = open(os.path.join(LOG_DIR, "daemon_stderr.log"), 'a')
 
             # Set path to PID file using absolute path
             pid_file = os.path.abspath(os.path.join(output_dir, "fimonisec_client.pid"))
@@ -1058,6 +1064,9 @@ if __name__ == "__main__":
                 logging.info(f"Created PID file with PID {os.getpid()}")
             except Exception as e:
                 logging.error(f"Failed to create PID file: {e}")
+
+            # Initialize ProcessGuardian AFTER fork, in the daemon child process only
+            guardian = initialize_process_protection()
 
             # Create a flag file to tell ProcessGuardian not to manage these processes
             monisec_manages_file = os.path.join(output_dir, "monisec_manages_processes")
@@ -1141,9 +1150,8 @@ if __name__ == "__main__":
 
     else:
         # No arguments - run in foreground mode
-        # Only initialize guardian for foreground mode
-        if not no_guardian and 'guardian' not in locals():
-            guardian = initialize_process_protection()
+        # Initialize guardian for foreground mode
+        guardian = initialize_process_protection()
 
         # Run updater in foreground mode
         try:
@@ -1185,3 +1193,4 @@ if __name__ == "__main__":
 
         # Start monitoring
         monitor_processes()
+
