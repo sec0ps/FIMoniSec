@@ -215,15 +215,23 @@ def load_config():
 
             # Ensure the 'siem_settings' key exists
             if "siem_settings" not in config:
-                print("[WARNING] 'siem_settings' key missing in fim.config.")
-                audit.configure_siem()  # Prompt user for SIEM settings
-                return load_config()  # Reload config after setting SIEM
+                print("[WARNING] 'siem_settings' key missing in fim.config. Adding default...")
+                config["siem_settings"] = {
+                    "enabled": False,
+                    "siem_type": "none",
+                    "host": "",
+                    "port": 514,
+                    "protocol": "udp"
+                }
+                # Save the updated config
+                with open(CONFIG_FILE, "w") as fw:
+                    json.dump(config, fw, indent=4)
 
             return config
 
         except json.JSONDecodeError:
             print("[ERROR] Invalid JSON format in fim.config. Creating a new default config...")
-            create_default_config()  # Create default config if JSON is invalid
+            create_default_config()
             return load_config()  # Reload the default config
 
 def create_default_config():
@@ -232,6 +240,10 @@ def create_default_config():
         "scheduled_scan": {
             "directories": [
                 "/etc",
+                "/usr/bin",
+                "/usr/sbin",
+                "/bin",
+                "/sbin"
                 "/var/www"
             ],
             "scan_interval": 300
