@@ -276,22 +276,38 @@ config = load_or_create_config()
 build_processes_dict()
 
 def start_process(name):
+    """Start a monitored process."""
     if name in PROCESSES:
         # Check if the process is already running and how many instances exist
         instances = is_process_running(name, count_instances=True)
-        
+
         if instances > 0:
             pid = is_process_running(name)
-            
+            logging.info(f"{name} is already running with PID {pid}")
+
             # If multiple instances are running, terminate the newer ones
             if instances > 1:
                 logging.warning(f"Multiple {name} instances detected. Cleaning up duplicates...")
                 cleanup_duplicate_processes(name)
         else:
-            process = subprocess.Popen(PROCESSES[name].split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            time.sleep(2)  # Wait for process to start
-            if not is_process_running(name):
-                logging.error(f"Failed to start {name}.")
+            try:
+                # Start process with correct working directory
+                process = subprocess.Popen(
+                    PROCESSES[name].split(),
+                    cwd=BASE_DIR,  # Set working directory to BASE_DIR
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+                logging.info(f"Started {name} with PID {process.pid}")
+                time.sleep(2)  # Wait for process to start
+
+                if not is_process_running(name):
+                    logging.error(f"Failed to start {name}.")
+            except Exception as e:
+                logging.error(f"Error starting {name}: {e}")
+    else:
+        logging.error(f"Unknown process: {name}")
 
 def stop_process(name):
     if name in PROCESSES:
