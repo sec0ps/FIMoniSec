@@ -1741,74 +1741,56 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
     """Enhanced monitoring loop that tracks both listening and all other processes."""
     # Load initial baseline if provided
     all_known_processes = INITIAL_BASELINE.copy() if use_initial_baseline and 'INITIAL_BASELINE' in globals() else {}
-    
+
     detection_history = {}
     alerted_processes = set()
-    
+    iteration_counter = 0
+
     # Track processes we've already logged events for to avoid duplicates
     logged_events = {
-        "new_process": set(),          # Track new processes already logged
-        "listening_process": set(),    # Track listening processes already logged
-        "terminated": set()            # Track terminated processes already logged
+        "new_process": set(),
+        "listening_process": set(),
+        "terminated": set()
     }
-    
-    # CRITICAL FIX: If baseline exists, we should NOT be in first_run mode
-    # This ensures alerts start immediately when a baseline already exists
+
+    # If baseline exists, we should NOT be in first_run mode
     if use_initial_baseline and all_known_processes:
         first_run = False
         print("[INFO] Using existing baseline - immediate alerting enabled")
-    
-    # Initialize first_iteration based on first_run parameter
+
     first_iteration = first_run
-    
-    # Track the PIDs we've seen as listening
     seen_listening_pids = set()
-    
+
     while True:
         try:
             # Get both listening and all processes
             listening_processes = get_listening_processes()
-            
-            # Get current listening PIDs
             current_listening_pids = set(info.get("pid") for info in listening_processes.values())
-            
-            # Find new listening PIDs
+
             new_listening_pids = current_listening_pids - seen_listening_pids
             if new_listening_pids:
                 print(f"[DEBUG] Detected new listening PIDs: {new_listening_pids}")
-            
+
             non_listening_processes = get_all_processes()
-            
-            # Start with a clean current processes list
+
             current_all_processes = {}
-            
-            # Add non-listening processes first
             for process_hash, info in non_listening_processes.items():
                 current_all_processes[process_hash] = info
-            
-            # Then add ALL listening processes, overriding any duplicates
-            # This ensures listening processes are properly tracked
+
             for process_hash, info in listening_processes.items():
                 current_all_processes[process_hash] = info
-            
-            # Identify new processes
-            new_processes = {h: info for h, info in current_all_processes.items() 
+
+            new_processes = {h: info for h, info in current_all_processes.items()
                             if h not in all_known_processes}
-            
-            # Identify terminated processes
-            terminated_processes = {h: info for h, info in all_known_processes.items() 
+
+            terminated_processes = {h: info for h, info in all_known_processes.items()
                                   if h not in current_all_processes}
-            
-            # Process events - only log if not in first run mode
-            
+
             # 1. Handle new processes
             for process_hash, info in new_processes.items():
-                # Always update tracking
                 update_process_tracking(process_hash, info)
-                
-                # Only log if not in first run mode
+
                 if not first_iteration:
-                    # Only log a NEW_PROCESS event if we haven't already
                     if process_hash not in logged_events["new_process"]:
                         log_pim_event(
                             event_type="NEW_PROCESS",
@@ -1817,8 +1799,7 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                             new_metadata=info
                         )
                         logged_events["new_process"].add(process_hash)
-                    
-                    # If it's a listening process, log that specifically too (but only once)
+
                     if info.get("is_listening", False) and process_hash not in logged_events["listening_process"]:
                         print(f"[ALERT] NEW LISTENING PROCESS: {info.get('process_name')} (PID: {info.get('pid')}) on port {info.get('port')}")
                         log_pim_event(
@@ -1828,13 +1809,12 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                             new_metadata=info
                         )
                         logged_events["listening_process"].add(process_hash)
-            
+
             # 2. Handle terminated processes
             for process_hash, info in terminated_processes.items():
                 remove_process_tracking(process_hash)
-                
+
                 if not first_iteration:
-                    # Check if we've already logged this termination
                     if process_hash not in logged_events["terminated"]:
                         log_pim_event(
                             event_type="PROCESS_TERMINATED",
@@ -1842,25 +1822,20 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                             previous_metadata=info,
                             new_metadata=None
                         )
-                        # Add to terminated set to prevent duplicate alerts
                         logged_events["terminated"].add(process_hash)
-            
-            # 3. Handle modified processes - specifically check for new listening status
+
+            # 3. Handle modified processes
             for process_hash, current_info in current_all_processes.items():
                 if process_hash in all_known_processes and process_hash not in new_processes:
-                    # Skip during first iteration
                     if first_iteration:
                         continue
-                    
+
                     previous_info = all_known_processes[process_hash]
-                    
-                    # Check if a process started listening
+
                     was_listening = previous_info.get("is_listening", False)
                     is_listening_now = current_info.get("is_listening", False)
-                    
+
                     if not was_listening and is_listening_now:
-                        # Process has started listening on a port
-                        # Only log if we haven't already logged this as a listening process
                         if process_hash not in logged_events["listening_process"]:
                             print(f"[ALERT] PROCESS STARTED LISTENING: {current_info.get('process_name')} (PID: {current_info.get('pid')}) on port {current_info.get('port')}")
                             log_pim_event(
@@ -1870,11 +1845,10 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                                 new_metadata=current_info
                             )
                             logged_events["listening_process"].add(process_hash)
-                    
-                    # Check for other significant changes
+
                     changes = {}
                     significant_fields = ["exe_path", "process_name", "port", "user", "cmdline"]
-                    
+
                     for field in significant_fields:
                         prev_value = previous_info.get(field)
                         curr_value = current_info.get(field)
@@ -1883,7 +1857,7 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                                 "previous": prev_value,
                                 "current": curr_value
                             }
-                    
+
                     if changes:
                         log_pim_event(
                             event_type="PROCESS_MODIFIED",
@@ -1892,163 +1866,55 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                             new_metadata=current_info
                         )
                         update_process_tracking(process_hash, current_info)
-                        
-            # Periodically clear the logged_events sets to prevent them from growing too large
-            # Reset every 10000 iterations (roughly every ~5.5 hours with 2 second intervals)
-            if ml_baseline_counter % 10000 == 0 and ml_baseline_counter > 0:
-                # Keep terminated processes in the history longer to prevent duplicates across restarts
+
+            # 4. Security checks for active processes
+            for process_hash, info in current_all_processes.items():
+                if process_hash in alerted_processes:
+                    continue
+
+                pid = info.get("pid")
+                detection_events = []
+
+                # Memory analysis for code injection (prioritize listening processes)
+                if info.get("is_listening", False):
+                    suspicious_memory = scan_process_memory(pid)
+                    if suspicious_memory:
+                        detection_events.append({
+                            "event_type": "SUSPICIOUS_MEMORY_REGION",
+                            "details": suspicious_memory
+                        })
+
+                if detection_events:
+                    threat_assessment = calculate_threat_score(info, detection_events)
+                    for event in detection_events:
+                        mitre_info = classify_by_mitre_attck(event["event_type"], info, event.get("details"))
+                        log_pim_event(event["event_type"], process_hash, None, {
+                            "process_info": info,
+                            "detection_details": event.get("details", {}),
+                            "mitre_mapping": mitre_info,
+                            "threat_assessment": threat_assessment
+                        })
+                    alerted_processes.add(process_hash)
+
+            # Periodic cleanup
+            iteration_counter += 1
+            if iteration_counter % 10000 == 0 and iteration_counter > 0:
                 print(f"[INFO] Clearing event history (new: {len(logged_events['new_process'])}, listening: {len(logged_events['listening_process'])}, terminated: {len(logged_events['terminated'])})")
-                
-                # Only clear processes we don't expect to see activity from again
                 logged_events["terminated"].clear()
-                
-                # For new processes and listening processes, only clear if they're also in terminated
                 logged_events["new_process"] = {p for p in logged_events["new_process"] if p not in logged_events["terminated"]}
                 logged_events["listening_process"] = {p for p in logged_events["listening_process"] if p not in logged_events["terminated"]}
-            
-            # ML Model Training - Separate from core PIM functionality
-            if establishing_ml_baseline:
-                # During ML baseline phase, just increment counter while still allowing PIM to operate
-                ml_baseline_counter += 1
-                
-                # Check if we've reached the end of the baseline phase
-                if ml_baseline_counter >= ml_baseline_cycles:
-                    establishing_ml_baseline = False
-                    print("[INFO] ML baseline collection complete (10 minutes). Training model...")
-                    
-                    # Train ML model only after baseline collection is complete
-                    if ML_LIBRARIES_AVAILABLE:
-                        ml_model_info = implement_behavioral_baselining()
-                        if ml_model_info and ml_model_info.get('model'):
-                            print("[INFO] ML model trained successfully. Enabling ML-based anomaly detection.")
-                        else:
-                            print("[WARNING] Failed to train ML model")
-                    else:
-                        print("[WARNING] ML libraries not available - anomaly detection disabled")
-            
-            # ML-based security checks - Only performed after ML baseline established
-            # Core PIM functionality continues regardless of ML model status
-            if not establishing_ml_baseline and ML_LIBRARIES_AVAILABLE and ml_model_info and ml_model_info.get('model'):
-                # Enhanced security checks for active processes
-                for process_hash, info in current_all_processes.items():
-                    # Skip processes we've already alerted on recently
-                    if process_hash in alerted_processes:
-                        continue
-                    
-                    pid = info.get("pid")
-                    
-                    # Check for security issues
-                    detection_events = []
-                    
-                    # 1. Memory analysis for code injection (prioritize listening processes)
-                    if info.get("is_listening", False):
-                        suspicious_memory = scan_process_memory(pid)
-                        if suspicious_memory:
-                            detection_events.append({
-                                "event_type": "SUSPICIOUS_MEMORY_REGION",
-                                "details": suspicious_memory
-                            })
-                    
-                    # 2. Behavioral pattern detection
-                    behavioral_patterns = analyze_process_for_anomalies(pid, info)
-                    if behavioral_patterns:
-                        detection_events.append({
-                            "event_type": "SUSPICIOUS_BEHAVIOR",
-                            "details": behavioral_patterns
-                        })
-                    
-                    # 3. ML-based anomaly detection
-                    if ml_model_info and ml_model_info.get('model'):
-                        # Prepare features
-                        process_features = {
-                            'port': int(info.get('port', 0)) if isinstance(info.get('port', 0), (int, str)) and str(info.get('port', 0)).isdigit() else 0,
-                            'lineage_length': len(info.get('lineage', [])),
-                            'cmdline_length': len(info.get('cmdline', '')),
-                            'user_is_root': 1 if info.get('user') == 'root' else 0,
-                            'child_processes': get_child_process_count(pid),
-                            'fd_count': get_open_fd_count(pid)
-                        }
-                        
-                        # Add memory usage
-                        mem_usage = get_process_memory_usage(pid)
-                        if mem_usage:
-                            process_features['memory_usage'] = mem_usage
-                        
-                        # Create prediction features
-                        feature_names = ml_model_info['features']
-                        features_for_prediction = {}
-                        for feature in feature_names:
-                            features_for_prediction[feature] = process_features.get(feature, 0)
-                        
-                        # Make prediction
-                        import pandas as pd
-                        prediction = ml_model_info['model'].predict(pd.DataFrame([features_for_prediction]))[0]
-                        if prediction == -1:  # Anomaly
-                            # Calculate anomaly score
-                            anomaly_score = ml_model_info['model'].decision_function(pd.DataFrame([features_for_prediction]))[0]
-                            
-                            # Only alert on more significant anomalies
-                            if anomaly_score < -0.1:  # Threshold to reduce noise
-                                detection_events.append({
-                                    "event_type": "ML_DETECTED_ANOMALY",
-                                    "details": {
-                                        "anomaly_score": anomaly_score,
-                                        "features": process_features
-                                    }
-                                })
-                    
-                    # If we have detection events, log them and analyze
-                    if detection_events:
-                        # Calculate threat score
-                        threat_assessment = calculate_threat_score(info, detection_events)
-                        
-                        # Add MITRE ATT&CK classification
-                        for event in detection_events:
-                            mitre_info = classify_by_mitre_attck(event["event_type"], info, event.get("details"))
-                            if mitre_info:
-                                event["mitre"] = mitre_info
-                            
-                            # Log the event
-                            log_pim_event(
-                                event_type=event["event_type"],
-                                process_hash=process_hash,
-                                previous_metadata=None,
-                                new_metadata={
-                                    "process_info": info,
-                                    "detection_details": event.get("details", {}),
-                                    "mitre_mapping": event.get("mitre", {}),
-                                    "threat_assessment": threat_assessment
-                                }
-                            )
-                        
-                        # Add to detection history and mark as alerted
-                        if process_hash not in detection_history:
-                            detection_history[process_hash] = []
-                        detection_history[process_hash].extend(detection_events)
-                        alerted_processes.add(process_hash)
-                
-                # Periodically clear the alerted_processes set
-                if ml_baseline_counter % 60 == 0:
-                    print("[INFO] Resetting alert suppression...")
-                    alerted_processes.clear()  # Allow processes to trigger alerts again
-            
-            # CRITICAL FIX: Always set first_iteration to False after first cycle
-            # This ensures we don't miss any events after the first run
+                alerted_processes.clear()
+
             first_iteration = False
-            
-            # Update for next iteration
             all_known_processes = current_all_processes.copy()
             seen_listening_pids.update(current_listening_pids)
-            
-            # Increment counter regardless of phase
-            ml_baseline_counter += 1
-            
+
             time.sleep(interval)
-            
+
         except Exception as e:
             print(f"[ERROR] Exception in enhanced monitoring loop: {e}")
             traceback.print_exc()
-            time.sleep(interval)  # Sleep to avoid spinning on errors
+            time.sleep(interval)
 
 def cleanup_and_exit(signum=None, frame=None):
     """Cleanup tasks before exiting. Updated to reflect our revised approach."""
