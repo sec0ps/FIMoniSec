@@ -141,7 +141,7 @@ For professional services, integrations, or support contact: operations@redcells
 **Email**: keith@redcellsecurity.org  
 **Website**: www.redcellsecurity.org  
 
-© 2025 Keith Pachulski. All rights reserved.
+© 2026 Keith Pachulski. All rights reserved.
 
 **License**: This software is licensed under the MIT License. You are free to use, modify, and distribute this software in accordance with the terms of the license.
 
