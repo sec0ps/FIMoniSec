@@ -154,11 +154,11 @@ def save_process_metadata(processes):
     except Exception as e:
         print(f"[ERROR] Failed to write to {INTEGRITY_PROCESS_FILE}: {e}", file=sys.stderr)
 
-
 def get_all_processes():
     """
     Enumerate all running processes using /proc for efficiency.
     Includes full metadata aligned with integrity_services schema.
+    Uses sudo to read process information for all users.
     """
     all_processes = {}
     hostname = socket.gethostname()
@@ -170,22 +170,40 @@ def get_all_processes():
                 continue
             proc_path = f"/proc/{pid}"
             try:
-                exe_real_path = os.readlink(os.path.join(proc_path, "exe"))
+                # Use sudo to read exe symlink for processes owned by other users
+                exe_result = subprocess.run(
+                    ["sudo", "-n", "readlink", "-f", f"{proc_path}/exe"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if exe_result.returncode != 0 or not exe_result.stdout.strip():
+                    continue
+                exe_real_path = exe_result.stdout.strip()
+
+                # Skip if exe path indicates deleted or invalid
+                if "(deleted)" in exe_real_path or not exe_real_path.startswith("/"):
+                    continue
+
                 process_name = os.path.basename(exe_real_path)
 
-                # Command line
+                # Command line using sudo
                 cmdline = ""
-                cmdline_path = os.path.join(proc_path, "cmdline")
-                if os.path.exists(cmdline_path):
-                    with open(cmdline_path, "r") as f:
-                        cmdline = f.read().replace("\x00", " ").strip()
+                cmdline_result = subprocess.run(
+                    ["sudo", "-n", "cat", f"{proc_path}/cmdline"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if cmdline_result.returncode == 0:
+                    cmdline = cmdline_result.stdout.replace("\x00", " ").strip()
 
-                # Status info (UID, PPID, State)
+                # Status info (UID, PPID, State) using sudo
                 user = None
                 ppid = None
                 process_state = None
-                with open(os.path.join(proc_path, "status"), "r") as f:
-                    for line in f:
+                status_result = subprocess.run(
+                    ["sudo", "-n", "cat", f"{proc_path}/status"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if status_result.returncode == 0:
+                    for line in status_result.stdout.splitlines():
                         if line.startswith("Uid:"):
                             uid = int(line.split()[1])
                             try:
@@ -197,13 +215,16 @@ def get_all_processes():
                         elif line.startswith("State:"):
                             process_state = line.split()[1]
 
-                # Start time and runtime from /proc/[pid]/stat
+                # Start time and runtime from /proc/[pid]/stat using sudo
                 start_time = None
                 runtime_seconds = None
-                stat_path = os.path.join(proc_path, "stat")
-                if os.path.exists(stat_path):
-                    with open(stat_path, "r") as f:
-                        stat_fields = f.read().split()
+                stat_result = subprocess.run(
+                    ["sudo", "-n", "cat", f"{proc_path}/stat"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if stat_result.returncode == 0:
+                    stat_fields = stat_result.stdout.split()
+                    if len(stat_fields) > 21:
                         start_ticks = int(stat_fields[21])
                         utime = int(stat_fields[13])
                         stime = int(stat_fields[14])
@@ -238,6 +259,8 @@ def get_all_processes():
                     "status": "running",
                     "type": "process"
                 }
+            except subprocess.TimeoutExpired:
+                continue
             except Exception:
                 continue
         return all_processes
@@ -391,88 +414,148 @@ def monitor_proc_events(interval=2, use_initial_baseline=False):
 
 def get_listening_processes():
     """
-    Enumerate all listening processes using /proc.
+    Enumerate all listening processes using /proc and ss/netstat.
     Metadata aligned with integrity_services schema.
+    Uses sudo to access process information for all users.
     """
     listening_processes = {}
     hostname = socket.gethostname()
     timestamp = datetime.utcnow().isoformat()
 
     try:
-        socket_map = {}
-        for proto in ["tcp", "udp"]:
-            path = f"/proc/net/{proto}"
-            if not os.path.exists(path):
-                continue
-            with open(path, "r") as f:
-                for line in f.readlines()[1:]:
-                    parts = line.split()
-                    local_address = parts[1]
-                    state = parts[3]
-                    inode = parts[9]
-                    if proto == "tcp" and state != "0A":
-                        continue
-                    ip_hex, port_hex = local_address.split(":")
-                    port = int(port_hex, 16)
-                    socket_map[inode] = (proto.upper(), port)
+        # Use ss command with sudo to get listening sockets with process info
+        # ss -tulnp gives TCP/UDP listening sockets with process names
+        ss_result = subprocess.run(
+            ["sudo", "-n", "ss", "-tulnp"],
+            capture_output=True, text=True, timeout=30
+        )
 
-        for pid in os.listdir("/proc"):
-            if not pid.isdigit():
-                continue
-            fd_dir = f"/proc/{pid}/fd"
-            if not os.path.exists(fd_dir):
-                continue
+        if ss_result.returncode != 0:
+            print(f"[ERROR] Failed to run ss command: {ss_result.stderr}")
+            return {}
+
+        # Parse ss output
+        # Format: Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+        lines = ss_result.stdout.strip().splitlines()
+
+        for line in lines[1:]:  # Skip header
             try:
-                for fd in os.listdir(fd_dir):
-                    link = os.readlink(os.path.join(fd_dir, fd))
-                    if link.startswith("socket:["):
-                        inode = link.split("[")[1].strip("]")
-                        if inode in socket_map:
-                            protocol, port = socket_map[inode]
-                            exe_path = os.readlink(f"/proc/{pid}/exe")
-                            process_name = os.path.basename(exe_path)
-                            cmdline = ""
-                            cmdline_path = f"/proc/{pid}/cmdline"
-                            if os.path.exists(cmdline_path):
-                                with open(cmdline_path, "r") as f:
-                                    cmdline = f.read().replace("\x00", " ").strip()
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
 
-                            user = None
-                            ppid = None
-                            with open(f"/proc/{pid}/status", "r") as f:
-                                for line in f:
-                                    if line.startswith("Uid:"):
-                                        uid = int(line.split()[1])
-                                        try:
-                                            user = pwd.getpwuid(uid).pw_name
-                                        except KeyError:
-                                            user = str(uid)
-                                    elif line.startswith("PPid:"):
-                                        ppid = int(line.split()[1])
+                netid = parts[0]  # tcp or udp
+                state = parts[1]
+                local_addr = parts[4]
 
-                            process_hash = get_process_hash(exe_path, cmdline)
-                            lineage = resolve_lineage(int(pid))
+                # Only process LISTEN state for TCP, all for UDP
+                if netid == "tcp" and state != "LISTEN":
+                    continue
+                if netid == "udp" and state not in ["UNCONN", "ESTAB"]:
+                    continue
 
-                            listening_processes[process_hash] = {
-                                "hostname": hostname,
-                                "timestamp": timestamp,
-                                "pid": int(pid),
-                                "exe_path": exe_path,
-                                "process_name": process_name,
-                                "port": port,
-                                "protocol": protocol,
-                                "user": user,
-                                "cmdline": cmdline,
-                                "hash": process_hash,
-                                "ppid": ppid,
-                                "lineage": lineage,
-                                "is_listening": True,
-                                "status": "listening",
-                                "type": "process"
-                            }
-            except Exception:
+                # Parse local address and port
+                if ":" in local_addr:
+                    # Handle IPv6 format [::]:port or IPv4 format ip:port
+                    if local_addr.startswith("["):
+                        # IPv6
+                        port_idx = local_addr.rfind("]:")
+                        if port_idx != -1:
+                            port = int(local_addr[port_idx + 2:])
+                    else:
+                        # IPv4
+                        port = int(local_addr.rsplit(":", 1)[1])
+                else:
+                    continue
+
+                protocol = netid.upper()
+
+                # Extract PID from process column
+                # Format: users:(("process",pid=1234,fd=5))
+                pid = None
+                process_col = None
+                for part in parts:
+                    if "pid=" in part:
+                        process_col = part
+                        break
+
+                if process_col:
+                    pid_match = re.search(r'pid=(\d+)', process_col)
+                    if pid_match:
+                        pid = int(pid_match.group(1))
+
+                if not pid:
+                    continue
+
+                proc_path = f"/proc/{pid}"
+
+                # Get exe path using sudo
+                exe_result = subprocess.run(
+                    ["sudo", "-n", "readlink", "-f", f"{proc_path}/exe"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if exe_result.returncode != 0 or not exe_result.stdout.strip():
+                    continue
+                exe_path = exe_result.stdout.strip()
+
+                if "(deleted)" in exe_path:
+                    continue
+
+                process_name = os.path.basename(exe_path)
+
+                # Get cmdline using sudo
+                cmdline = ""
+                cmdline_result = subprocess.run(
+                    ["sudo", "-n", "cat", f"{proc_path}/cmdline"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if cmdline_result.returncode == 0:
+                    cmdline = cmdline_result.stdout.replace("\x00", " ").strip()
+
+                # Get user and ppid from status using sudo
+                user = None
+                ppid = None
+                status_result = subprocess.run(
+                    ["sudo", "-n", "cat", f"{proc_path}/status"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if status_result.returncode == 0:
+                    for status_line in status_result.stdout.splitlines():
+                        if status_line.startswith("Uid:"):
+                            uid = int(status_line.split()[1])
+                            try:
+                                user = pwd.getpwuid(uid).pw_name
+                            except KeyError:
+                                user = str(uid)
+                        elif status_line.startswith("PPid:"):
+                            ppid = int(status_line.split()[1])
+
+                process_hash = get_process_hash(exe_path, cmdline)
+                lineage = resolve_lineage(pid)
+
+                listening_processes[process_hash] = {
+                    "hostname": hostname,
+                    "timestamp": timestamp,
+                    "pid": pid,
+                    "exe_path": exe_path,
+                    "process_name": process_name,
+                    "port": port,
+                    "protocol": protocol,
+                    "user": user,
+                    "cmdline": cmdline,
+                    "hash": process_hash,
+                    "ppid": ppid,
+                    "lineage": lineage,
+                    "is_listening": True,
+                    "status": "listening",
+                    "type": "process"
+                }
+
+            except Exception as e:
                 continue
+
         return listening_processes
+
     except Exception as e:
         print(f"[ERROR] Failed to enumerate listening processes: {e}")
         return {}
