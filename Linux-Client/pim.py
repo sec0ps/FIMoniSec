@@ -1848,42 +1848,81 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
         "terminated": set()
     }
 
+    # Track PID to hash mapping for detecting listening state changes
+    pid_to_hash = {}
+    for process_hash, info in all_known_processes.items():
+        pid = info.get("pid")
+        if pid:
+            pid_to_hash[pid] = process_hash
+
+    # Track which PIDs are currently listening
+    known_listening_pids = set()
+    for process_hash, info in all_known_processes.items():
+        if info.get("is_listening", False):
+            known_listening_pids.add(info.get("pid"))
+
     # If baseline exists, we should NOT be in first_run mode
     if use_initial_baseline and all_known_processes:
         first_run = False
         print("[INFO] Using existing baseline - immediate alerting enabled")
 
     first_iteration = first_run
-    seen_listening_pids = set()
 
     while True:
         try:
-            # Get both listening and all processes
+            # Get all processes first
+            all_processes = get_all_processes()
+
+            # Get listening processes separately
             listening_processes = get_listening_processes()
-            current_listening_pids = set(info.get("pid") for info in listening_processes.values())
 
-            new_listening_pids = current_listening_pids - seen_listening_pids
-            if new_listening_pids:
-                print(f"[DEBUG] Detected new listening PIDs: {new_listening_pids}")
-
-            non_listening_processes = get_all_processes()
-
-            current_all_processes = {}
-            for process_hash, info in non_listening_processes.items():
-                current_all_processes[process_hash] = info
-
+            # Build current PID to listening info map
+            current_listening_pids = {}
             for process_hash, info in listening_processes.items():
-                current_all_processes[process_hash] = info
+                pid = info.get("pid")
+                if pid:
+                    current_listening_pids[pid] = {
+                        "port": info.get("port"),
+                        "protocol": info.get("protocol"),
+                        "hash": process_hash
+                    }
 
+            # Build current PID to hash mapping
+            current_pid_to_hash = {}
+            for process_hash, info in all_processes.items():
+                pid = info.get("pid")
+                if pid:
+                    current_pid_to_hash[pid] = process_hash
+
+            # Merge listening info into all_processes
+            # Update processes that are listening with correct metadata
+            for pid, listening_info in current_listening_pids.items():
+                # Find the process hash for this PID in all_processes
+                for process_hash, info in all_processes.items():
+                    if info.get("pid") == pid:
+                        info["is_listening"] = True
+                        info["port"] = listening_info["port"]
+                        info["protocol"] = listening_info["protocol"]
+                        break
+
+            current_all_processes = all_processes.copy()
+
+            # Identify new processes (by hash)
             new_processes = {h: info for h, info in current_all_processes.items()
                             if h not in all_known_processes}
 
+            # Identify terminated processes (by hash)
             terminated_processes = {h: info for h, info in all_known_processes.items()
                                   if h not in current_all_processes}
 
             # 1. Handle new processes
             for process_hash, info in new_processes.items():
                 update_process_tracking(process_hash, info)
+                pid = info.get("pid")
+
+                # Update PID tracking
+                if pid:
+                    pid_to_hash[pid] = process_hash
 
                 if not first_iteration:
                     if process_hash not in logged_events["new_process"]:
@@ -1895,19 +1934,28 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                         )
                         logged_events["new_process"].add(process_hash)
 
-                    if info.get("is_listening", False) and process_hash not in logged_events["listening_process"]:
-                        print(f"[ALERT] NEW LISTENING PROCESS: {info.get('process_name')} (PID: {info.get('pid')}) on port {info.get('port')}")
-                        log_pim_event(
-                            event_type="NEW_LISTENING_PROCESS",
-                            process_hash=process_hash,
-                            previous_metadata=None,
-                            new_metadata=info
-                        )
-                        logged_events["listening_process"].add(process_hash)
+                    # Check if new process is already listening
+                    if info.get("is_listening", False):
+                        if pid not in known_listening_pids:
+                            print(f"[ALERT] NEW LISTENING PROCESS: {info.get('process_name')} (PID: {pid}) on port {info.get('port')}/{info.get('protocol')}")
+                            log_pim_event(
+                                event_type="NEW_LISTENING_PROCESS",
+                                process_hash=process_hash,
+                                previous_metadata=None,
+                                new_metadata=info
+                            )
+                            logged_events["listening_process"].add(process_hash)
+                            known_listening_pids.add(pid)
 
             # 2. Handle terminated processes
             for process_hash, info in terminated_processes.items():
                 remove_process_tracking(process_hash)
+                pid = info.get("pid")
+
+                # Clean up PID tracking
+                if pid:
+                    pid_to_hash.pop(pid, None)
+                    known_listening_pids.discard(pid)
 
                 if not first_iteration:
                     if process_hash not in logged_events["terminated"]:
@@ -1919,20 +1967,18 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                         )
                         logged_events["terminated"].add(process_hash)
 
-            # 3. Handle modified processes
-            for process_hash, current_info in current_all_processes.items():
-                if process_hash in all_known_processes and process_hash not in new_processes:
-                    if first_iteration:
-                        continue
+            # 3. Detect processes that started listening (existing processes)
+            if not first_iteration:
+                for pid, listening_info in current_listening_pids.items():
+                    # Check if this PID was NOT listening before but is now
+                    if pid not in known_listening_pids:
+                        # Find the process info for this PID
+                        process_hash = current_pid_to_hash.get(pid)
+                        if process_hash and process_hash in current_all_processes:
+                            current_info = current_all_processes[process_hash]
+                            previous_info = all_known_processes.get(process_hash)
 
-                    previous_info = all_known_processes[process_hash]
-
-                    was_listening = previous_info.get("is_listening", False)
-                    is_listening_now = current_info.get("is_listening", False)
-
-                    if not was_listening and is_listening_now:
-                        if process_hash not in logged_events["listening_process"]:
-                            print(f"[ALERT] PROCESS STARTED LISTENING: {current_info.get('process_name')} (PID: {current_info.get('pid')}) on port {current_info.get('port')}")
+                            print(f"[ALERT] PROCESS STARTED LISTENING: {current_info.get('process_name')} (PID: {pid}) on port {listening_info['port']}/{listening_info['protocol']}")
                             log_pim_event(
                                 event_type="NEW_LISTENING_PROCESS",
                                 process_hash=process_hash,
@@ -1941,8 +1987,60 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                             )
                             logged_events["listening_process"].add(process_hash)
 
+                            # Update the stored metadata
+                            update_process_tracking(process_hash, current_info)
+
+                        # Mark this PID as known listening
+                        known_listening_pids.add(pid)
+
+            # 4. Detect processes that stopped listening
+            if not first_iteration:
+                stopped_listening_pids = known_listening_pids - set(current_listening_pids.keys())
+                for pid in stopped_listening_pids:
+                    # Only alert if the process still exists (didn't terminate)
+                    if pid in current_pid_to_hash:
+                        process_hash = current_pid_to_hash[pid]
+                        if process_hash in current_all_processes:
+                            current_info = current_all_processes[process_hash]
+                            previous_info = all_known_processes.get(process_hash)
+
+                            print(f"[INFO] PROCESS STOPPED LISTENING: {current_info.get('process_name')} (PID: {pid})")
+                            log_pim_event(
+                                event_type="PROCESS_STOPPED_LISTENING",
+                                process_hash=process_hash,
+                                previous_metadata=previous_info,
+                                new_metadata=current_info
+                            )
+
+                            # Update the stored metadata
+                            update_process_tracking(process_hash, current_info)
+
+                # Remove from known listening set
+                known_listening_pids -= stopped_listening_pids
+
+            # 5. Handle other modifications (port change, etc.)
+            for process_hash, current_info in current_all_processes.items():
+                if process_hash in all_known_processes and process_hash not in new_processes:
+                    if first_iteration:
+                        continue
+
+                    previous_info = all_known_processes[process_hash]
+
+                    # Check for port changes on listening processes
+                    if current_info.get("is_listening") and previous_info.get("is_listening"):
+                        if current_info.get("port") != previous_info.get("port"):
+                            print(f"[ALERT] LISTENING PORT CHANGED: {current_info.get('process_name')} (PID: {current_info.get('pid')}) from port {previous_info.get('port')} to {current_info.get('port')}")
+                            log_pim_event(
+                                event_type="LISTENING_PORT_CHANGED",
+                                process_hash=process_hash,
+                                previous_metadata=previous_info,
+                                new_metadata=current_info
+                            )
+                            update_process_tracking(process_hash, current_info)
+
+                    # Check for other significant changes
                     changes = {}
-                    significant_fields = ["exe_path", "process_name", "port", "user", "cmdline"]
+                    significant_fields = ["exe_path", "process_name", "user", "cmdline"]
 
                     for field in significant_fields:
                         prev_value = previous_info.get(field)
@@ -1962,7 +2060,7 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                         )
                         update_process_tracking(process_hash, current_info)
 
-            # 4. Security checks for active processes
+            # 6. Security checks for active processes
             for process_hash, info in current_all_processes.items():
                 if process_hash in alerted_processes:
                     continue
@@ -2000,14 +2098,15 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                 logged_events["listening_process"] = {p for p in logged_events["listening_process"] if p not in logged_events["terminated"]}
                 alerted_processes.clear()
 
+            # Update for next iteration
             first_iteration = False
             all_known_processes = current_all_processes.copy()
-            seen_listening_pids.update(current_listening_pids)
+            pid_to_hash = current_pid_to_hash.copy()
 
             time.sleep(interval)
 
         except Exception as e:
-            print(f"[ERROR] Exception in enhanced monitoring loop: {e}")
+            print(f"[ERROR] Exception in monitoring loop: {e}")
             traceback.print_exc()
             time.sleep(interval)
 
