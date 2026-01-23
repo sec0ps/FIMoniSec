@@ -1,105 +1,133 @@
 # FIMoniSec: System Security Monitoring
 
-FIMoniSec is a lightweight yet powerful Python-based system security monitoring application designed for Linux environments. It offers comprehensive intrusion detection through advanced behavioral analysis, machine learning, and real-time monitoring of process and file integrity.
+**FIMoniSec** is an enterprise-grade security monitoring solution for Linux systems that provides real-time file integrity monitoring (FIM), process integrity monitoring (PIM), and optional log integrity monitoring (LIM). It detects unauthorized modifications, tracks process behavior, and maps security events to the MITRE ATT&CK framework.
 
 ## Features
 
-### Process Integrity Monitoring (PIM)
-- **Real-time Process Monitoring**: Continuously tracks all listening processes for suspicious behavior
-- **ML-Based Anomaly Detection**: Uses Isolation Forest algorithm to detect statistical anomalies in process behavior
-- **Memory Analysis**: Scans process memory regions to detect code injection and other memory-based attacks
-- **Behavioral Pattern Detection**: Identifies suspicious patterns like unusual execution paths or encoded commands
-- **MITRE ATT&CK Mapping**: Maps detected threats to the MITRE ATT&CK framework for better threat intelligence
-- **Threat Scoring System**: Prioritizes alerts based on calculated severity scores
-
 ### File Integrity Monitoring (FIM)
-- Monitors critical system files for unexpected changes
-- Tracks file modifications, permissions changes, and ownership changes
-- Provides detailed logging of file system events
+- **Baseline Management**: Create and maintain SHA-256 hash baselines for critical system files
+- **Real-time Monitoring**: Instant detection of file changes using pyinotify
+- **Scheduled Scanning**: Configurable periodic integrity scans
+- **Change Detection**: Tracks file creation, modification, deletion, moves, and metadata changes
+- **Config File Tracking**: Automatic backup and diff generation for configuration files
+- **MITRE ATT&CK Mapping**: Events mapped to relevant ATT&CK techniques and tactics
 
-### Client-Server Architecture
-- Centralized security monitoring for multiple endpoints
-- Secure communication using TLS/SSL and PSK authentication
-- Remote command functionality for security management
-- SIEM integration for comprehensive security operations
+### Process Integrity Monitoring (PIM)
+- **Process Enumeration**: Monitor all running processes with full metadata
+- **Listening Port Detection**: Track processes with open network sockets
+- **Process Lineage**: Build and track parent-child process relationships
+- **State Change Detection**: Detect when processes start/stop listening on ports
 
-## Requirements
-
-### System Requirements
-- Python 3.6 or higher
-- Linux-based operating system
-- Required Python packages:
-  - `numpy`
-  - `pandas`
-  - `scikit-learn`
-  - `psutil`
+### Security & Integration
+- **SIEM Integration**: Forward events to SIEM solutions via TCP/UDP
+- **Exclusion Management**: Flexible exclusion rules by directory, file, pattern, or extension
+- **Daemon Mode**: Run as a background service with automatic process recovery
+- **Process Guardian**: Self-healing capabilities with automatic restart of monitored components
+- **Remote Management**: WebSocket-based remote communication (optional)
 
 ## Installation
 
-1. Execute the installer
-    ```
-    sudo sh installer.sh
+### Prerequisites
+- Python 3.8+
+- Linux operating system (Ubuntu 20.04+ recommended)
+- Root/sudo access
 
-4. Run the server component (central monitoring):
-   ```
-   python monisec-server.py (create the initial configuration file)
-   python monisec-server.py -d
-   python monisec-server.py add-agent
-   ```
+### Setup
 
-5. On each client, configure and run the client:
-   ```
-   python monisec_client.py import-psk
-   python monisec_client.py -d
-   ```
+1. **Clone the repository:**
+```bash
+git clone https://github.com/sec0ps/FIMoniSec.git
+cd FIMoniSec
+```
+
+2. **Run the installer as root:**
+```bash
+sudo python3 fimonisec_installer.py
+```
+
+3. **Follow the prompts:**
+   - Select `1` to Install FIMoniSec
+   - Select `1` for Linux Client or `2` for Server installation
+   - Choose whether to start the service immediately
+
+The installer will automatically:
+- Create a dedicated `fimonisec` user and group
+- Clone/update the repository to `/opt/FIMoniSec`
+- Install required Python dependencies
+- Configure sudo permissions for required commands
+- Create and enable systemd service(s)
+
+### Post-Installation
+
+After installation, the service can be managed with systemctl:
+```bash
+# Start the service
+sudo systemctl start fimonisec-client
+
+# Stop the service
+sudo systemctl stop fimonisec-client
+
+# Check status
+sudo systemctl status fimonisec-client
+
+# View logs
+sudo journalctl -u fimonisec-client -f
+```
+
+### Uninstallation
+
+To remove FIMoniSec completely:
+```bash
+sudo python3 fimonisec_installer.py
+# Select option 2 to Remove FIMoniSec
+```
+
+This will stop services, remove files, clean up sudoers entries, and delete the fimonisec user/group.
+```
 
 ## Usage
 
-### Server Commands
-```
-python monisec-server.py [command] [client_name]
-
-Commands:
-  add-agent <agent_name>     Add a new client and generate a unique PSK.
-  remove-agent <agent_name>  Remove an existing client.
-  list-agents                List all registered clients.
-  configure-siem             Configure SIEM settings for log forwarding.
-  -d                         Launch the MoniSec Server as a daemon.
-  stop                       Stop the running MoniSec Server daemon.
-  -h, --help                 Show this help message.
+### Start FIMoniSec (Daemon Mode)
+```bash
+python fimonisec_client.py start
 ```
 
-### Client Commands
-```
-python monisec_client.py [command]
-
-Commands:
-  restart                    Restart monisec_client
-  stop                       Stop monisec_client daemon
-  pim start|stop|restart     Control Process Integrity Monitor
-  fim start|stop|restart     Control File Integrity Monitor
-  import-psk                 Import PSK for authentication
-  auth test                  Test authentication, then exit
-  -d                         Run client in daemon mode
+### Stop FIMoniSec
+```bash
+python fimonisec_client.py stop
 ```
 
-## Security Alert Levels
+### Restart FIMoniSec
+```bash
+python fimonisec_client.py restart
+```
 
-MoniSec uses a sophisticated threat scoring system to categorize security events:
+### Control Individual Components
+```bash
+# File Integrity Monitor
+python fimonisec_client.py fim start|stop|restart
 
-- **Critical (80-100)**: Severe security threats requiring immediate attention
-- **High (60-79)**: Significant security concerns that should be addressed promptly
-- **Medium (40-59)**: Potential security issues requiring investigation
-- **Low (20-39)**: Minor security concerns
-- **Informational (0-19)**: Behavioral anomalies with low security impact
+# Process Integrity Monitor
+python fimonisec_client.py pim start|stop|restart
 
-## Future Plans
+# Log Integrity Monitor (if enabled)
+python fimonisec_client.py lim start|stop|restart
+```
 
-- Windows version compatibility
-- Additional detection capabilities
-- Enhanced automated response actions
-- Further machine learning model improvements
-- Broader SIEM integration options
+### Manage Exclusions
+```bash
+# Add exclusion
+python fimonisec_client.py exclusion add directory /path/to/exclude
+python fimonisec_client.py exclusion add file /path/to/file
+python fimonisec_client.py exclusion add pattern "*.log"
+python fimonisec_client.py exclusion add extension .tmp
+
+# Remove exclusion
+python fimonisec_client.py exclusion remove directory /path/to/exclude
+
+# List exclusions
+python fimonisec_client.py exclusion list
+python fimonisec_client.py exclusion list directory
 
 ## Contact
 For professional services, integrations, or support contact: operations@redcellsecurity.org
