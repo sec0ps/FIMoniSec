@@ -627,14 +627,38 @@ def create_baseline():
 
         for path in critical_service_paths:
             if os.path.exists(path):
-                current_service_metadata[path] = {
-                    "hostname": hostname,
-                    "timestamp": timestamp,
-                    "path": path,
-                    "hash": get_process_hash(path),
-                    "type": "service",
-                    "status": "verified"
-                }
+                try:
+                    stat_info = os.stat(path)
+                    try:
+                        user = pwd.getpwuid(stat_info.st_uid).pw_name
+                    except KeyError:
+                        user = str(stat_info.st_uid)
+
+                    real_path = os.path.realpath(path) if os.path.islink(path) else path
+                    path_components = path.strip("/").split("/")
+
+                    current_service_metadata[path] = {
+                        "hostname": hostname,
+                        "timestamp": timestamp,
+                        "pid": None,
+                        "exe_path": real_path,
+                        "process_name": os.path.basename(path),
+                        "port": "N/A",
+                        "protocol": "N/A",
+                        "user": user,
+                        "start_time": None,
+                        "cmdline": path,
+                        "hash": get_process_hash(path),
+                        "ppid": None,
+                        "lineage": path_components[:-1] if len(path_components) > 1 else [],
+                        "is_listening": False,
+                        "state": "file",
+                        "runtime_seconds": None,
+                        "status": "verified",
+                        "type": "service"
+                    }
+                except Exception as e:
+                    print(f"[ERROR] Failed to get metadata for {path}: {e}")
 
         for directory in service_config_dirs:
             if os.path.exists(directory):
@@ -642,14 +666,38 @@ def create_baseline():
                     for file in files:
                         full_path = os.path.join(root, file)
                         if os.path.isfile(full_path):
-                            current_service_metadata[full_path] = {
-                                "hostname": hostname,
-                                "timestamp": timestamp,
-                                "path": full_path,
-                                "hash": get_process_hash(full_path),
-                                "type": "service_config",
-                                "status": "verified"
-                            }
+                            try:
+                                stat_info = os.stat(full_path)
+                                try:
+                                    user = pwd.getpwuid(stat_info.st_uid).pw_name
+                                except KeyError:
+                                    user = str(stat_info.st_uid)
+
+                                real_path = os.path.realpath(full_path) if os.path.islink(full_path) else full_path
+                                path_components = full_path.strip("/").split("/")
+
+                                current_service_metadata[full_path] = {
+                                    "hostname": hostname,
+                                    "timestamp": timestamp,
+                                    "pid": None,
+                                    "exe_path": real_path,
+                                    "process_name": os.path.basename(full_path),
+                                    "port": "N/A",
+                                    "protocol": "N/A",
+                                    "user": user,
+                                    "start_time": None,
+                                    "cmdline": full_path,
+                                    "hash": get_process_hash(full_path),
+                                    "ppid": None,
+                                    "lineage": path_components[:-1] if len(path_components) > 1 else [],
+                                    "is_listening": False,
+                                    "state": "file",
+                                    "runtime_seconds": None,
+                                    "status": "verified",
+                                    "type": "service_config"
+                                }
+                            except Exception as e:
+                                print(f"[ERROR] Failed to get metadata for {full_path}: {e}")
 
         with open(INTEGRITY_SERVICE_FILE, "w") as f:
             json.dump(current_service_metadata, f, indent=4)
@@ -1488,7 +1536,6 @@ def run_monitor():
     """
     Run the process monitoring loop with comprehensive tracking of all processes.
     Includes boot-time integrity enforcement for critical service binaries and configs.
-    Refactored to enrich service metadata without introducing new functions.
     """
     try:
         # Ensure directories and files exist
@@ -1536,14 +1583,38 @@ def run_monitor():
 
         for path in critical_service_paths:
             if os.path.exists(path):
-                current_service_metadata[path] = {
-                    "hostname": hostname,
-                    "timestamp": timestamp,
-                    "path": path,
-                    "hash": get_process_hash(path),
-                    "type": "service",
-                    "status": "verified"
-                }
+                try:
+                    stat_info = os.stat(path)
+                    try:
+                        user = pwd.getpwuid(stat_info.st_uid).pw_name
+                    except KeyError:
+                        user = str(stat_info.st_uid)
+
+                    real_path = os.path.realpath(path) if os.path.islink(path) else path
+                    path_components = path.strip("/").split("/")
+
+                    current_service_metadata[path] = {
+                        "hostname": hostname,
+                        "timestamp": timestamp,
+                        "pid": None,
+                        "exe_path": real_path,
+                        "process_name": os.path.basename(path),
+                        "port": "N/A",
+                        "protocol": "N/A",
+                        "user": user,
+                        "start_time": None,
+                        "cmdline": path,
+                        "hash": get_process_hash(path),
+                        "ppid": None,
+                        "lineage": path_components[:-1] if len(path_components) > 1 else [],
+                        "is_listening": False,
+                        "state": "file",
+                        "runtime_seconds": None,
+                        "status": "verified",
+                        "type": "service"
+                    }
+                except Exception as e:
+                    print(f"[ERROR] Failed to get metadata for {path}: {e}")
 
         for directory in service_config_dirs:
             if os.path.exists(directory):
@@ -1551,14 +1622,38 @@ def run_monitor():
                     for file in files:
                         full_path = os.path.join(root, file)
                         if os.path.isfile(full_path):
-                            current_service_metadata[full_path] = {
-                                "hostname": hostname,
-                                "timestamp": timestamp,
-                                "path": full_path,
-                                "hash": get_process_hash(full_path),
-                                "type": "service_config",
-                                "status": "verified"
-                            }
+                            try:
+                                stat_info = os.stat(full_path)
+                                try:
+                                    user = pwd.getpwuid(stat_info.st_uid).pw_name
+                                except KeyError:
+                                    user = str(stat_info.st_uid)
+
+                                real_path = os.path.realpath(full_path) if os.path.islink(full_path) else full_path
+                                path_components = full_path.strip("/").split("/")
+
+                                current_service_metadata[full_path] = {
+                                    "hostname": hostname,
+                                    "timestamp": timestamp,
+                                    "pid": None,
+                                    "exe_path": real_path,
+                                    "process_name": os.path.basename(full_path),
+                                    "port": "N/A",
+                                    "protocol": "N/A",
+                                    "user": user,
+                                    "start_time": None,
+                                    "cmdline": full_path,
+                                    "hash": get_process_hash(full_path),
+                                    "ppid": None,
+                                    "lineage": path_components[:-1] if len(path_components) > 1 else [],
+                                    "is_listening": False,
+                                    "state": "file",
+                                    "runtime_seconds": None,
+                                    "status": "verified",
+                                    "type": "service_config"
+                                }
+                            except Exception as e:
+                                print(f"[ERROR] Failed to get metadata for {full_path}: {e}")
 
         # Baseline handling for services
         if not os.path.exists(INTEGRITY_SERVICE_FILE):
@@ -1579,7 +1674,7 @@ def run_monitor():
                     print(f"[ALERT] Service integrity mismatch detected: {path}")
                     log_pim_event(
                         event_type="SERVICE_HASH_MISMATCH",
-                        process_hash="SERVICE_CHECK",
+                        process_hash=current_info["hash"],
                         previous_metadata=baseline_info,
                         new_metadata=current_info
                     )
