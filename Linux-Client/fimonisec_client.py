@@ -908,12 +908,12 @@ def send_to_siem(log_entry):
 
 if __name__ == "__main__":
     # Define flag to skip guardian initialization for stop/restart commands
-    no_guardian = len(sys.argv) <= 1 or sys.argv[1] != "start"
-    
+    no_guardian = len(sys.argv) <= 1 or sys.argv[1] not in ["start"]
+
     # Only initialize guardian if not stopping or restarting
     if not no_guardian:
         guardian = initialize_process_protection()
-    
+
     # Process commands first
     if len(sys.argv) > 1:
         action = sys.argv[1]
@@ -921,7 +921,7 @@ if __name__ == "__main__":
         if action == "import-psk":
             remote.import_psk()
             sys.exit(0)
-            
+
         elif action == "auth":
             if len(sys.argv) > 2 and sys.argv[2] == "test":
                 print("[INFO] Attempting authentication using stored credentials...")
@@ -940,7 +940,11 @@ if __name__ == "__main__":
         if action == "restart":
             stop_fimonisec_client_daemon()
             time.sleep(2)
-            start_process("fimonisec_client")
+            # Restart in daemon mode
+            subprocess.Popen([sys.executable, "fimonisec_client.py", "start"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            print("[INFO] fimonisec_client restarted.")
+            sys.exit(0)
 
         elif action == "stop":
             stop_fimonisec_client_daemon()
@@ -948,14 +952,40 @@ if __name__ == "__main__":
 
         elif action in ["pim", "fim", "lim"]:
             if len(sys.argv) > 2 and sys.argv[2] in ["start", "stop", "restart"]:
-                # Fix: Only append "_client" if the action is "fim"
-                target_process = f"{action}_client" if action == "fim" else action
+                # Use the action name directly as it matches PROCESSES keys
+                target_process = action
+
+                # Check if LIM is enabled when trying to control it
+                if action == "lim" and not config.get("client_settings", {}).get("lim_enabled", False):
+                    print("[ERROR] LIM is not enabled in configuration. Set 'lim_enabled' to true in fim.config first.")
+                    sys.exit(1)
+
                 if sys.argv[2] == "start":
+                    print(f"[INFO] Starting {target_process}...")
                     start_process(target_process)
+                    time.sleep(2)
+                    if is_process_running(target_process):
+                        print(f"[INFO] {target_process} started successfully.")
+                    else:
+                        print(f"[ERROR] Failed to start {target_process}.")
+                        sys.exit(1)
                 elif sys.argv[2] == "stop":
+                    print(f"[INFO] Stopping {target_process}...")
                     stop_process(target_process)
+                    time.sleep(2)
+                    if not is_process_running(target_process):
+                        print(f"[INFO] {target_process} stopped successfully.")
+                    else:
+                        print(f"[WARNING] {target_process} may still be running.")
                 elif sys.argv[2] == "restart":
-                    restart_process(target_process)
+                    print(f"[INFO] Restarting {target_process}...")
+                    success = restart_process(target_process)
+                    if success:
+                        print(f"[INFO] {target_process} restarted successfully.")
+                    else:
+                        print(f"[ERROR] Failed to restart {target_process}.")
+                        sys.exit(1)
+                sys.exit(0)
             else:
                 print(f"[ERROR] Invalid command. Usage: fimonisec_client {action} start|stop|restart")
                 sys.exit(1)
@@ -963,18 +993,18 @@ if __name__ == "__main__":
         elif action == "config-siem":
             configure_siem()
             sys.exit(0)
-    
-        # Daemon mode
-        elif action == "-d":
+
+        # Daemon mode - now triggered by "start" instead of "-d"
+        elif action == "start":
             # Run updater in daemon mode
             try:
                 updater.check_for_updates()
             except Exception as e:
                 logging.warning(f"Updater failed: {e}")
-            
+
             # Check if already running - with improved stale PID detection
             pid_file = os.path.join(BASE_DIR, "output", "fimonisec_client.pid")
-            
+
             # Force remove any existing PID file regardless of content
             if os.path.exists(pid_file):
                 try:
@@ -982,44 +1012,45 @@ if __name__ == "__main__":
                     logging.info(f"Removed existing PID file at startup")
                 except Exception as e:
                     logging.error(f"Failed to remove existing PID file: {e}")
-            
+
             # Scan for any potentially running processes
             running_monisec_processes = []
             for proc in psutil.process_iter(['pid', 'cmdline']):
                 try:
                     cmdline = " ".join(proc.info['cmdline'] or [])
                     # Only count it if it's not our current process
-                    if "fimonisec_client.py" in cmdline and "-d" in cmdline and proc.info['pid'] != os.getpid():
+                    if "fimonisec_client.py" in cmdline and "start" in cmdline and proc.info['pid'] != os.getpid():
                         running_monisec_processes.append(proc.info['pid'])
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-            
+
             if running_monisec_processes:
                 print(f"MoniSec client is already running with PID {running_monisec_processes[0]}")
                 sys.exit(0)
-            
+
             # Clean up any existing orphaned child processes
             for name in ["fim", "pim", "lim"]:
                 instances = is_process_running(name, count_instances=True)
                 if instances > 0:
                     logging.info(f"Found {instances} orphaned {name} processes. Cleaning up...")
                     cleanup_duplicate_processes(name)
-            
+
             # Create output directory if it doesn't exist
             output_dir = os.path.join(BASE_DIR, "output")
             os.makedirs(output_dir, exist_ok=True)
-            
+
             # Start the daemon process
             pid = os.fork()
             if pid > 0:
+                print(f"[INFO] MoniSec client started in daemon mode.")
                 sys.exit(0)
             os.setsid()
             os.umask(0)
             sys.stdin = open(os.devnull, 'r')
-        
+
             # Set path to PID file using absolute path
             pid_file = os.path.abspath(os.path.join(output_dir, "fimonisec_client.pid"))
-            
+
             # Write PID to file with error handling
             try:
                 with open(pid_file, 'w') as f:
@@ -1027,41 +1058,41 @@ if __name__ == "__main__":
                 logging.info(f"Created PID file with PID {os.getpid()}")
             except Exception as e:
                 logging.error(f"Failed to create PID file: {e}")
-            
+
             # Create a flag file to tell ProcessGuardian not to manage these processes
             monisec_manages_file = os.path.join(output_dir, "monisec_manages_processes")
             with open(monisec_manages_file, 'w') as f:
                 f.write("true")
-                
+
             # Make sure the guardian stop monitoring file doesn't exist
             control_file = os.path.join(output_dir, "guardian_stop_monitoring")
             if os.path.exists(control_file):
                 os.remove(control_file)
-        
+
             logging.info("MoniSec Endpoint Monitor started in daemon mode.")
-        
+
             # Start the watchdog BEFORE entering the monitoring loop
             start_watchdog(delay=15)
-            
+
             # Check authentication first
             remote.check_auth_and_send_logs()
-            
+
             # Let start_listener_if_authorized handle the listener starting
             remote.start_listener_if_authorized()
-            
+
             # Register exit handler for the daemon process
             atexit.register(lambda: os.path.exists(monisec_manages_file) and os.remove(monisec_manages_file))
-            
+
             # This is an infinite loop that never returns
             monitor_processes()
-    
+
         elif action == "exclusion":
             if len(sys.argv) < 3:
                 print("[ERROR] Invalid command. Usage: fimonisec_client exclusion add|remove|list [type] [value]")
                 sys.exit(1)
-                
+
             excl_action = sys.argv[2]
-            
+
             if excl_action == "list":
                 # List exclusions of a specific type or all if not specified
                 exclusion_type = sys.argv[3] if len(sys.argv) > 3 else None
@@ -1071,16 +1102,16 @@ if __name__ == "__main__":
                     sys.exit(1)
                 list_exclusions(exclusion_type)
                 sys.exit(0)
-                
+
             elif excl_action in ["add", "remove"]:
                 if len(sys.argv) < 5:
                     print(f"[ERROR] Invalid command. Usage: fimonisec_client exclusion {excl_action} <type> <value>")
                     print("Valid types: ip, user, file, directory, pattern, extension")
                     sys.exit(1)
-                    
+
                 exclusion_type = sys.argv[3]
                 value = sys.argv[4]
-                
+
                 success = manage_exclusions(excl_action, exclusion_type, value)
                 sys.exit(0 if success else 1)
             else:
@@ -1090,8 +1121,9 @@ if __name__ == "__main__":
         else:
             print(
                 """Usage:
-                fimonisec_client restart                                # Restart fimonisec_client
+                fimonisec_client start                                  # Start fimonisec_client in daemon mode
                 fimonisec_client stop                                   # Stop fimonisec_client daemon
+                fimonisec_client restart                                # Restart fimonisec_client
                 fimonisec_client pim start|stop|restart                 # Control PIM process
                 fimonisec_client fim start|stop|restart                 # Control FIM process
                 fimonisec_client lim start|stop|restart                 # Control LIM process
@@ -1101,13 +1133,14 @@ if __name__ == "__main__":
                 fimonisec_client exclusion add <type> <value>           # Add an exclusion
                 fimonisec_client exclusion remove <type> <value>        # Remove an exclusion
                 fimonisec_client exclusion list [type]                  # List all exclusions or of a specific type
-                
+
                 Exclusion types: ip, user, file, directory, pattern, extension
             """
             )
             sys.exit(1)
 
     else:
+        # No arguments - run in foreground mode
         # Only initialize guardian for foreground mode
         if not no_guardian and 'guardian' not in locals():
             guardian = initialize_process_protection()
@@ -1122,7 +1155,7 @@ if __name__ == "__main__":
 
         # Check auth before attempting connections
         remote.check_auth_and_send_logs()
-        
+
         # Start connection monitoring only if authentication is valid
         if remote.validate_auth_token()[0]:
             # Start the connection maintenance thread
@@ -1131,24 +1164,24 @@ if __name__ == "__main__":
             logging.info("[INIT] Started WebSocket connection monitoring")
         else:
             logging.info("[INIT] WebSocket connection monitoring disabled - no valid authentication")
-            
+
         # Only use start_listener_if_authorized to handle listener starting
         # This will internally check if auth token is valid
         remote.start_listener_if_authorized()
-        
-        # Only start WebSocket client if auth is valid - start_websocket_client 
+
+        # Only start WebSocket client if auth is valid - start_websocket_client
         # will now internally validate auth token
         if remote.validate_auth_token()[0]:
             # Start WebSocket client (after authentication)
             remote.start_websocket_client()
-            
+
         # Create the flag file for foreground mode too
         monisec_manages_file = os.path.join(BASE_DIR, "output", "monisec_manages_processes")
         with open(monisec_manages_file, 'w') as f:
             f.write("true")
-            
+
         # Register cleanup on exit
         atexit.register(lambda: os.path.exists(monisec_manages_file) and os.remove(monisec_manages_file))
-        
+
         # Start monitoring
         monitor_processes()
