@@ -140,68 +140,8 @@ def build_processes_dict():
     # Only add LIM if it's enabled in config
     if config.get("client_settings", {}).get("lim_enabled", False):
         PROCESSES["lim"] = "python3 lim.py -d"
-
-def create_default_config():
-    """Create a default configuration file if it does not exist and set permissions."""
-    default_config = {
-        "client_settings": {
-            "BASE_DIR": BASE_DIR,
-            "lim_enabled": False  # LIM disabled by default
-        },
-        "scheduled_scan": {
-            "directories": ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/var/www"],
-            "scan_interval": 60
-        },
-        "real_time_monitoring": {
-            "directories": ["/var/www"]
-        },
-        "exclusions": {
-            "directories": ["/var/log"],
-            "files": [
-                "/etc/mnttab",
-                "/etc/mtab",
-                "/etc/hosts.deny",
-                "/etc/mail/statistics",
-                "/etc/random-seed",
-                "/etc/adjtime",
-                "/etc/httpd/logs",
-                "/etc/utmpx",
-                "/etc/wtmpx",
-                "/etc/cups/certs",
-                "/etc/dumpdates",
-                "/etc/svc/volatile"
-            ],
-            "patterns": ["*.tmp", "*.log", "*.swp", "*~"],
-            "extensions": [".bak", ".tmp", ".swp", ".cache"],
-            "max_size": 1073741824  # 1GB
-        },
-        "performance": {
-            "worker_threads": os.cpu_count() or 4,
-            "chunk_size": 65536  # Default chunk size for hash calculation
-        },
-        "siem_settings": {
-            "enabled": False,  # Default to disabled
-            "siem_server": "",
-            "siem_port": 0
-   },
-        "instructions": {
-            "scheduled_scan": "Add directories to 'scheduled_scan -> directories' for periodic integrity checks. Adjust 'scan_interval' to control scan frequency (0 disables it).",
-            "real_time_monitoring": "Add directories to 'real_time_monitoring -> directories' for instant event detection.",
-            "exclusions": "Specify directories or files to be excluded from scanning and monitoring.",
-            "performance": "Adjust performance settings based on system resources.",
-            "siem_settings": "Set 'enabled' to true, and provide 'siem_server' and 'siem_port' for SIEM logging.",
-            "lim_enabled": "Set to true to enable Log Integrity Monitoring (LIM) process. Default is false.",
-            "enhanced_fim": "Configure enhanced file integrity monitoring capabilities including performance optimization, behavioral analysis, content analysis, and detection."
-        }
-    }
-
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(default_config, f, indent=4)
-    os.chmod(CONFIG_FILE, 0o600)
-    print(f"[INFO] Default configuration file created at {CONFIG_FILE}. Please update it as needed.")
-    return default_config
-
 ## Process Protection and Watchdog ###
+
 
 # Initialize process guardian at the beginning of execution
 def initialize_process_protection():
@@ -238,8 +178,8 @@ def initialize_process_protection():
 
 def load_or_create_config():
     """
-    Load the configuration file if it exists, otherwise create it with default settings.
-    The configuration file is expected to be in the BASE_DIR.
+    Load the configuration file if it exists, otherwise create minimal default.
+    The full configuration is managed by fim.py.
     """
     # Check if config file exists
     if os.path.isfile(CONFIG_FILE):
@@ -263,8 +203,73 @@ def load_or_create_config():
             print(f"Error loading config file: {e}")
             sys.exit(1)
     else:
-        # Config doesn't exist, create a new one
-        default_config = create_default_config()
+        # Config doesn't exist - create minimal config for fimonisec_client
+        # Full config will be created by fim.py when it runs
+        print(f"[INFO] Configuration file not found at {CONFIG_FILE}")
+        print(f"[INFO] Creating default configuration...")
+
+        # Create config matching fim.py defaults
+        default_config = {
+            "client_settings": {
+                "BASE_DIR": BASE_DIR,
+                "lim_enabled": False
+            },
+            "scheduled_scan": {
+                "directories": ["/etc", "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/var/www"],
+                "scan_interval": 300
+            },
+            "real_time_monitoring": {
+                "directories": ["/var/www"]
+            },
+            "exclusions": {
+                "directories": ["/var/log"],
+                "files": [
+                    "/etc/mnttab",
+                    "/etc/mtab",
+                    "/etc/hosts.deny",
+                    "/etc/mail/statistics",
+                    "/etc/random-seed",
+                    "/etc/adjtime",
+                    "/etc/httpd/logs",
+                    "/etc/utmpx",
+                    "/etc/wtmpx",
+                    "/etc/cups/certs",
+                    "/etc/dumpdates",
+                    "/etc/svc/volatile"
+                ],
+                "patterns": [
+                    "*.tmp",
+                    "*.log",
+                    "*.swp",
+                    "*~"
+                ],
+                "extensions": [
+                    ".bak",
+                    ".tmp",
+                    ".swp",
+                    ".cache"
+                ],
+                "max_size": 1073741824
+            },
+            "siem_settings": {
+                "enabled": False,
+                "siem_server": "",
+                "siem_port": 0
+            },
+            "performance": {
+                "worker_threads": 4,
+                "chunk_size": 65536
+            }
+        }
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(default_config, f, indent=4)
+        os.chmod(CONFIG_FILE, 0o600)
+
+        print(f"[INFO] Created default configuration at {CONFIG_FILE}")
         return default_config
 
 config = load_or_create_config()
