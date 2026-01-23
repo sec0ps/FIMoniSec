@@ -479,44 +479,45 @@ class ProcessGuardian:
             logger.error(f"Failed to prevent core dumps: {e}")
 
     def terminate_monitored_processes(self):
-        """
-        Terminate all monitored processes when shutting down in foreground mode.
-        """
-        logger.info("Terminating all monitored processes...")
+            """
+            Terminate all monitored processes when shutting down in foreground mode.
+            """
+            logger.info("Terminating all monitored processes...")
 
-        # Build list of processes to terminate based on config
-        processes_to_terminate = ["fim_client.py", "pim.py"]
+            # Build list of processes to terminate based on config
+            processes_to_terminate = ["fim.py", "pim.py"]
 
-        # Check if LIM is enabled
-        config_file = os.path.join(BASE_DIR, "fim.config")
-        try:
-            with open(config_file, 'r') as f:
-                import json
-                config = json.load(f)
-                if config.get("client_settings", {}).get("lim_enabled", False):
-                    processes_to_terminate.append("lim.py")
-        except Exception as e:
-            logger.warning(f"Could not read config to check LIM status: {e}")
+            # Check if LIM is enabled
+            config_file = os.path.join(BASE_DIR, "fim.config")
+            try:
+                with open(config_file, 'r') as f:
+                    import json
+                    config = json.load(f)
+                    if config.get("client_settings", {}).get("lim_enabled", False):
+                        processes_to_terminate.append("lim.py")
+            except Exception as e:
+                logger.warning(f"Could not read config to check LIM status: {e}")
 
-        # Find and terminate all monitored processes
-        for proc_name in processes_to_terminate:
-            pids = self._find_process_pids(proc_name)
-            for pid in pids:
-                try:
-                    logger.info(f"Sending SIGTERM to {proc_name} (PID: {pid})...")
-                    os.kill(pid, signal.SIGTERM)
-                except OSError as e:
-                    logger.error(f"Error sending SIGTERM to {proc_name} (PID: {pid}): {e}")
+            # Find and terminate all monitored processes
+            for proc_name in processes_to_terminate:
+                pids = self._find_process_pids(proc_name)
+                for pid in pids:
+                    try:
+                        logger.info(f"Sending SIGTERM to {proc_name} (PID: {pid})...")
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError as e:
+                        logger.error(f"Error sending SIGTERM to {proc_name} (PID: {pid}): {e}")
 
-        # Wait for processes to terminate gracefully
-        time.sleep(2)
+            # Wait for processes to terminate gracefully
+            time.sleep(2)
 
-        # Force kill any remaining processes
-        for proc_name in processes_to_terminate:
-            pids = self._find_process_pids(proc_name)
-            for pid in pids:
-                try:
-                    logger.warning(f"Process {proc_name} (PID: {pid}) did not terminate gracefully. Forcing...")
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass  # Process might already be gone
+            # Force kill any remaining processes
+            for proc_name in processes_to_terminate:
+                pids = self._find_process_pids(proc_name)
+                for pid in pids:
+                    try:
+                        logger.warning(f"Process {proc_name} (PID: {pid}) did not terminate gracefully. Forcing...")
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass  # Process might already be gone
+
