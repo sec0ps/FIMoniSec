@@ -1880,30 +1880,37 @@ def run_monitor():
         traceback.print_exc()
 
 def rescan_all_processes(interval=60, is_first_run=False):
-    """
-    Periodic full rescan of all processes to catch any that might have been missed.
-    Uses the same baseline checking logic as the main monitor.
-    """
-    # Use the first_run flag passed from run_monitor, don't determine it independently
+
     first_iteration = is_first_run
 
+    # Track listening PIDs from baseline for detecting terminated listeners
+    baseline = load_process_metadata()
+    listening_pids = set()
+    for process_hash, info in baseline.items():
+        if info.get("is_listening", False):
+            pid = info.get("pid")
+            if pid:
+                listening_pids.add(pid)
+
     if first_iteration:
-        print("[PERIODIC SCAN] First run - establishing baseline without generating alerts")
+        print(f"[PERIODIC SCAN] First run - syncing with {len(baseline)} baseline processes, {len(listening_pids)} listening")
     else:
-        print("[PERIODIC SCAN] Using existing baseline - alerts enabled")
+        print(f"[PERIODIC SCAN] Using existing baseline ({len(baseline)} processes, {len(listening_pids)} listening) - alerts enabled")
 
     while True:
         try:
-            if first_iteration:
-                print("[PERIODIC SCAN] First run - establishing baseline without generating alerts")
-            else:
-                print("[PERIODIC SCAN] Running integrity check on all processes...")
-
             # Get current state of all processes
             current_all = get_all_processes()
             current_listening = get_listening_processes()
 
-            # Merge listening info
+            # Build current listening PIDs
+            current_listening_pids = set()
+            for process_hash, info in current_listening.items():
+                pid = info.get("pid")
+                if pid:
+                    current_listening_pids.add(pid)
+
+            # Merge listening info into current_all
             for process_hash, info in current_listening.items():
                 if process_hash in current_all:
                     current_all[process_hash].update({
@@ -1914,49 +1921,75 @@ def rescan_all_processes(interval=60, is_first_run=False):
                 else:
                     current_all[process_hash] = info
 
-            # Load stored baseline
-            stored_baseline = load_process_metadata()
+            # Load current baseline
+            baseline = load_process_metadata()
 
-            # Check for new processes not in baseline
-            for process_hash, info in current_all.items():
-                if process_hash not in stored_baseline:
-                    # New process found
-                    if not first_iteration:
+            if not first_iteration:
+                # Check for NEW processes not in baseline (unknown binaries)
+                for process_hash, info in current_all.items():
+                    if process_hash not in baseline:
+                        # New unknown binary - alert and add to baseline
                         log_pim_event(
                             event_type="NEW_PROCESS",
                             process_hash=process_hash,
                             previous_metadata=None,
                             new_metadata=info
                         )
-                    # Add to tracking
-                    update_process_tracking(process_hash, info)
+                        # Add to persistent baseline
+                        update_process_tracking(process_hash, info)
 
-            # Check for terminated processes
-            for process_hash, info in stored_baseline.items():
-                if process_hash not in current_all:
-                    # Process terminated
-                    if not first_iteration:
-                        log_pim_event(
-                            event_type="PROCESS_TERMINATED",
-                            process_hash=process_hash,
-                            previous_metadata=info,
-                            new_metadata=None
-                        )
-                    # Remove from tracking
-                    remove_process_tracking(process_hash)
+                # Check for LISTENING processes that terminated (security-relevant)
+                for process_hash, info in baseline.items():
+                    if process_hash not in current_all:
+                        pid = info.get("pid")
+                        was_listening = pid in listening_pids if pid else info.get("is_listening", False)
 
-            # After first iteration, enable alerting
-            if first_iteration:
-                first_iteration = False
-                print("[PERIODIC SCAN] Baseline scan complete. Enabling alerts for future scans.")
+                        # Only alert for listening processes that terminate
+                        if was_listening:
+                            print(f"[PERIODIC SCAN] LISTENING PROCESS TERMINATED: {info.get('process_name')} (PID: {pid})")
+                            log_pim_event(
+                                event_type="PROCESS_TERMINATED",
+                                process_hash=process_hash,
+                                previous_metadata=info,
+                                new_metadata=None
+                            )
 
-            # Periodically clean up tracking sets
-            if hasattr(rescan_all_processes, 'scan_count'):
-                rescan_all_processes.scan_count += 1
-                if rescan_all_processes.scan_count % 50 == 0:
-                    cleanup_tracking_sets()
+                        # Clean up PID from listening tracking (but DON'T remove hash from baseline)
+                        if pid:
+                            listening_pids.discard(pid)
+
+                # Check for processes that started listening
+                for process_hash, info in current_all.items():
+                    if info.get("is_listening", False):
+                        pid = info.get("pid")
+                        if pid and pid not in listening_pids:
+                            print(f"[PERIODIC SCAN] PROCESS STARTED LISTENING: {info.get('process_name')} (PID: {pid}) on port {info.get('port')}")
+                            log_pim_event(
+                                event_type="NEW_LISTENING_PROCESS",
+                                process_hash=process_hash,
+                                previous_metadata=baseline.get(process_hash),
+                                new_metadata=info
+                            )
+                            listening_pids.add(pid)
+
+                print(f"[PERIODIC SCAN] Scan complete - {len(current_all)} current, {len(baseline)} in baseline")
             else:
-                rescan_all_processes.scan_count = 1
+                # First iteration - just sync without alerts
+                for process_hash, info in current_all.items():
+                    if process_hash not in baseline:
+                        update_process_tracking(process_hash, info)
+
+                    # Track listening state
+                    if info.get("is_listening", False):
+                        pid = info.get("pid")
+                        if pid:
+                            listening_pids.add(pid)
+
+                first_iteration = False
+                print(f"[PERIODIC SCAN] Initial sync complete. {len(listening_pids)} listening processes tracked. Alerts enabled for future scans.")
+
+            # Update listening_pids based on current state
+            listening_pids = current_listening_pids.copy()
 
             time.sleep(interval)
 
