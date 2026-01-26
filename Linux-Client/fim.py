@@ -444,11 +444,12 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
         log_entry["changes"] = changes
 
     # Enhanced logging for config file changes
+    # get_config_diff will update the backup AFTER getting the diff
     if event_type in ["MODIFIED", "METADATA_CHANGED"] and is_config_file(file_path):
         config_diff = get_config_diff(file_path)
         if config_diff:
             log_entry["config_changes"] = {
-                "diff": config_diff[:20]  # Limit to 20 lines
+                "diff": config_diff[:20]
             }
 
     # Write to log file
@@ -470,8 +471,9 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
     # Print alert based on event type
     if event_type == "NEW FILE":
         print(f"[NEW FILE] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+        # Create initial backup for new config files only if backup doesn't exist
         if is_config_file(file_path):
-            backup_config_file(file_path)
+            backup_config_file(file_path, force=False)
     elif event_type == "DELETED":
         print(f"[DELETED] {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
     elif event_type == "MODIFIED":
@@ -486,8 +488,9 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
         print(f"[METADATA] {file_path}{changes_text} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
     elif event_type == "MOVED":
         print(f"[MOVED] {old_path} -> {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
+        # Create backup for config files moved into monitored area
         if is_config_file(file_path):
-            backup_config_file(file_path)
+            backup_config_file(file_path, force=False)
     elif event_type == "MOVED_AWAY":
         print(f"[MOVED_AWAY] {file_path} -> (unmonitored location) - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
 
@@ -518,27 +521,26 @@ def process_file(filepath, integrity_state):
 
 def generate_file_hashes(scheduled_directories, real_time_directories, exclusions, config=None):
     """Generate and store SHA-256 hashes for all monitored files, tracking changes over time."""
-    global is_baseline_mode  # Add global declaration here
-    
+    global is_baseline_mode
+
     # Check if this is an initial baseline
-    is_initial_baseline = not os.path.exists(INTEGRITY_STATE_FILE) or os.path.getsize(INTEGRITY_STATE_FILE) <= 2  # {} is 2 bytes
-    
+    is_initial_baseline = not os.path.exists(INTEGRITY_STATE_FILE) or os.path.getsize(INTEGRITY_STATE_FILE) <= 2
+
     if is_initial_baseline:
         print("[INFO] Performing initial baseline - alerts will be suppressed during this process")
-        is_baseline_mode = True  # Set the global variable
-    
+        is_baseline_mode = True
+
     integrity_state = load_integrity_state()
 
     # Performance optimization: Dynamic thread pool sizing
     cpu_count = os.cpu_count() or 2
-    worker_count = 4  # Default value
-    
+    worker_count = 4
+
     if config and "performance" in config:
         worker_count = config.get("performance", {}).get("worker_threads", cpu_count)
-    
-    # Avoid excessive threads
+
     worker_count = min(worker_count, cpu_count * 2)
-    worker_count = max(worker_count, 2)  # Ensure at least 2 threads
+    worker_count = max(worker_count, 2)
 
     print(f"[INFO] Using {worker_count} worker threads for file processing")
 
@@ -547,7 +549,7 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
     all_files = []
 
     start_time = time.time()
-    
+
     # Build file list with enhanced exclusion logic
     for directory in scheduled_directories + real_time_directories:
         if directory in exclusions.get("directories", []):
@@ -558,23 +560,24 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
 
     file_count = len(all_files)
     print(f"[INFO] Found {file_count} files to process")
-    
-    # Create a separate function for processing each file
+
+    # Process file function - only backup config files on INITIAL baseline
     def process_file_with_backup(filepath):
         result = process_file(filepath, integrity_state)
-        
-        # Backup config files during the scan
-        str_filepath = str(filepath)
-        if is_config_file(str_filepath):
-            backup_config_file(str_filepath)
-            
+
+        # Only backup config files during INITIAL baseline (not on subsequent runs)
+        if is_initial_baseline:
+            str_filepath = str(filepath)
+            if is_config_file(str_filepath):
+                backup_config_file(str_filepath, force=False)  # Won't overwrite existing
+
         return result
-    
+
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         results = executor.map(process_file_with_backup, all_files)
 
     changes_detected = 0
-    
+
     for result in results:
         if result:
             str_filepath, file_hash, metadata = result
@@ -584,10 +587,9 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
             previous_hash = previous_metadata.get("hash") if previous_metadata else None
 
             if str_filepath in integrity_state:
-                # Detect Metadata Changes Separately
+                # Detect Metadata Changes
                 metadata_changes = compare_metadata(previous_metadata, metadata)
                 if metadata_changes:
-                    # Only log during non-baseline operations
                     if not is_initial_baseline:
                         log_event(
                             event_type="METADATA_CHANGED",
@@ -598,9 +600,8 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
                         )
                     changes_detected += 1
 
-                # Detect Content Changes (Hash Differences)
+                # Detect Content Changes
                 if previous_hash != file_hash:
-                    # Only log during non-baseline operations
                     if not is_initial_baseline:
                         log_event(
                             event_type="MODIFIED",
@@ -613,7 +614,6 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
                     changes_detected += 1
 
             else:
-                # Only log during non-baseline operations
                 if not is_initial_baseline:
                     log_event(
                         event_type="NEW FILE",
@@ -633,7 +633,7 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
         for deleted_file in deleted_files:
             previous_metadata = integrity_state.get(deleted_file)
             previous_hash = previous_metadata.get("hash") if previous_metadata else None
-            
+
             log_event(
                 event_type="DELETED",
                 file_path=deleted_file,
@@ -647,14 +647,13 @@ def generate_file_hashes(scheduled_directories, real_time_directories, exclusion
 
     save_integrity_state(new_integrity_state)
 
-    # Add execution stats
     end_time = time.time()
     duration = end_time - start_time
-    
+
     if is_initial_baseline:
-        print(f"[INFO] Initial baseline completed in {duration:.2f} seconds. Added {changes_detected} files to integrity state.")
+        print(f"[INFO] Initial baseline completed in {duration:.2f} seconds. Added {len(existing_files)} files to integrity state.")
         print("[INFO] Config files have been backed up for future comparison.")
-        is_baseline_mode = False  # Reset baseline mode after completion
+        is_baseline_mode = False
     else:
         print(f"[INFO] Scan completed in {duration:.2f} seconds. Detected {changes_detected} changes.")
 
@@ -1230,129 +1229,125 @@ def is_config_file(file_path):
     return False
 
 def get_config_diff(file_path):
-    """Get diff between current config file and its backup using sudo if necessary."""
+    """Get diff between current config file and its backup."""
     if not is_config_file(file_path):
         return None
-        
+
     try:
         # Get the backup path
         config_backup_dir = os.path.join(OUTPUT_DIR, "config_backups")
         safe_filename = file_path.replace("/", "_").replace("\\", "_")
         backup_path = os.path.join(config_backup_dir, f"{safe_filename}.bak")
-        
+
         # If we don't have a backup yet, create one and return None (no diff available)
         if not os.path.exists(backup_path):
-            backup_config_file(file_path)
+            backup_config_file(file_path, force=True)
             return None
-        
+
         # Read backup content
         try:
             with open(backup_path, 'r', encoding='utf-8') as f:
                 old_content = f.read()
         except UnicodeDecodeError:
             with open(backup_path, 'rb') as f:
-                old_content = f.read().decode('latin1')  # Use latin1 as fallback
-                
-        # Read current content - first try normal access
+                old_content = f.read().decode('latin1')
+
+        # Read current content
         new_content = None
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 new_content = f.read()
         except (IOError, PermissionError, UnicodeDecodeError):
             try:
-                # Try using sudo cat
-                result = subprocess.run(['sudo', '/bin/cat', file_path], 
-                                     capture_output=True, 
-                                     text=True, 
+                result = subprocess.run(['sudo', '/bin/cat', file_path],
+                                     capture_output=True,
+                                     text=True,
                                      check=True)
                 new_content = result.stdout
             except subprocess.SubprocessError as se:
                 print(f"[WARNING] Failed to read config file {file_path} even with sudo: {str(se)}")
                 return None
-        
+
         if not new_content:
             return None
-            
+
         # Calculate diff
         old_lines = old_content.splitlines()
         new_lines = new_content.splitlines()
         diff = list(difflib.unified_diff(old_lines, new_lines, n=2))
-        
+
         # Process the diff to make it more readable
         readable_diff = []
-        for line in diff[3:] if len(diff) > 3 else []:  # Skip the header lines
+        for line in diff[3:] if len(diff) > 3 else []:
             if line.startswith('+'):
                 readable_diff.append(f"Added: {line[1:]}")
             elif line.startswith('-'):
                 readable_diff.append(f"Removed: {line[1:]}")
-        
-        # After getting diff, update the backup
-        backup_config_file(file_path)
-        
+
+        # Update backup AFTER getting the diff (so next comparison is against current state)
+        backup_config_file(file_path, force=True)
+
         return readable_diff if readable_diff else None
-        
+
     except Exception as e:
         print(f"[WARNING] Failed to generate config diff for {file_path}: {str(e)}")
         return None
 
-def backup_config_file(file_path):
-    """Create or update a backup of a config file using sudo if necessary."""
+def backup_config_file(file_path, force=False):
+    """
+    Create or update a backup of a config file.
+
+    Args:
+        file_path: Path to the config file
+        force: If False, only create backup if one doesn't exist. If True, always update.
+    """
     try:
         # Create config backup directory if it doesn't exist
         config_backup_dir = os.path.join(OUTPUT_DIR, "config_backups")
-        
+
         # Create directory if it doesn't exist
         if not os.path.exists(config_backup_dir):
             os.makedirs(config_backup_dir, exist_ok=True)
-            # Set secure permissions (0700) on the directory
             os.chmod(config_backup_dir, 0o700)
             print(f"[INFO] Created config backup directory with secure permissions (0700)")
-        else:
-            # Ensure the directory has the correct permissions
-            current_mode = os.stat(config_backup_dir).st_mode & 0o777
-            if current_mode != 0o700:
-                os.chmod(config_backup_dir, 0o700)
-                print(f"[INFO] Updated config backup directory permissions from {oct(current_mode)} to 0700")
-        
+
         # Create a safe filename for the backup
         safe_filename = file_path.replace("/", "_").replace("\\", "_")
         backup_path = os.path.join(config_backup_dir, f"{safe_filename}.bak")
-        
+
+        # Skip if backup already exists and force is False
+        if os.path.exists(backup_path) and not force:
+            return backup_path
+
         # Only create backup if file exists
         if os.path.exists(file_path) and os.path.isfile(file_path):
-            # First try binary mode to be safe
             try:
                 # Try using sudo cat with binary output
-                result = subprocess.run(['sudo', '/bin/cat', file_path], 
-                                     capture_output=True, 
+                result = subprocess.run(['sudo', '/bin/cat', file_path],
+                                     capture_output=True,
                                      check=True)
-                
-                # Write the output to our backup file in binary mode
+
                 with open(backup_path, 'wb') as dst:
                     dst.write(result.stdout)
-                    
-                print(f"[INFO] Successfully backed up config file: {file_path}")
-                    
+
             except subprocess.SubprocessError as se:
-                print(f"[WARNING] Failed to backup config file {file_path} with sudo: {str(se)}")
-                
                 # Try normal file access if sudo fails
                 try:
                     with open(file_path, 'rb') as src:
                         content = src.read()
-                        
+
                     with open(backup_path, 'wb') as dst:
                         dst.write(content)
                 except (IOError, PermissionError) as e:
                     print(f"[WARNING] Failed to backup config file {file_path}: {str(e)}")
                     return None
-                    
+
             # Set secure permissions on backup
             os.chmod(backup_path, 0o600)
             return backup_path
     except Exception as e:
         print(f"[WARNING] Failed to backup config file {file_path}: {str(e)}")
-    
+
     return None
 
 def is_system_directory(file_path):
