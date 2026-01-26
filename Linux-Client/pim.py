@@ -566,101 +566,123 @@ def log_pim_event(event_type, process_hash, previous_metadata=None, new_metadata
     Includes detailed explanations and MITRE ATT&CK mappings when applicable.
     """
     global LOGGED_EVENTS
-    
+
     # Check for duplicate events based on type
     if event_type == "PROCESS_TERMINATED":
-        # Skip duplicate termination events
         if process_hash in LOGGED_EVENTS["terminated"]:
             return
         LOGGED_EVENTS["terminated"].add(process_hash)
     elif event_type == "NEW_PROCESS":
-        # Skip duplicate new process events
         if process_hash in LOGGED_EVENTS["new_process"]:
             return
         LOGGED_EVENTS["new_process"].add(process_hash)
     elif event_type == "NEW_LISTENING_PROCESS":
-        # Skip duplicate listening process events
         if process_hash in LOGGED_EVENTS["listening_process"]:
             return
         LOGGED_EVENTS["listening_process"].add(process_hash)
-    
+    elif event_type == "PROCESS_MASQUERADING":
+        # Always log masquerading - critical security event
+        pass
+
     # Create the basic log entry
     log_entry = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "log_type": "FIM",
+        "log_type": "PIM",
         "event_type": event_type,
         "process_hash": process_hash,
         "previous_metadata": previous_metadata,
         "new_metadata": new_metadata
     }
-    
-    # Extract details for better logging
+
+    # Extract details for logging
     process_name = (new_metadata or previous_metadata or {}).get("process_name", "UNKNOWN")
     pid = (new_metadata or previous_metadata or {}).get("pid", "UNKNOWN")
     exe_path = (new_metadata or previous_metadata or {}).get("exe_path", "UNKNOWN")
-    
-    # Add context about what changed
+
+    # Add context about what changed for PROCESS_MODIFIED
     changes_description = ""
     if event_type == "PROCESS_MODIFIED" and previous_metadata and new_metadata:
-        # Only include significant fields in the changes description
         significant_fields = ["exe_path", "process_name", "port", "user", "cmdline", "is_listening"]
-        
+
         changed_fields = []
         for field in significant_fields:
             prev_value = previous_metadata.get(field)
             curr_value = new_metadata.get(field)
             if prev_value != curr_value:
                 changed_fields.append(f"{field}: {prev_value} → {curr_value}")
-        
+
         if changed_fields:
             changes_description = f"Significant changes detected: {', '.join(changed_fields)}"
             log_entry["changes_description"] = changes_description
-    
-    # Add MITRE ATT&CK mapping if applicable
+
+    # Get MITRE ATT&CK mapping
     process_info = new_metadata or previous_metadata or {}
-    
-    # Only get MITRE mapping for significant events, not PID changes
+    mitre_mapping = None
+    is_masquerading = False
+    masquerade_details = None
+
     if event_type != "PROCESS_MODIFIED" or (event_type == "PROCESS_MODIFIED" and changes_description):
         mitre_mapping = classify_by_mitre_attck(event_type, process_info)
         if mitre_mapping:
             log_entry["mitre_mapping"] = mitre_mapping
-    
-    # Add process lineage information for context
+            is_masquerading = mitre_mapping.get("is_masquerading", False)
+            masquerade_details = mitre_mapping.get("masquerade_details")
+
+    # Add process lineage information
     if new_metadata and "lineage" in new_metadata:
         log_entry["lineage"] = new_metadata.get("lineage", [])
     elif previous_metadata and "lineage" in previous_metadata:
         log_entry["lineage"] = previous_metadata.get("lineage", [])
-    
-    # Format the JSON with indentation for better readability
-    formatted_json = json.dumps(log_entry, indent=2)
-    
+
+    # If masquerading detected, update event type in log entry
+    if is_masquerading and event_type in ["NEW_PROCESS", "NEW_LISTENING_PROCESS"]:
+        log_entry["event_type"] = "PROCESS_MASQUERADING"
+        log_entry["original_event_type"] = event_type
+        if masquerade_details:
+            log_entry["masquerade_details"] = masquerade_details
+
     # Write to the PIM logging file
+    formatted_json = json.dumps(log_entry, indent=2)
     try:
         with open(PIM_LOGGING_JSON, "a") as log_file:
             log_file.write(formatted_json + "\n")
     except Exception as e:
         print(f"[ERROR] Failed to write to PIM log file: {e}")
-    
-    # Only print alerts for significant events
+
+    # Print alerts - handle masquerading specially
+    if is_masquerading:
+        print("=" * 80)
+        print("[CRITICAL ALERT] PROCESS MASQUERADING DETECTED!")
+        print(f"  Process Name: {process_name}")
+        print(f"  PID: {pid}")
+        print(f"  Suspicious Path: {exe_path}")
+        if masquerade_details:
+            print(f"  Legitimate Path: {masquerade_details.get('legitimate_path', 'UNKNOWN')}")
+            print(f"  Severity: {masquerade_details.get('severity', 'HIGH')}")
+            print(f"  Reason: {masquerade_details.get('reason', 'Path mismatch detected')}")
+        print("  [MITRE ATT&CK] T1036.003: Masquerading: Rename System Utilities (Defense Evasion)")
+        print("=" * 80)
+        return
+
+    # Print alerts for other significant events
     significant_event = (
-        event_type in ["NEW_PROCESS", "PROCESS_TERMINATED", "SUSPICIOUS_MEMORY_REGION"] or
+        event_type in ["NEW_PROCESS", "PROCESS_TERMINATED", "SUSPICIOUS_MEMORY_REGION",
+                       "NEW_LISTENING_PROCESS", "PROCESS_STARTED_LISTENING", "PROCESS_MASQUERADING"] or
         (event_type == "PROCESS_MODIFIED" and changes_description)
     )
-    
+
     if significant_event:
         alert_message = f"[ALERT] {event_type}: {process_name} (PID: {pid}, Path: {exe_path})"
-        
-        # Add changes description if available
+
         if changes_description:
             alert_message += f"\n  {changes_description}"
-        
-        # Add MITRE ATT&CK context if available
-        if log_entry.get("mitre_mapping") and "techniques" in log_entry["mitre_mapping"]:
-            techniques = log_entry["mitre_mapping"]["techniques"]
+
+        if mitre_mapping and "techniques" in mitre_mapping:
+            techniques = mitre_mapping["techniques"]
             if techniques:
-                technique_info = techniques[0]  # Get the first technique
+                technique_info = techniques[0]
                 alert_message += f"\n  [MITRE ATT&CK] {technique_info.get('technique_id')}: {technique_info.get('technique_name')} ({technique_info.get('tactic')})"
-        
+
         print(alert_message)
 
 def cleanup_tracking_sets():
@@ -986,10 +1008,9 @@ def calculate_region_size(addr_range):
 
 def classify_by_mitre_attck(event_type, process_info, detection_details=None):
     """
-    Map detected activities to MITRE ATT&CK techniques with enhanced impersonation detection
-    by comparing process attributes to known good processes in the integrity database.
+    Classify process events using MITRE ATT&CK framework with context-based insights.
+    Returns classification dict with 'is_masquerading' flag when process impersonation detected.
     """
-    # Comprehensive built-in MITRE ATT&CK mappings - CORRECTED FOR LINUX
     mitre_mapping = {
         "NEW_PROCESS": [
             {
@@ -1027,6 +1048,23 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                 "technique_id": "T1546.004",
                 "technique_name": "Event Triggered Execution: Unix Shell Configuration Modification",
                 "tactic": "Persistence"
+            }
+        ],
+        "PROCESS_MASQUERADING": [
+            {
+                "technique_id": "T1036.003",
+                "technique_name": "Masquerading: Rename System Utilities",
+                "tactic": "Defense Evasion"
+            },
+            {
+                "technique_id": "T1036.005",
+                "technique_name": "Masquerading: Match Legitimate Name or Location",
+                "tactic": "Defense Evasion"
+            },
+            {
+                "technique_id": "T1036",
+                "technique_name": "Masquerading",
+                "tactic": "Defense Evasion"
             }
         ],
         "SUSPICIOUS_MEMORY_REGION": [
@@ -1124,99 +1162,122 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             }
         ]
     }
-    
-    # Context-based classification enhancements
+
     if not process_info:
         return None
-        
+
     process_name = process_info.get("process_name", "").lower()
     exe_path = process_info.get("exe_path", "").lower()
     cmdline = process_info.get("cmdline", "").lower()
     user = process_info.get("user", "").lower()
     lineage = process_info.get("lineage", [])
     process_hash = process_info.get("hash", "")
-    
-    # Build contextual insights based on heuristics and patterns
+
     context_insights = []
-    
-    # CRITICAL: Check for process impersonation by comparing with known good processes
-    # Load the integrity database to check for known good processes
+    is_masquerading = False
+    masquerade_details = None
+
+    # Load the integrity database for baseline comparison
     integrity_database = load_process_metadata()
-    
-    # 1. Check for process name impersonation (same name but different attributes)
-    impersonation_detected = False
-    impersonation_details = []
-    
-    # Get all processes with the same name from the integrity database
-    known_good_processes = []
+
+    # Build set of known system directories FROM BASELINE DATA (not hardcoded)
+    baseline_directories = set()
     for hash_key, proc_data in integrity_database.items():
-        if proc_data.get("process_name", "").lower() == process_name:
-            # Skip if this is the same process (same hash)
+        baseline_exe = proc_data.get("exe_path", "")
+        if baseline_exe:
+            baseline_dir = os.path.dirname(baseline_exe)
+            if baseline_dir:
+                baseline_directories.add(baseline_dir)
+
+    # Check for process name impersonation against baseline
+    if event_type in ["NEW_PROCESS", "NEW_LISTENING_PROCESS"]:
+        for hash_key, proc_data in integrity_database.items():
+            baseline_name = proc_data.get("process_name", "").lower()
+            baseline_path = proc_data.get("exe_path", "")
+
+            # Skip if same hash (same process)
             if hash_key == process_hash:
                 continue
-            known_good_processes.append(proc_data)
-    
-    # If we found known good processes with the same name, check for impersonation
-    if known_good_processes and event_type in ["NEW_PROCESS", "NEW_LISTENING_PROCESS"]:
-        # Check each known good process for attribute mismatches
-        for good_proc in known_good_processes:
-            mismatches = []
-            
-            # Check executable path
-            good_exe_path = good_proc.get("exe_path", "").lower()
-            if good_exe_path and exe_path and good_exe_path != exe_path:
-                mismatches.append(f"Executable path mismatch: {good_exe_path} vs {exe_path}")
-            
-            # Check user
-            good_user = good_proc.get("user", "").lower()
-            if good_user and user and good_user != user:
-                mismatches.append(f"User mismatch: {good_user} vs {user}")
-            
-            # Check lineage pattern (might not be exact match but should follow similar pattern)
-            good_lineage = good_proc.get("lineage", [])
-            if good_lineage and lineage and len(good_lineage) > 0 and len(lineage) > 0:
-                # Simple check - does it follow a different ancestry pattern?
-                if (good_lineage[0] != lineage[0] or 
-                    ("bash" in lineage and "bash" not in good_lineage) or
-                    (len(good_lineage) > 1 and len(lineage) > 1 and good_lineage[1] != lineage[1])):
-                    mismatches.append(f"Lineage mismatch: {good_lineage} vs {lineage}")
-            
-            # If we found mismatches, we have impersonation
-            if mismatches:
-                impersonation_detected = True
-                impersonation_details.extend(mismatches)
-    
-    # 2. If impersonation detected, add specific MITRE ATT&CK techniques
-    if impersonation_detected:
-        context_insights.append({
-            "technique_id": "T1036",
-            "technique_name": "Masquerading",
-            "tactic": "Defense Evasion",
-            "severity": "high",
-            "evidence": f"Process impersonation detected: {process_name} with {'; '.join(impersonation_details)}"
-        })
-        
-        context_insights.append({
-            "technique_id": "T1036.005",
-            "technique_name": "Masquerading: Match Legitimate Name or Location",
-            "tactic": "Defense Evasion",
-            "severity": "high",
-            "evidence": f"Process masquerading as {process_name} but with different attributes"
-        })
-        
-        # Add specific alert for server process impersonation
-        server_processes = ["apache", "apache2", "httpd", "nginx", "sshd", "ftpd", "smbd", "nmbd", "named", "mysqld", "postgres"]
-        if any(server in process_name for server in server_processes):
-            context_insights.append({
-                "technique_id": "T1190",
-                "technique_name": "Exploit Public-Facing Application",
-                "tactic": "Initial Access",
-                "severity": "critical",
-                "evidence": f"Server process {process_name} being impersonated, possible web shell or backdoor"
-            })
-    
-    # 3. Check for defense evasion - running from temp or unusual directories
-    suspicious_dirs = ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/", "/home/"]
+
+            # Same name but different path = potential masquerading
+            if baseline_name == process_name and baseline_path and exe_path:
+                if baseline_path.lower() != exe_path:
+                    # Check if baseline path is in a known baseline directory
+                    baseline_dir = os.path.dirname(baseline_path)
+                    current_dir = os.path.dirname(process_info.get("exe_path", ""))
+
+                    # Baseline is in a known directory but current process is NOT
+                    baseline_in_known_dir = baseline_dir in baseline_directories
+                    current_in_known_dir = current_dir in baseline_directories
+
+                    if baseline_in_known_dir and not current_in_known_dir:
+                        is_masquerading = True
+                        masquerade_details = {
+                            "legitimate_path": baseline_path,
+                            "malicious_path": process_info.get("exe_path", ""),
+                            "legitimate_hash": hash_key,
+                            "current_hash": process_hash,
+                            "baseline_user": proc_data.get("user", "unknown"),
+                            "current_user": process_info.get("user", "unknown"),
+                            "severity": "CRITICAL",
+                            "reason": f"Process '{process_name}' running from '{process_info.get('exe_path', '')}' but legitimate version runs from '{baseline_path}'"
+                        }
+
+                        context_insights.append({
+                            "technique_id": "T1036.003",
+                            "technique_name": "Masquerading: Rename System Utilities",
+                            "tactic": "Defense Evasion",
+                            "severity": "critical",
+                            "evidence": masquerade_details["reason"]
+                        })
+
+                        context_insights.append({
+                            "technique_id": "T1036.005",
+                            "technique_name": "Masquerading: Match Legitimate Name or Location",
+                            "tactic": "Defense Evasion",
+                            "severity": "critical",
+                            "evidence": f"Process masquerading as {process_name} from unauthorized location"
+                        })
+
+                        # Check if it's a server process - even more critical
+                        server_processes = ["apache", "apache2", "httpd", "nginx", "sshd", "ftpd", "smbd", "nmbd", "named", "mysqld", "postgres", "mariadb"]
+                        if any(server in process_name for server in server_processes):
+                            context_insights.append({
+                                "technique_id": "T1190",
+                                "technique_name": "Exploit Public-Facing Application",
+                                "tactic": "Initial Access",
+                                "severity": "critical",
+                                "evidence": f"Server process {process_name} being impersonated - possible backdoor"
+                            })
+
+                        # Found masquerading, no need to check further
+                        break
+
+                    # Both in known dirs but different paths - still suspicious
+                    elif baseline_in_known_dir and current_in_known_dir and baseline_path.lower() != exe_path:
+                        is_masquerading = True
+                        masquerade_details = {
+                            "legitimate_path": baseline_path,
+                            "malicious_path": process_info.get("exe_path", ""),
+                            "legitimate_hash": hash_key,
+                            "current_hash": process_hash,
+                            "baseline_user": proc_data.get("user", "unknown"),
+                            "current_user": process_info.get("user", "unknown"),
+                            "severity": "HIGH",
+                            "reason": f"Process '{process_name}' path mismatch: expected '{baseline_path}', found '{process_info.get('exe_path', '')}'"
+                        }
+
+                        context_insights.append({
+                            "technique_id": "T1036",
+                            "technique_name": "Masquerading",
+                            "tactic": "Defense Evasion",
+                            "severity": "high",
+                            "evidence": masquerade_details["reason"]
+                        })
+                        break
+
+    # Check for processes running from suspicious temporary directories
+    suspicious_dirs = ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/"]
     if any(susp_dir in exe_path for susp_dir in suspicious_dirs):
         context_insights.append({
             "technique_id": "T1564.001",
@@ -1225,10 +1286,10 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             "severity": "medium",
             "evidence": f"Process running from suspicious location: {exe_path}"
         })
-    
-    # 4. Check for privilege escalation - non-root user binding to privileged port
+
+    # Check for privilege escalation - non-root user binding to privileged port
     port = process_info.get("port", 0)
-    if isinstance(port, int) and port < 1024 and user != "root":
+    if isinstance(port, int) and port < 1024 and user and user != "root":
         context_insights.append({
             "technique_id": "T1548.001",
             "technique_name": "Abuse Elevation Control Mechanism: Setuid and Setgid",
@@ -1236,11 +1297,11 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             "severity": "high",
             "evidence": f"Non-root user '{user}' binding to privileged port {port}"
         })
-    
-    # 5. Check for suspicious command line patterns
+
+    # Check for suspicious command line patterns
     suspicious_cmd_patterns = [
-        "base64", "-encode", "--decode", "python -c", "perl -e", "eval", "exec", 
-        "system(", "shell_exec", "wget", "curl", "nc ", "netcat", "bash -i", "sh -i"
+        "base64", "-encode", "--decode", "python -c", "perl -e", "eval", "exec",
+        "system(", "shell_exec", "nc ", "netcat", "bash -i", "sh -i", "/dev/tcp/", "/dev/udp/"
     ]
     if any(pattern in cmdline for pattern in suspicious_cmd_patterns):
         context_insights.append({
@@ -1248,119 +1309,129 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             "technique_name": "Command and Scripting Interpreter",
             "tactic": "Execution",
             "severity": "medium",
-            "evidence": f"Suspicious command line pattern detected: {cmdline}"
+            "evidence": f"Suspicious command line pattern detected"
         })
-    
-    # 6. Check for server processes spawned by shell (suspicious lineage)
+
+    # Check for server processes spawned by shell (suspicious lineage)
     server_processes = ["apache", "apache2", "httpd", "nginx", "sshd", "ftpd", "smbd", "nmbd", "named", "mysqld", "postgres"]
-    if any(server in process_name for server in server_processes) and any(shell in lineage for shell in ["bash", "sh", "zsh", "dash"]):
+    if any(server in process_name for server in server_processes):
+        if any(shell in str(lineage).lower() for shell in ["bash", "sh", "zsh", "dash", "ksh"]):
+            context_insights.append({
+                "technique_id": "T1190",
+                "technique_name": "Exploit Public-Facing Application",
+                "tactic": "Initial Access",
+                "severity": "high",
+                "evidence": f"Server process '{process_name}' spawned by shell in lineage"
+            })
+
+    # Check for reverse shell patterns
+    reverse_shell_patterns = ["bash -i", "sh -i", "/dev/tcp", "/dev/udp", "mkfifo", "nc -e", "nc -c"]
+    if any(pattern in cmdline for pattern in reverse_shell_patterns):
         context_insights.append({
-            "technique_id": "T1190",
-            "technique_name": "Exploit Public-Facing Application",
-            "tactic": "Initial Access",
-            "severity": "high",
-            "evidence": f"Server process '{process_name}' spawned by shell in lineage: {lineage}"
-        })
-    
-    # 7. Check for reverse shells
-    if "shell" in cmdline.lower() and any(net_tool in cmdline.lower() for net_tool in ["nc", "netcat", "socat"]):
-        context_insights.append({
-            "technique_id": "T1071.001",
-            "technique_name": "Application Layer Protocol: Web Protocols",
-            "tactic": "Command and Control",
+            "technique_id": "T1059.004",
+            "technique_name": "Command and Scripting Interpreter: Unix Shell",
+            "tactic": "Execution",
             "severity": "critical",
-            "evidence": f"Potential reverse shell detected: {cmdline}"
+            "evidence": "Potential reverse shell detected"
         })
-    
-    # 8. Check for credential access - CORRECTED FOR LINUX
-    if any(cred_file in cmdline for cred_file in ["/etc/shadow", "/etc/passwd", "/etc/gshadow", "/etc/group"]):
+
+    # Check for credential access
+    cred_files = ["/etc/shadow", "/etc/passwd", "/etc/gshadow", "/etc/group", ".ssh/id_rsa", ".ssh/id_dsa"]
+    if any(cred_file in cmdline for cred_file in cred_files):
         context_insights.append({
             "technique_id": "T1003.008",
             "technique_name": "OS Credential Dumping: /etc/passwd and /etc/shadow",
             "tactic": "Credential Access",
             "severity": "high",
-            "evidence": f"Potential credential access attempt: {cmdline}"
+            "evidence": "Potential credential access attempt"
         })
-    
-    # 9. Check for sudo/su privilege escalation attempts
-    if any(priv_cmd in cmdline for priv_cmd in ["sudo -s", "sudo su", "su -", "sudo bash", "sudo sh"]):
+
+    # Check for sudo/su privilege escalation attempts
+    priv_cmds = ["sudo -s", "sudo su", "su -", "sudo bash", "sudo sh", "sudo -i"]
+    if any(priv_cmd in cmdline for priv_cmd in priv_cmds):
         context_insights.append({
             "technique_id": "T1548.003",
             "technique_name": "Abuse Elevation Control Mechanism: Sudo and Sudo Caching",
             "tactic": "Privilege Escalation",
             "severity": "medium",
-            "evidence": f"Privilege escalation attempt detected: {cmdline}"
+            "evidence": "Privilege escalation attempt detected"
         })
-    
-    # 10. Check for Linux-specific persistence mechanisms
-    if any(persist_file in cmdline for persist_file in [".bashrc", ".bash_profile", ".profile", "/etc/crontab", ".ssh/authorized_keys"]):
+
+    # Check for persistence mechanisms
+    persist_files = [".bashrc", ".bash_profile", ".profile", "/etc/crontab", ".ssh/authorized_keys", "/etc/rc.local"]
+    if any(persist_file in cmdline for persist_file in persist_files):
         context_insights.append({
             "technique_id": "T1546.004",
             "technique_name": "Event Triggered Execution: Unix Shell Configuration Modification",
             "tactic": "Persistence",
             "severity": "medium",
-            "evidence": f"Potential persistence mechanism modification: {cmdline}"
+            "evidence": "Potential persistence mechanism modification"
         })
-    
-    # 11. Check for Linux service manipulation
-    if any(service_cmd in cmdline for service_cmd in ["systemctl", "service", "chkconfig", "/etc/init.d/"]):
+
+    # Check for service manipulation
+    service_cmds = ["systemctl enable", "systemctl start", "update-rc.d", "chkconfig", "/etc/init.d/"]
+    if any(service_cmd in cmdline for service_cmd in service_cmds):
         context_insights.append({
             "technique_id": "T1543.002",
             "technique_name": "Create or Modify System Process: Systemd Service",
             "tactic": "Persistence",
             "severity": "medium",
-            "evidence": f"Service manipulation detected: {cmdline}"
+            "evidence": "Service manipulation detected"
         })
-    
-    # 12. Check for Linux kernel module manipulation
-    if any(kernel_cmd in cmdline for kernel_cmd in ["insmod", "rmmod", "modprobe", "lsmod"]):
+
+    # Check for kernel module manipulation
+    kernel_cmds = ["insmod", "rmmod", "modprobe -r", "modprobe"]
+    if any(kernel_cmd in cmdline for kernel_cmd in kernel_cmds):
         context_insights.append({
             "technique_id": "T1547.006",
             "technique_name": "Boot or Logon Autostart Execution: Kernel Modules and Extensions",
             "tactic": "Persistence",
             "severity": "high",
-            "evidence": f"Kernel module manipulation detected: {cmdline}"
+            "evidence": "Kernel module manipulation detected"
         })
-    
-    # 13. Check for specific detection events
+
+    # Handle specific detection events
     if event_type == "SUSPICIOUS_BEHAVIOR" and detection_details:
         if "suspicious_patterns" in detection_details:
             for pattern in detection_details.get("suspicious_patterns", []):
                 pattern_lower = pattern.lower() if isinstance(pattern, str) else ""
-                
+
                 if "unusual directory" in pattern_lower:
                     context_insights.append({
-                        "technique_id": "T1564.001", 
+                        "technique_id": "T1564.001",
                         "technique_name": "Hide Artifacts: Hidden Files and Directories",
                         "tactic": "Defense Evasion",
                         "severity": "medium",
                         "evidence": pattern
                     })
-                
                 elif "webshell" in pattern_lower:
                     context_insights.append({
-                        "technique_id": "T1505.003", 
+                        "technique_id": "T1505.003",
                         "technique_name": "Server Software Component: Web Shell",
                         "tactic": "Persistence",
                         "severity": "high",
                         "evidence": pattern
                     })
-                
                 elif "encoded command" in pattern_lower or "base64" in pattern_lower:
                     context_insights.append({
-                        "technique_id": "T1027", 
+                        "technique_id": "T1027",
                         "technique_name": "Obfuscated Files or Information",
                         "tactic": "Defense Evasion",
                         "severity": "medium",
                         "evidence": pattern
                     })
-    
-    # Merge base techniques with context-specific insights
+
+    # Build final techniques list
     techniques = []
-    if event_type in mitre_mapping:
+
+    # If masquerading detected, use PROCESS_MASQUERADING mapping
+    if is_masquerading:
+        techniques.extend(mitre_mapping.get("PROCESS_MASQUERADING", []))
+    elif event_type in mitre_mapping:
         techniques.extend(mitre_mapping[event_type])
+
     techniques.extend(context_insights)
-    
+
     # Deduplicate techniques
     unique_techniques = []
     seen_ids = set()
@@ -1368,7 +1439,7 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
         if technique["technique_id"] not in seen_ids:
             unique_techniques.append(technique)
             seen_ids.add(technique["technique_id"])
-    
+
     if unique_techniques:
         return {
             "techniques": unique_techniques,
@@ -1377,11 +1448,13 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                 "pid": process_info.get("pid", ""),
                 "path": process_info.get("exe_path", ""),
                 "detection_type": event_type
-            }
+            },
+            "is_masquerading": is_masquerading,
+            "masquerade_details": masquerade_details
         }
-    
+
     return None
-    
+
 def calculate_threat_score(process_info, detection_events):
     """Calculate a threat score for a process based on its behavior and detections."""
     base_score = 0
@@ -1978,9 +2051,7 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                     current_pid_to_hash[pid] = process_hash
 
             # Merge listening info into all_processes
-            # Update processes that are listening with correct metadata
             for pid, listening_info in current_listening_pids.items():
-                # Find the process hash for this PID in all_processes
                 for process_hash, info in all_processes.items():
                     if info.get("pid") == pid:
                         info["is_listening"] = True
@@ -2009,6 +2080,7 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
 
                 if not first_iteration:
                     if process_hash not in logged_events["new_process"]:
+                        # Log the event - log_pim_event will detect masquerading internally
                         log_pim_event(
                             event_type="NEW_PROCESS",
                             process_hash=process_hash,
@@ -2053,9 +2125,7 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
             # 3. Detect processes that started listening (existing processes)
             if not first_iteration:
                 for pid, listening_info in current_listening_pids.items():
-                    # Check if this PID was NOT listening before but is now
                     if pid not in known_listening_pids:
-                        # Find the process info for this PID
                         process_hash = current_pid_to_hash.get(pid)
                         if process_hash and process_hash in current_all_processes:
                             current_info = current_all_processes[process_hash]
@@ -2070,17 +2140,14 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                             )
                             logged_events["listening_process"].add(process_hash)
 
-                            # Update the stored metadata
                             update_process_tracking(process_hash, current_info)
 
-                        # Mark this PID as known listening
                         known_listening_pids.add(pid)
 
             # 4. Detect processes that stopped listening
             if not first_iteration:
                 stopped_listening_pids = known_listening_pids - set(current_listening_pids.keys())
                 for pid in stopped_listening_pids:
-                    # Only alert if the process still exists (didn't terminate)
                     if pid in current_pid_to_hash:
                         process_hash = current_pid_to_hash[pid]
                         if process_hash in current_all_processes:
@@ -2095,10 +2162,8 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
                                 new_metadata=current_info
                             )
 
-                            # Update the stored metadata
                             update_process_tracking(process_hash, current_info)
 
-                # Remove from known listening set
                 known_listening_pids -= stopped_listening_pids
 
             # 5. Handle other modifications (port change, etc.)
