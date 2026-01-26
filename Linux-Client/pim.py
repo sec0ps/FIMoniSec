@@ -1166,8 +1166,11 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
     if not process_info:
         return None
 
-    process_name = process_info.get("process_name", "").lower()
-    exe_path = process_info.get("exe_path", "").lower()
+    # Extract process attributes (keep original case for paths, lowercase for names)
+    process_name = process_info.get("process_name", "")
+    process_name_lower = process_name.lower()
+    exe_path = process_info.get("exe_path", "")
+    exe_path_lower = exe_path.lower()
     cmdline = process_info.get("cmdline", "").lower()
     user = process_info.get("user", "").lower()
     lineage = process_info.get("lineage", [])
@@ -1180,47 +1183,54 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
     # Load the integrity database for baseline comparison
     integrity_database = load_process_metadata()
 
-    # Build set of known system directories FROM BASELINE DATA (not hardcoded)
+    # Build set of known directories FROM BASELINE DATA
     baseline_directories = set()
+    baseline_directories_lower = set()
     for hash_key, proc_data in integrity_database.items():
         baseline_exe = proc_data.get("exe_path", "")
         if baseline_exe:
             baseline_dir = os.path.dirname(baseline_exe)
             if baseline_dir:
                 baseline_directories.add(baseline_dir)
+                baseline_directories_lower.add(baseline_dir.lower())
 
     # Check for process name impersonation against baseline
-    if event_type in ["NEW_PROCESS", "NEW_LISTENING_PROCESS"]:
+    if event_type in ["NEW_PROCESS", "NEW_LISTENING_PROCESS"] and integrity_database:
         for hash_key, proc_data in integrity_database.items():
-            baseline_name = proc_data.get("process_name", "").lower()
+            baseline_name = proc_data.get("process_name", "")
+            baseline_name_lower = baseline_name.lower()
             baseline_path = proc_data.get("exe_path", "")
+            baseline_path_lower = baseline_path.lower() if baseline_path else ""
 
             # Skip if same hash (same process)
             if hash_key == process_hash:
                 continue
 
             # Same name but different path = potential masquerading
-            if baseline_name == process_name and baseline_path and exe_path:
-                if baseline_path.lower() != exe_path:
-                    # Check if baseline path is in a known baseline directory
+            if baseline_name_lower == process_name_lower and baseline_path and exe_path:
+                if baseline_path_lower != exe_path_lower:
+                    # Get directories for comparison
                     baseline_dir = os.path.dirname(baseline_path)
-                    current_dir = os.path.dirname(process_info.get("exe_path", ""))
+                    baseline_dir_lower = baseline_dir.lower()
+                    current_dir = os.path.dirname(exe_path)
+                    current_dir_lower = current_dir.lower()
 
-                    # Baseline is in a known directory but current process is NOT
-                    baseline_in_known_dir = baseline_dir in baseline_directories
-                    current_in_known_dir = current_dir in baseline_directories
+                    # Check if baseline is in a known baseline directory
+                    baseline_in_known_dir = baseline_dir_lower in baseline_directories_lower
+                    current_in_known_dir = current_dir_lower in baseline_directories_lower
 
+                    # CRITICAL: Baseline is in known directory but current process is NOT
                     if baseline_in_known_dir and not current_in_known_dir:
                         is_masquerading = True
                         masquerade_details = {
                             "legitimate_path": baseline_path,
-                            "malicious_path": process_info.get("exe_path", ""),
+                            "malicious_path": exe_path,
                             "legitimate_hash": hash_key,
                             "current_hash": process_hash,
                             "baseline_user": proc_data.get("user", "unknown"),
                             "current_user": process_info.get("user", "unknown"),
                             "severity": "CRITICAL",
-                            "reason": f"Process '{process_name}' running from '{process_info.get('exe_path', '')}' but legitimate version runs from '{baseline_path}'"
+                            "reason": f"Process '{process_name}' running from '{exe_path}' but legitimate version runs from '{baseline_path}'"
                         }
 
                         context_insights.append({
@@ -1239,9 +1249,9 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                             "evidence": f"Process masquerading as {process_name} from unauthorized location"
                         })
 
-                        # Check if it's a server process - even more critical
+                        # Extra severity for server processes
                         server_processes = ["apache", "apache2", "httpd", "nginx", "sshd", "ftpd", "smbd", "nmbd", "named", "mysqld", "postgres", "mariadb"]
-                        if any(server in process_name for server in server_processes):
+                        if any(server in process_name_lower for server in server_processes):
                             context_insights.append({
                                 "technique_id": "T1190",
                                 "technique_name": "Exploit Public-Facing Application",
@@ -1250,21 +1260,20 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
                                 "evidence": f"Server process {process_name} being impersonated - possible backdoor"
                             })
 
-                        # Found masquerading, no need to check further
                         break
 
-                    # Both in known dirs but different paths - still suspicious
-                    elif baseline_in_known_dir and current_in_known_dir and baseline_path.lower() != exe_path:
+                    # HIGH: Both in known dirs but different paths
+                    elif baseline_in_known_dir and baseline_path_lower != exe_path_lower:
                         is_masquerading = True
                         masquerade_details = {
                             "legitimate_path": baseline_path,
-                            "malicious_path": process_info.get("exe_path", ""),
+                            "malicious_path": exe_path,
                             "legitimate_hash": hash_key,
                             "current_hash": process_hash,
                             "baseline_user": proc_data.get("user", "unknown"),
                             "current_user": process_info.get("user", "unknown"),
                             "severity": "HIGH",
-                            "reason": f"Process '{process_name}' path mismatch: expected '{baseline_path}', found '{process_info.get('exe_path', '')}'"
+                            "reason": f"Process '{process_name}' path mismatch: expected '{baseline_path}', found '{exe_path}'"
                         }
 
                         context_insights.append({
@@ -1278,7 +1287,7 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
 
     # Check for processes running from suspicious temporary directories
     suspicious_dirs = ["/tmp/", "/dev/shm/", "/var/tmp/", "/run/user/"]
-    if any(susp_dir in exe_path for susp_dir in suspicious_dirs):
+    if any(susp_dir in exe_path_lower for susp_dir in suspicious_dirs):
         context_insights.append({
             "technique_id": "T1564.001",
             "technique_name": "Hide Artifacts: Hidden Files and Directories",
@@ -1309,12 +1318,12 @@ def classify_by_mitre_attck(event_type, process_info, detection_details=None):
             "technique_name": "Command and Scripting Interpreter",
             "tactic": "Execution",
             "severity": "medium",
-            "evidence": f"Suspicious command line pattern detected"
+            "evidence": "Suspicious command line pattern detected"
         })
 
     # Check for server processes spawned by shell (suspicious lineage)
     server_processes = ["apache", "apache2", "httpd", "nginx", "sshd", "ftpd", "smbd", "nmbd", "named", "mysqld", "postgres"]
-    if any(server in process_name for server in server_processes):
+    if any(server in process_name_lower for server in server_processes):
         if any(shell in str(lineage).lower() for shell in ["bash", "sh", "zsh", "dash", "ksh"]):
             context_insights.append({
                 "technique_id": "T1190",
@@ -1836,6 +1845,8 @@ def run_monitor():
                     )
 
         # === BASELINE HANDLING FOR PROCESSES ===
+        is_first_run = False  # Track if this is actually a first run
+
         if not os.path.exists(INTEGRITY_PROCESS_FILE) or os.path.getsize(INTEGRITY_PROCESS_FILE) <= 3:
             print("[INFO] First run detected - establishing baseline without generating alerts")
             listening_processes = get_listening_processes()
@@ -1846,13 +1857,15 @@ def run_monitor():
                 json.dump(merged_processes, f, indent=4)
             os.chmod(INTEGRITY_PROCESS_FILE, 0o600)
             print("[INFO] Baseline established. Starting monitoring mode...")
+            is_first_run = True  # This is actually a first run
             time.sleep(1)
         else:
             print("[INFO] Baseline already exists. Starting in monitoring mode.")
+            is_first_run = False  # Baseline exists, not a first run
 
         global INITIAL_BASELINE
         INITIAL_BASELINE = load_process_metadata()
-        use_initial_baseline = True
+        use_initial_baseline = is_first_run  # Only True when baseline was just created
 
         # Start periodic integrity scan in a separate thread
         print("[INFO] Starting periodic integrity scan...")
@@ -1866,19 +1879,19 @@ def run_monitor():
         print(f"[ERROR] PIM encountered an error: {e}")
         traceback.print_exc()
 
-def rescan_all_processes(interval=120, use_initial_baseline=False):
+def rescan_all_processes(interval=60, is_first_run=False):
     """
-    Periodically scans all processes (both listening and non-listening) and performs integrity checks.
-    This replaces the previous rescan_listening_processes function.
+    Periodic full rescan of all processes to catch any that might have been missed.
+    Uses the same baseline checking logic as the main monitor.
     """
-    # Set first_iteration flag based on use_initial_baseline parameter
-    first_iteration = use_initial_baseline
-    
-    if use_initial_baseline:
-        print("[INFO] Integrity scan using initial baseline - suppressing alerts for first scan")
-        # Wait a longer interval before first scan to ensure monitoring is established
-        time.sleep(interval * 2)
-    
+    # Use the first_run flag passed from run_monitor, don't determine it independently
+    first_iteration = is_first_run
+
+    if first_iteration:
+        print("[PERIODIC SCAN] First run - establishing baseline without generating alerts")
+    else:
+        print("[PERIODIC SCAN] Using existing baseline - alerts enabled")
+
     while True:
         try:
             if first_iteration:
@@ -1886,107 +1899,71 @@ def rescan_all_processes(interval=120, use_initial_baseline=False):
             else:
                 print("[PERIODIC SCAN] Running integrity check on all processes...")
 
-            # Load current tracking state
-            integrity_state = load_process_metadata()
-            
-            # Get current processes
-            listening_processes = get_listening_processes()
-            all_processes = get_all_processes()
-            
-            # Merge processes, with listening processes taking precedence
-            current_processes = all_processes.copy()
-            for process_hash, info in listening_processes.items():
-                current_processes[process_hash] = info
-            
-            # Only check for dead processes if not in first run mode
-            if not first_iteration:
-                # Check for processes in our tracking that no longer exist
-                terminated_processes = {}
-                for process_hash, stored_info in integrity_state.items():
-                    if process_hash not in current_processes:
-                        terminated_processes[process_hash] = stored_info
+            # Get current state of all processes
+            current_all = get_all_processes()
+            current_listening = get_listening_processes()
+
+            # Merge listening info
+            for process_hash, info in current_listening.items():
+                if process_hash in current_all:
+                    current_all[process_hash].update({
+                        "is_listening": True,
+                        "port": info.get("port"),
+                        "protocol": info.get("protocol")
+                    })
+                else:
+                    current_all[process_hash] = info
+
+            # Load stored baseline
+            stored_baseline = load_process_metadata()
+
+            # Check for new processes not in baseline
+            for process_hash, info in current_all.items():
+                if process_hash not in stored_baseline:
+                    # New process found
+                    if not first_iteration:
+                        log_pim_event(
+                            event_type="NEW_PROCESS",
+                            process_hash=process_hash,
+                            previous_metadata=None,
+                            new_metadata=info
+                        )
+                    # Add to tracking
+                    update_process_tracking(process_hash, info)
+
+            # Check for terminated processes
+            for process_hash, info in stored_baseline.items():
+                if process_hash not in current_all:
+                    # Process terminated
+                    if not first_iteration:
                         log_pim_event(
                             event_type="PROCESS_TERMINATED",
                             process_hash=process_hash,
-                            previous_metadata=stored_info,
+                            previous_metadata=info,
                             new_metadata=None
                         )
-                        remove_process_tracking(process_hash)
-            
-                # Check for modifications in existing processes
-                for process_hash, current_info in current_processes.items():
-                    if process_hash in integrity_state:
-                        stored_info = integrity_state[process_hash]
-                        
-                        # Check for significant metadata changes (ignore pid/ppid changes)
-                        changes = {}
-                        
-                        # Fields to check for significant changes
-                        significant_fields = ["exe_path", "process_name", "port", "user", "cmdline", "is_listening"]
-                        
-                        for field in significant_fields:
-                            stored_value = stored_info.get(field)
-                            current_value = current_info.get(field)
-                            if stored_value != current_value:
-                                changes[field] = {
-                                    "previous": stored_value,
-                                    "current": current_value
-                                }
-                        
-                        # Log changes if any were found
-                        if changes:
-                            log_pim_event(
-                                event_type="PROCESS_MODIFIED",
-                                process_hash=process_hash,
-                                previous_metadata=stored_info,
-                                new_metadata=current_info
-                            )
-                            
-                            # Update the stored metadata
-                            update_process_tracking(process_hash, current_info)
-                    
-                    else:
-                        # New process found during scan that wasn't in our tracking
-                        log_pim_event(
-                            event_type="NEW_UNTRACKED_PROCESS",
-                            process_hash=process_hash,
-                            previous_metadata=None,
-                            new_metadata=current_info
-                        )
-                        
-                        # If it's a listening process, log that specifically too
-                        if current_info.get("is_listening", False):
-                            log_pim_event(
-                                event_type="NEW_LISTENING_PROCESS",
-                                process_hash=process_hash,
-                                previous_metadata=None,
-                                new_metadata=current_info
-                            )
-                        
-                        # Add to tracking
-                        update_process_tracking(process_hash, current_info)
-            else:
-                # During first run, just update all processes without alerts
-                for process_hash, info in current_processes.items():
-                    update_process_tracking(process_hash, info)
-            
-            # Clear first_iteration flag after the first run
-            first_iteration = False
-            
-            # Periodically clean up the tracking sets
+                    # Remove from tracking
+                    remove_process_tracking(process_hash)
+
+            # After first iteration, enable alerting
+            if first_iteration:
+                first_iteration = False
+                print("[PERIODIC SCAN] Baseline scan complete. Enabling alerts for future scans.")
+
+            # Periodically clean up tracking sets
             if hasattr(rescan_all_processes, 'scan_count'):
                 rescan_all_processes.scan_count += 1
                 if rescan_all_processes.scan_count % 50 == 0:
                     cleanup_tracking_sets()
             else:
                 rescan_all_processes.scan_count = 1
-            
+
             time.sleep(interval)
-            
+
         except Exception as e:
             print(f"[ERROR] Exception in periodic scan: {e}")
             traceback.print_exc()
-            time.sleep(interval)  # Still sleep to avoid spinning on errors
+            time.sleep(interval)
 
 def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
     """Enhanced monitoring loop that tracks both listening and all other processes."""
