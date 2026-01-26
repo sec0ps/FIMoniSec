@@ -40,6 +40,7 @@ import difflib
 import subprocess
 import shutil
 import pyinotify
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
 from pathlib import Path
@@ -58,6 +59,116 @@ INTEGRITY_STATE_FILE = os.path.join(OUTPUT_DIR, "integrity_state.json")
 
 class EventHandler(pyinotify.ProcessEvent):
     """Event handler for file system changes."""
+
+    # Class variable to track pending moves with timestamps
+    pending_moves = {}
+    MOVE_TIMEOUT = 1.0  # seconds to wait for matching MOVED_TO event
+
+    def process_IN_MOVED_FROM(self, event):
+        """Handles file moved FROM this directory."""
+        global is_baseline_mode, integrity_state, exclusions
+
+        full_path = event.pathname
+
+        # Skip directories and excluded files
+        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
+            return
+
+        previous_metadata = integrity_state.get(full_path, None)
+        previous_hash = previous_metadata.get("hash") if previous_metadata else None
+
+        # Store the move info with cookie for potential correlation
+        cookie = event.cookie
+        EventHandler.pending_moves[cookie] = {
+            "from_path": full_path,
+            "metadata": previous_metadata,
+            "hash": previous_hash,
+            "timestamp": time.time()
+        }
+
+        # Start a delayed check to see if we get a matching MOVED_TO
+        # If not, treat it as a "moved away" (file left monitored area)
+        threading.Timer(self.MOVE_TIMEOUT, self._check_pending_move, args=[cookie]).start()
+
+    def process_IN_MOVED_TO(self, event):
+        """Handles file moved TO this directory."""
+        global is_baseline_mode, integrity_state, exclusions
+
+        full_path = event.pathname
+
+        # Skip directories and excluded files
+        if os.path.isdir(full_path) or should_exclude_file(full_path, exclusions):
+            return
+
+        cookie = event.cookie
+        file_hash = get_file_hash(full_path)
+        metadata = get_file_metadata(full_path)
+
+        if not file_hash or not metadata:
+            return
+
+        metadata["hash"] = file_hash
+
+        # Check if we have a matching MOVED_FROM event
+        if cookie in EventHandler.pending_moves:
+            move_info = EventHandler.pending_moves.pop(cookie)
+            old_path = move_info["from_path"]
+            previous_metadata = move_info["metadata"]
+            previous_hash = move_info["hash"]
+
+            # This is a move within monitored directories
+            if not is_baseline_mode:
+                log_event(
+                    event_type="MOVED",
+                    file_path=full_path,
+                    previous_metadata=previous_metadata,
+                    new_metadata=metadata,
+                    previous_hash=previous_hash,
+                    new_hash=file_hash,
+                    old_path=old_path
+                )
+
+            # Remove old path from tracking
+            remove_file_tracking(old_path)
+            # Add new path to tracking
+            update_file_tracking(full_path, file_hash, metadata)
+        else:
+            # File moved in from unmonitored location - treat as new file
+            if not is_baseline_mode:
+                log_event(
+                    event_type="NEW FILE",
+                    file_path=full_path,
+                    previous_metadata=None,
+                    new_metadata=metadata,
+                    previous_hash=None,
+                    new_hash=file_hash
+                )
+
+            update_file_tracking(full_path, file_hash, metadata)
+
+    def _check_pending_move(self, cookie):
+        """Check if a MOVED_FROM event was never matched with MOVED_TO."""
+        global is_baseline_mode
+
+        if cookie in EventHandler.pending_moves:
+            move_info = EventHandler.pending_moves.pop(cookie)
+            old_path = move_info["from_path"]
+            previous_metadata = move_info["metadata"]
+            previous_hash = move_info["hash"]
+
+            # File was moved out of monitored area - treat as MOVED_AWAY
+            if not is_baseline_mode and previous_metadata:
+                log_event(
+                    event_type="MOVED_AWAY",
+                    file_path=old_path,
+                    previous_metadata=previous_metadata,
+                    new_metadata=None,
+                    previous_hash=previous_hash,
+                    new_hash=None
+                )
+
+            # Remove from tracking
+            remove_file_tracking(old_path)
 
     def process_IN_CREATE(self, event):
         """Handles file creation with enhanced detection for moved files."""
@@ -319,7 +430,7 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
     }
 
     # Add original path for moved files
-    if event_type == "MOVED" and old_path:
+    if event_type in ["MOVED", "MOVED_AWAY"] and old_path:
         log_entry["old_path"] = old_path
 
     # Add hash information if available
@@ -377,6 +488,8 @@ def log_event(event_type, file_path, previous_metadata=None, new_metadata=None, 
         print(f"[MOVED] {old_path} -> {file_path} - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
         if is_config_file(file_path):
             backup_config_file(file_path)
+    elif event_type == "MOVED_AWAY":
+        print(f"[MOVED_AWAY] {file_path} -> (unmonitored location) - MITRE: {mitre_id} ({mitre_name}, {mitre_tactic})")
 
     return log_entry
 
@@ -738,8 +851,11 @@ def get_file_metadata(filepath):
 
 def monitor_changes(real_time_directories, exclusions):
     """Monitors file system changes using pyinotify with error handling."""
-    global integrity_state, is_baseline_mode
-    
+    global integrity_state, is_baseline_mode, pending_moves
+
+    # Initialize pending moves tracker for correlating MOVED_FROM/MOVED_TO
+    pending_moves = {}
+
     try:
         integrity_state = load_integrity_state()
 
@@ -751,9 +867,12 @@ def monitor_changes(real_time_directories, exclusions):
         for directory in real_time_directories:
             if directory in exclusions.get("directories", []):
                 continue
-            
+
             try:
-                mask = pyinotify.IN_CREATE | pyinotify.IN_DELETE | pyinotify.IN_MODIFY | pyinotify.IN_ATTRIB
+                # Add IN_MOVED_FROM and IN_MOVED_TO to the mask
+                mask = (pyinotify.IN_CREATE | pyinotify.IN_DELETE |
+                        pyinotify.IN_MODIFY | pyinotify.IN_ATTRIB |
+                        pyinotify.IN_MOVED_FROM | pyinotify.IN_MOVED_TO)
                 wm.add_watch(directory, mask, rec=True, auto_add=True)
                 print(f"[INFO] Watching directory: {directory}")
             except Exception as e:
@@ -767,7 +886,7 @@ def monitor_changes(real_time_directories, exclusions):
         print(f"[ERROR] Real-time monitoring thread crashed: {e}")
         print("[INFO] Attempting to restart real-time monitoring in 10 seconds...")
         time.sleep(10)
-        
+
         # Recursive call to restart the monitoring
         monitor_changes(real_time_directories, exclusions)
 
@@ -1245,7 +1364,6 @@ def is_system_directory(file_path):
     
     return any(file_path.startswith(d) for d in system_dirs)
 
-
 def get_mitre_mapping(event_type, file_path, changes=None):
     """Map file events to MITRE ATT&CK techniques."""
 
@@ -1260,7 +1378,7 @@ def get_mitre_mapping(event_type, file_path, changes=None):
                 "description": "New service file created for potential persistence"
             }
         # Web shell detection (specific extensions)
-        if "/var/www/" in file_path and any(ext in file_path.lower() for ext in ['.php', '.jsp', '.asp', '.aspx', '.cgi', '.pl']):
+        if "/var/www/" in file_path and any(ext in file_path.lower() for ext in ['.php', '.jsp', '.asp', '.aspx', '.cgi', '.pl', '.sh']):
             return {
                 "technique_id": "T1505.003",
                 "technique_name": "Server Software Component: Web Shell",
@@ -1364,6 +1482,14 @@ def get_mitre_mapping(event_type, file_path, changes=None):
                 "tactic": "Defense Evasion",
                 "description": "Temporary file deleted, potential cleanup after execution"
             }
+        # Web files
+        if "/var/www/" in file_path:
+            return {
+                "technique_id": "T1070.004",
+                "technique_name": "Indicator Removal: File Deletion",
+                "tactic": "Defense Evasion",
+                "description": "Web file deleted from monitored directory"
+            }
         # Default for DELETED
         return {
             "technique_id": "T1070.004",
@@ -1463,7 +1589,7 @@ def get_mitre_mapping(event_type, file_path, changes=None):
             "description": "File metadata modified"
         }
 
-    # Context-aware mappings for MOVED
+    # Context-aware mappings for MOVED (within monitored directories)
     if event_type == "MOVED":
         if "/etc/" in file_path:
             return {
@@ -1493,12 +1619,57 @@ def get_mitre_mapping(event_type, file_path, changes=None):
                 "tactic": "Persistence",
                 "description": "File moved to SSH directory"
             }
+        if "/var/www/" in file_path:
+            return {
+                "technique_id": "T1105",
+                "technique_name": "Ingress Tool Transfer",
+                "tactic": "Command and Control",
+                "description": "File moved to web directory"
+            }
         # Default for MOVED
         return {
             "technique_id": "T1036",
             "technique_name": "Masquerading",
             "tactic": "Defense Evasion",
             "description": "File moved within monitored directories"
+        }
+
+    # Context-aware mappings for MOVED_AWAY (file moved out of monitored area)
+    if event_type == "MOVED_AWAY":
+        if any(d in file_path for d in ['/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/']):
+            return {
+                "technique_id": "T1036.003",
+                "technique_name": "Masquerading: Rename System Utilities",
+                "tactic": "Defense Evasion",
+                "description": "System binary moved to unmonitored location"
+            }
+        if "/var/www/" in file_path:
+            return {
+                "technique_id": "T1074.001",
+                "technique_name": "Data Staged: Local Data Staging",
+                "tactic": "Collection",
+                "description": "Web file moved out of web directory to unmonitored location"
+            }
+        if "/etc/" in file_path:
+            return {
+                "technique_id": "T1070.004",
+                "technique_name": "Indicator Removal: File Deletion",
+                "tactic": "Defense Evasion",
+                "description": "Configuration file moved out of monitored area"
+            }
+        if "/.ssh/" in file_path:
+            return {
+                "technique_id": "T1098.004",
+                "technique_name": "Account Manipulation: SSH Authorized Keys",
+                "tactic": "Persistence",
+                "description": "SSH file moved to unmonitored location"
+            }
+        # Default for MOVED_AWAY
+        return {
+            "technique_id": "T1074.001",
+            "technique_name": "Data Staged: Local Data Staging",
+            "tactic": "Collection",
+            "description": "File moved out of monitored directory to unmonitored location"
         }
 
     # Fallback for unknown event types
