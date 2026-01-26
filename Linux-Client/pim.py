@@ -1970,14 +1970,23 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
     # Load the known-good baseline (persistent registry of known binaries)
     baseline_registry = INITIAL_BASELINE.copy() if 'INITIAL_BASELINE' in globals() and INITIAL_BASELINE else {}
 
-    # Runtime state: currently running processes (in-memory only)
-    running_processes = {}
+    # Initialize runtime state from baseline
+    running_processes = baseline_registry.copy()
 
-    # Track PID to hash mapping for runtime state
+    # Track PID to hash mapping - initialize from baseline
     pid_to_hash = {}
+    for process_hash, info in baseline_registry.items():
+        pid = info.get("pid")
+        if pid:
+            pid_to_hash[pid] = process_hash
 
-    # Track which PIDs are currently listening (runtime state)
+    # Track which PIDs are currently listening - initialize from baseline
     listening_pids = set()
+    for process_hash, info in baseline_registry.items():
+        if info.get("is_listening", False):
+            pid = info.get("pid")
+            if pid:
+                listening_pids.add(pid)
 
     # Track processes we've already logged events for to avoid duplicates
     logged_events = {
@@ -1991,14 +2000,18 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
 
     iteration_counter = 0
 
-    # If baseline exists, we're not in first_run mode
-    if baseline_registry:
-        first_run = False
-        print(f"[INFO] Loaded baseline with {len(baseline_registry)} known binaries - immediate alerting enabled")
+    # Determine first_iteration based on whether this is a true first run
+    # use_initial_baseline=True means baseline was JUST created (suppress alerts for sync)
+    # use_initial_baseline=False means baseline already existed (restart, enable alerts)
+    if use_initial_baseline:
+        first_iteration = True
+        print(f"[INFO] First run - baseline has {len(baseline_registry)} processes, suppressing alerts for initial sync")
+    elif baseline_registry:
+        first_iteration = False
+        print(f"[INFO] Restart detected - loaded baseline with {len(baseline_registry)} known binaries, {len(listening_pids)} listening")
     else:
+        first_iteration = True
         print("[INFO] No baseline found - first run mode, collecting baseline")
-
-    first_iteration = first_run
 
     while True:
         try:
@@ -2223,7 +2236,12 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
 
             # === 8. UPDATE RUNTIME STATE FOR NEXT ITERATION ===
             first_iteration = False
-            running_processes = current_processes.copy()
+
+            # Sync running_processes with current state
+            # Keep baseline_registry unchanged (persistent known-good list)
+            for process_hash, info in current_processes.items():
+                running_processes[process_hash] = info
+
             pid_to_hash = current_pid_to_hash.copy()
 
             # Update listening_pids based on current state
