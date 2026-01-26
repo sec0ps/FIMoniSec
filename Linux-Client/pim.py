@@ -1967,8 +1967,8 @@ def rescan_all_processes(interval=60, is_first_run=False):
 
 def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
     """Enhanced monitoring loop that tracks both listening and all other processes."""
-    # Load initial baseline if provided
-    all_known_processes = INITIAL_BASELINE.copy() if use_initial_baseline and 'INITIAL_BASELINE' in globals() else {}
+    # Always load baseline if it exists - this prevents false positives on restart
+    all_known_processes = INITIAL_BASELINE.copy() if 'INITIAL_BASELINE' in globals() and INITIAL_BASELINE else {}
 
     detection_history = {}
     alerted_processes = set()
@@ -1995,7 +1995,7 @@ def monitor_processes(interval=2, first_run=False, use_initial_baseline=False):
             known_listening_pids.add(info.get("pid"))
 
     # If baseline exists, we should NOT be in first_run mode
-    if use_initial_baseline and all_known_processes:
+    if all_known_processes:
         first_run = False
         print("[INFO] Using existing baseline - immediate alerting enabled")
 
