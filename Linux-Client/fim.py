@@ -1245,167 +1245,269 @@ def is_system_directory(file_path):
     
     return any(file_path.startswith(d) for d in system_dirs)
 
+
 def get_mitre_mapping(event_type, file_path, changes=None):
     """Map file events to MITRE ATT&CK techniques."""
-    mitre_mapping = {
-        "NEW FILE": {
-            "technique_id": "T1222",
-            "technique_name": "File and Directory Permissions Modification",
-            "tactic": "Defense Evasion",
-            "description": "Adversary created new file that could be used for persistence or execution"
-        },
-        "DELETED": {
-            "technique_id": "T1485",
-            "technique_name": "Data Destruction",
-            "tactic": "Impact",
-            "description": "Adversary deleted file that may be critical for system operation or evidence removal"
-        },
-        "MODIFIED": {
-            "technique_id": "T1565",
-            "technique_name": "Data Manipulation",
-            "tactic": "Impact",
-            "description": "Adversary modified existing file content"
-        },
-        "METADATA_CHANGED": {
-            "technique_id": "T1222",
-            "technique_name": "File and Directory Permissions Modification",
-            "tactic": "Defense Evasion",
-            "description": "Adversary modified file attributes which could indicate permission changes"
-        },
-        "MOVED": {
-            "technique_id": "T1036",
-            "technique_name": "Masquerading",
-            "tactic": "Defense Evasion",
-            "description": "Adversary moved file to a different location, potentially to hide malicious activity or evade detection"
-        }
-    }
-    
-    # Context-aware mappings
-    if event_type == "MODIFIED":
-        if is_config_file(file_path):
-            return {
-                "technique_id": "T1562.001",
-                "technique_name": "Disable or Modify Tools",
-                "tactic": "Defense Evasion",
-                "description": "Adversary may modify configuration files to disable security tools"
-            }
-        if "/etc/passwd" in file_path or "/etc/shadow" in file_path:
-            return {
-                "technique_id": "T1136",
-                "technique_name": "Create Account",
-                "tactic": "Persistence",
-                "description": "Adversary may create accounts by modifying account databases"
-            }
-        if "/etc/crontab" in file_path or "/etc/cron.d" in file_path:
-            return {
-                "technique_id": "T1053.003",
-                "technique_name": "Scheduled Task/Job: Cron",
-                "tactic": "Persistence",
-                "description": "Adversary may create scheduled tasks for persistence"
-            }
-        if ".ssh" in file_path:
-            return {
-                "technique_id": "T1098",
-                "technique_name": "Account Manipulation",
-                "tactic": "Persistence",
-                "description": "Adversary may modify SSH keys for persistence"
-            }
-        if "/etc/hosts" in file_path:
-            return {
-                "technique_id": "T1565.002",
-                "technique_name": "Data Manipulation: Transmitted Data Manipulation",
-                "tactic": "Impact",
-                "description": "Adversary may redirect network traffic by modifying hosts file"
-            }
-        if ".bashrc" in file_path or ".bash_profile" in file_path or ".profile" in file_path:
-            return {
-                "technique_id": "T1546.004",
-                "technique_name": "Event Triggered Execution: Unix Shell Configuration Modification",
-                "tactic": "Persistence",
-                "description": "Adversary modified shell configuration for automatic execution"
-            }
-    
-    # Handle metadata changes more specifically
-    if event_type == "METADATA_CHANGED" and changes:
-        if isinstance(changes, dict):
-            if "Permissions changed" in changes:
-                return {
-                    "technique_id": "T1222.002",
-                    "technique_name": "File and Directory Permissions Modification: Linux and Mac File and Directory Permissions Modification",
-                    "tactic": "Defense Evasion",
-                    "description": "Adversary modified permissions to allow execution or hide activity"
-                }
-            if "Ownership changed" in changes:
-                return {
-                    "technique_id": "T1222.002",
-                    "technique_name": "File and Directory Permissions Modification: Linux and Mac File and Directory Permissions Modification",
-                    "tactic": "Defense Evasion",
-                    "description": "Adversary changed file ownership to execute with different privileges"
-                }
-    
-    # For new files in specific locations
+
+    # Context-aware mappings for NEW FILE
     if event_type == "NEW FILE":
-        if "/etc/init.d/" in file_path or "/lib/systemd/" in file_path:
+        # Service/systemd files
+        if "/etc/init.d/" in file_path or "/lib/systemd/" in file_path or "/etc/systemd/" in file_path:
             return {
                 "technique_id": "T1543.002",
                 "technique_name": "Create or Modify System Process: Systemd Service",
                 "tactic": "Persistence",
-                "description": "Adversary created service file for persistence and privilege execution"
+                "description": "New service file created for potential persistence"
             }
-        if "/var/www/" in file_path and any(ext in file_path.lower() for ext in ['.php', '.jsp', '.asp', '.aspx']):
+        # Web shell detection (specific extensions)
+        if "/var/www/" in file_path and any(ext in file_path.lower() for ext in ['.php', '.jsp', '.asp', '.aspx', '.cgi', '.pl']):
             return {
                 "technique_id": "T1505.003",
                 "technique_name": "Server Software Component: Web Shell",
                 "tactic": "Persistence",
-                "description": "Adversary may have placed web shell for remote access"
+                "description": "Potential web shell placed in web directory"
             }
-        if "/tmp/" in file_path and is_binary_file(file_path):
+        # Generic web directory file
+        if "/var/www/" in file_path:
             return {
-                "technique_id": "T1574.005",
-                "technique_name": "Hijack Execution Flow: Dynamic Linker Hijacking",
-                "tactic": "Persistence",
-                "description": "Adversary placed binary in temporary directory for execution hijacking"
+                "technique_id": "T1105",
+                "technique_name": "Ingress Tool Transfer",
+                "tactic": "Command and Control",
+                "description": "New file created in web directory"
             }
-    
-    # Context-specific mappings for moved files
+        # SSH directory
+        if "/.ssh/" in file_path or file_path.endswith("authorized_keys"):
+            return {
+                "technique_id": "T1098.004",
+                "technique_name": "Account Manipulation: SSH Authorized Keys",
+                "tactic": "Persistence",
+                "description": "SSH key file created for potential unauthorized access"
+            }
+        # Cron directories
+        if "/etc/cron" in file_path or "/var/spool/cron" in file_path:
+            return {
+                "technique_id": "T1053.003",
+                "technique_name": "Scheduled Task/Job: Cron",
+                "tactic": "Persistence",
+                "description": "New cron job created for potential persistence"
+            }
+        # Temp directories
+        if "/tmp/" in file_path or "/var/tmp/" in file_path or "/dev/shm/" in file_path:
+            if is_binary_file(file_path):
+                return {
+                    "technique_id": "T1059",
+                    "technique_name": "Command and Scripting Interpreter",
+                    "tactic": "Execution",
+                    "description": "Binary file placed in temporary directory"
+                }
+            return {
+                "technique_id": "T1074.001",
+                "technique_name": "Data Staged: Local Data Staging",
+                "tactic": "Collection",
+                "description": "File created in temporary directory, potential staging"
+            }
+        # System binary directories
+        if any(file_path.startswith(d) for d in ['/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/', '/usr/local/bin/']):
+            return {
+                "technique_id": "T1105",
+                "technique_name": "Ingress Tool Transfer",
+                "tactic": "Command and Control",
+                "description": "New executable placed in system binary directory"
+            }
+        # Shell configuration files
+        if any(pattern in file_path for pattern in ['.bashrc', '.bash_profile', '.profile', '.zshrc']):
+            return {
+                "technique_id": "T1546.004",
+                "technique_name": "Event Triggered Execution: Unix Shell Configuration Modification",
+                "tactic": "Persistence",
+                "description": "Shell configuration file created"
+            }
+        # /etc directory (generic)
+        if file_path.startswith("/etc/"):
+            return {
+                "technique_id": "T1037",
+                "technique_name": "Boot or Logon Initialization Scripts",
+                "tactic": "Persistence",
+                "description": "New configuration file created in /etc"
+            }
+        # Default for NEW FILE
+        return {
+            "technique_id": "T1105",
+            "technique_name": "Ingress Tool Transfer",
+            "tactic": "Command and Control",
+            "description": "New file created in monitored directory"
+        }
+
+    # Context-aware mappings for DELETED
+    if event_type == "DELETED":
+        # Log files
+        if "/var/log/" in file_path or file_path.endswith(".log"):
+            return {
+                "technique_id": "T1070.002",
+                "technique_name": "Indicator Removal: Clear Linux or Mac System Logs",
+                "tactic": "Defense Evasion",
+                "description": "Log file deleted, potential evidence removal"
+            }
+        # History files
+        if "history" in file_path.lower() or ".bash_history" in file_path:
+            return {
+                "technique_id": "T1070.003",
+                "technique_name": "Indicator Removal: Clear Command History",
+                "tactic": "Defense Evasion",
+                "description": "Command history file deleted"
+            }
+        # Temp/staging files
+        if "/tmp/" in file_path or "/var/tmp/" in file_path:
+            return {
+                "technique_id": "T1070.004",
+                "technique_name": "Indicator Removal: File Deletion",
+                "tactic": "Defense Evasion",
+                "description": "Temporary file deleted, potential cleanup after execution"
+            }
+        # Default for DELETED
+        return {
+            "technique_id": "T1070.004",
+            "technique_name": "Indicator Removal: File Deletion",
+            "tactic": "Defense Evasion",
+            "description": "File deleted from monitored directory"
+        }
+
+    # Context-aware mappings for MODIFIED
+    if event_type == "MODIFIED":
+        if "/etc/passwd" in file_path or "/etc/shadow" in file_path or "/etc/group" in file_path:
+            return {
+                "technique_id": "T1136.001",
+                "technique_name": "Create Account: Local Account",
+                "tactic": "Persistence",
+                "description": "Account database modified, potential unauthorized account creation"
+            }
+        if "/etc/sudoers" in file_path or "/etc/sudoers.d/" in file_path:
+            return {
+                "technique_id": "T1548.003",
+                "technique_name": "Abuse Elevation Control Mechanism: Sudo and Sudo Caching",
+                "tactic": "Privilege Escalation",
+                "description": "Sudoers file modified, potential privilege escalation"
+            }
+        if "/etc/crontab" in file_path or "/etc/cron" in file_path or "/var/spool/cron" in file_path:
+            return {
+                "technique_id": "T1053.003",
+                "technique_name": "Scheduled Task/Job: Cron",
+                "tactic": "Persistence",
+                "description": "Cron configuration modified for potential persistence"
+            }
+        if "/.ssh/" in file_path or "authorized_keys" in file_path:
+            return {
+                "technique_id": "T1098.004",
+                "technique_name": "Account Manipulation: SSH Authorized Keys",
+                "tactic": "Persistence",
+                "description": "SSH configuration modified for potential unauthorized access"
+            }
+        if "/etc/hosts" in file_path:
+            return {
+                "technique_id": "T1565.001",
+                "technique_name": "Data Manipulation: Stored Data Manipulation",
+                "tactic": "Impact",
+                "description": "Hosts file modified, potential traffic redirection"
+            }
+        if any(pattern in file_path for pattern in ['.bashrc', '.bash_profile', '.profile', '.zshrc']):
+            return {
+                "technique_id": "T1546.004",
+                "technique_name": "Event Triggered Execution: Unix Shell Configuration Modification",
+                "tactic": "Persistence",
+                "description": "Shell configuration modified for automatic execution"
+            }
+        if "/var/www/" in file_path:
+            return {
+                "technique_id": "T1565.001",
+                "technique_name": "Data Manipulation: Stored Data Manipulation",
+                "tactic": "Impact",
+                "description": "Web content modified"
+            }
+        if is_config_file(file_path):
+            return {
+                "technique_id": "T1562.001",
+                "technique_name": "Impair Defenses: Disable or Modify Tools",
+                "tactic": "Defense Evasion",
+                "description": "Configuration file modified, potential security control changes"
+            }
+        # Default for MODIFIED
+        return {
+            "technique_id": "T1565.001",
+            "technique_name": "Data Manipulation: Stored Data Manipulation",
+            "tactic": "Impact",
+            "description": "File content modified in monitored directory"
+        }
+
+    # Context-aware mappings for METADATA_CHANGED
+    if event_type == "METADATA_CHANGED":
+        if changes and isinstance(changes, dict):
+            if "Permissions changed" in changes:
+                return {
+                    "technique_id": "T1222.002",
+                    "technique_name": "File and Directory Permissions Modification: Linux and Mac",
+                    "tactic": "Defense Evasion",
+                    "description": "File permissions modified"
+                }
+            if "Ownership changed" in changes:
+                return {
+                    "technique_id": "T1222.002",
+                    "technique_name": "File and Directory Permissions Modification: Linux and Mac",
+                    "tactic": "Defense Evasion",
+                    "description": "File ownership changed"
+                }
+        # Default for METADATA_CHANGED
+        return {
+            "technique_id": "T1222.002",
+            "technique_name": "File and Directory Permissions Modification: Linux and Mac",
+            "tactic": "Defense Evasion",
+            "description": "File metadata modified"
+        }
+
+    # Context-aware mappings for MOVED
     if event_type == "MOVED":
-        # Moving files to/from sensitive locations
         if "/etc/" in file_path:
             return {
                 "technique_id": "T1036.005",
                 "technique_name": "Masquerading: Match Legitimate Name or Location",
                 "tactic": "Defense Evasion",
-                "description": "Adversary moved file to a system configuration directory to appear legitimate"
+                "description": "File moved to system configuration directory"
             }
-        if "/bin/" in file_path or "/sbin/" in file_path or "/usr/bin/" in file_path:
+        if any(d in file_path for d in ['/bin/', '/sbin/', '/usr/bin/', '/usr/sbin/']):
             return {
                 "technique_id": "T1036.003",
                 "technique_name": "Masquerading: Rename System Utilities",
                 "tactic": "Defense Evasion",
-                "description": "Adversary moved file to a system binary location, potentially masquerading as legitimate tool"
+                "description": "File moved to system binary location"
             }
         if "/tmp/" in file_path or "/var/tmp/" in file_path:
             return {
                 "technique_id": "T1074.001",
                 "technique_name": "Data Staged: Local Data Staging",
                 "tactic": "Collection",
-                "description": "Adversary moved file to a temporary location, potentially staging for exfiltration"
+                "description": "File moved to temporary location, potential staging"
             }
         if "/.ssh/" in file_path:
             return {
-                "technique_id": "T1098",
-                "technique_name": "Account Manipulation",
+                "technique_id": "T1098.004",
+                "technique_name": "Account Manipulation: SSH Authorized Keys",
                 "tactic": "Persistence",
-                "description": "Adversary moved file to SSH directory, potentially for persistence via SSH keys"
+                "description": "File moved to SSH directory"
             }
+        # Default for MOVED
+        return {
+            "technique_id": "T1036",
+            "technique_name": "Masquerading",
+            "tactic": "Defense Evasion",
+            "description": "File moved within monitored directories"
+        }
 
-    # Provide generic mapping if no specific context match
-    return mitre_mapping.get(event_type, {
+    # Fallback for unknown event types
+    return {
         "technique_id": "T1565",
         "technique_name": "Data Manipulation",
         "tactic": "Impact",
-        "description": "Generic file manipulation"
-    })
+        "description": "File system change detected"
+    }
 
 ############################################################
 
