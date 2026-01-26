@@ -1119,6 +1119,10 @@ def run_monitor():
     """Run the file monitoring process with real-time monitoring and scheduled scans."""
     global is_baseline_mode, integrity_state, exclusions
 
+    # Ensure required directories exist
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
