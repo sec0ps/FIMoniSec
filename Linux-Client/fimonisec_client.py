@@ -102,19 +102,18 @@ def ensure_directories_and_files(base_dir):
 ensure_directories_and_files(BASE_DIR)
 
 # Now set up logging properly with a single configuration
+# Now set up logging properly with a single configuration
 LOG_FILE = os.path.join(BASE_DIR, "logs", "monisec-endpoint.log")
+LOG_DIR = os.path.dirname(LOG_FILE)
 log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
-
-LOG_FILE = os.path.join(BASE_DIR, "logs", "monisec-endpoint.log")
-LOG_DIR = os.path.dirname(LOG_FILE)
 
 # Clear any existing handlers to avoid duplication
 for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
 
-# Add file handler
+# Add file handler - keeps INFO level for full audit trail
 log_handler = logging.FileHandler(LOG_FILE)
 log_handler.setFormatter(log_formatter)
 log_handler.setLevel(logging.INFO)
@@ -126,7 +125,7 @@ logging.getLogger('asyncio').setLevel(logging.WARNING)
 if not (len(sys.argv) > 1 and sys.argv[1] == "-d"):
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(log_formatter)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING)
     root_logger.addHandler(console_handler)
 
 # List of monitored processes - will be built dynamically based on config
