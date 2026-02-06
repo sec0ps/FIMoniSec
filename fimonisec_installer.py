@@ -176,7 +176,7 @@ Type=simple
 User={FIM_USER}
 Group={FIM_GROUP}
 WorkingDirectory={INSTALL_DIR}
-ExecStart=/usr/bin/python3 {INSTALL_DIR}/Linux-Client/fimonisec_client.py -d
+ExecStart=/usr/bin/python3 {INSTALL_DIR}/Linux-Client/fimonisec_client.py start
 Restart=on-failure
 RestartSec=5s
 [Install]
