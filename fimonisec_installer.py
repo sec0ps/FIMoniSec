@@ -176,7 +176,7 @@ Type=simple
 User={FIM_USER}
 Group={FIM_GROUP}
 WorkingDirectory={INSTALL_DIR}
-ExecStart=/usr/bin/python3 {INSTALL_DIR}/Linux-Client/monisec_client.py -d
+ExecStart=/usr/bin/python3 {INSTALL_DIR}/Linux-Client/fimonisec_client.py -d
 Restart=on-failure
 RestartSec=5s
 [Install]
@@ -195,7 +195,7 @@ Type=simple
 User={FIM_USER}
 Group={FIM_GROUP}
 WorkingDirectory={INSTALL_DIR}
-ExecStart=/usr/bin/python3 {INSTALL_DIR}/Monisec-Server/monisec-server.py -d
+ExecStart=/usr/bin/python3 {INSTALL_DIR}/Monisec-Server/fimonisec-server.py -d
 Restart=on-failure
 RestartSec=5s
 [Install]
