@@ -107,6 +107,9 @@ log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 
+LOG_FILE = os.path.join(BASE_DIR, "logs", "monisec-endpoint.log")
+LOG_DIR = os.path.dirname(LOG_FILE)
+
 # Clear any existing handlers to avoid duplication
 for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
